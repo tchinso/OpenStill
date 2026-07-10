@@ -25,11 +25,13 @@ const DEFAULT_SETTINGS = Object.freeze({ soundEnabled: true });
 const VALID_STATUSES = new Set([
   'ok',
   'changed',
-  'missing',
+  'needs-review',
   'error',
   'permission-needed',
   'needs-baseline'
 ]);
+
+const ELEMENT_NOT_FOUND_MESSAGE = '선택한 요소를 찾지 못했습니다. 로그인 상태나 페이지 구성, CSS 선택자를 확인해 주세요.';
 
 let storageQueue = Promise.resolve();
 let offscreenCreation;
@@ -40,6 +42,20 @@ let alarmQueue = Promise.resolve();
 
 function cleanText(value, maxLength = MAX_SNAPSHOT_CHARS) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+// Snapshot text has a different job from labels and error messages: line boundaries
+// give the change view enough structure to show a newly inserted list item without
+// highlighting every item that merely shifted down.
+function cleanSnapshotText(value, maxLength = MAX_SNAPSHOT_CHARS) {
+  return String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[\t\f\v ]+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength);
 }
 
 function cleanShortText(value, maxLength = 180) {
@@ -136,7 +152,7 @@ function normalizeSnapshot(value) {
   return {
     exists: value.exists,
     matchCount: Number.isInteger(matchCount) && matchCount >= 0 ? matchCount : value.exists ? 1 : 0,
-    text: cleanText(value.text),
+    text: cleanSnapshotText(value.text),
     capturedAt: asIso(value.capturedAt, null)
   };
 }
@@ -163,11 +179,18 @@ function normalizeMonitor(value) {
   const lastCheckedAt = asIso(value.lastCheckedAt, null);
   const calculatedNextCheck = lastCheckedAt ? addHours(lastCheckedAt, intervalHours) : nowIso();
   const requestedNextCheck = asIso(value.nextCheckAt, null);
-  const status = VALID_STATUSES.has(value.status) ? value.status : 'ok';
-  const snapshot = normalizeSnapshot(value.snapshot);
+  // Older development builds called this state "missing". It now deliberately
+  // means "needs review": a logged-out page must not be reported as a content change.
+  const requestedStatus = value.status === 'missing' ? 'needs-review' : value.status;
+  const status = VALID_STATUSES.has(requestedStatus) ? requestedStatus : 'ok';
+  const normalizedSnapshot = normalizeSnapshot(value.snapshot);
+  // A no-match result is never a baseline. Keeping it here would make the
+  // next successful render look like an element deletion/reappearance change.
+  const snapshot = normalizedSnapshot?.exists ? normalizedSnapshot : null;
   const lastChange = value.lastChange && typeof value.lastChange === 'object'
     ? {
         previous: normalizeSnapshot(value.lastChange.previous),
+        current: normalizeSnapshot(value.lastChange.current),
         detectedAt: asIso(value.lastChange.detectedAt, null)
       }
     : null;
@@ -197,6 +220,7 @@ function normalizeMonitor(value) {
     nextCheckAt: requestedNextCheck ?? calculatedNextCheck,
     snapshot,
     lastChange,
+    lastReviewAt: asIso(value.lastReviewAt, null),
     lastError: cleanText(value.lastError, 300) || null,
     status,
     unread: Boolean(value.unread)
@@ -454,7 +478,7 @@ async function inspectRenderedDocument(selector, minimumWaitMilliseconds, quietM
       ok: true,
       exists: Boolean(first),
       matchCount: matches.length,
-      text: first ? String(first.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 10_000) : ''
+      text: first ? String(first.innerText || first.textContent || '').slice(0, 10_000) : ''
     };
   } catch (error) {
     return { ok: false, error: 'CSS 선택자를 해석할 수 없습니다: ' + error.message };
@@ -484,7 +508,7 @@ async function captureRenderedSnapshot(monitor) {
     const snapshot = {
       exists: Boolean(result.exists),
       matchCount: Number.isInteger(result.matchCount) ? result.matchCount : 0,
-      text: cleanText(result.text),
+      text: cleanSnapshotText(result.text),
       capturedAt: nowIso()
     };
     if (snapshot.matchCount > 1) {
@@ -530,7 +554,7 @@ async function inspectRenderedDocumentBatch(selectors, minimumWaitMilliseconds, 
         ok: true,
         exists: Boolean(first),
         matchCount: matches.length,
-        text: first ? String(first.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 10_000) : ''
+        text: first ? String(first.innerText || first.textContent || '').slice(0, 10_000) : ''
       };
     } catch (error) {
       return { ok: false, error: 'CSS 선택자를 해석할 수 없습니다: ' + error.message };
@@ -579,7 +603,7 @@ async function captureRenderedSnapshots(monitors) {
       const snapshot = {
         exists: Boolean(rendered.exists),
         matchCount: Number.isInteger(rendered.matchCount) ? rendered.matchCount : 0,
-        text: cleanText(rendered.text),
+        text: cleanSnapshotText(rendered.text),
         capturedAt
       };
       if (snapshot.matchCount > 1) {
@@ -661,6 +685,7 @@ async function setCheckFailure(id, expectedRevision, status, errorMessage) {
     monitor.lastCheckedAt = checkedAt;
     monitor.nextCheckAt = addHours(checkedAt, monitor.intervalHours);
     monitor.status = status;
+    monitor.lastReviewAt = null;
     monitor.lastError = cleanText(errorMessage, 300);
     monitor.updatedAt = checkedAt;
     return monitor;
@@ -669,6 +694,45 @@ async function setCheckFailure(id, expectedRevision, status, errorMessage) {
 
 function outcomesWithError(monitors, status, error) {
   return new Map(monitors.map((monitor) => [monitor.id, { status, error }]));
+}
+
+function statusForStoredSnapshot(snapshot) {
+  if (!snapshot) return 'needs-baseline';
+  return snapshot.exists ? 'ok' : 'needs-review';
+}
+
+function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
+  // A missing match is deliberately not a comparison result. A session can have
+  // expired, the page can be behind a login wall, or a temporary error page can
+  // be rendered. Keep the last successful snapshot so a later reappearance is
+  // compared against real content instead of producing a false change.
+  if (!nextSnapshot.exists) {
+    monitor.status = 'needs-review';
+    monitor.lastReviewAt = checkedAt;
+    monitor.lastError = ELEMENT_NOT_FOUND_MESSAGE;
+    return { changed: false, needsReview: true };
+  }
+
+  const previous = monitor.snapshot;
+  const changed = Boolean(previous) && !snapshotsEqual(previous, nextSnapshot);
+  monitor.snapshot = nextSnapshot;
+  monitor.lastError = null;
+  monitor.lastReviewAt = null;
+
+  if (changed) {
+    monitor.lastChangedAt = checkedAt;
+    monitor.lastChange = {
+      previous,
+      detectedAt: checkedAt
+    };
+    monitor.unread = true;
+    monitor.status = 'changed';
+  } else {
+    // An unread change remains actionable after a later successful re-check.
+    monitor.status = monitor.unread ? 'changed' : 'ok';
+  }
+
+  return { changed, needsReview: false };
 }
 
 async function commitCheckOutcomes(candidates, outcomes) {
@@ -680,10 +744,11 @@ async function commitCheckOutcomes(candidates, outcomes) {
       return current && current.enabled && current.revision === candidate.revision;
     });
     if (!valid) {
-      return { ok: false, reason: 'outdated', changedMonitors: [] };
+      return { ok: false, reason: 'outdated', changedMonitors: [], needsReviewMonitors: [] };
     }
 
     const changedMonitors = [];
+    const needsReviewMonitors = [];
     for (const candidate of candidates) {
       const current = currentById.get(candidate.id);
       const outcome = outcomes.get(candidate.id);
@@ -693,31 +758,20 @@ async function commitCheckOutcomes(candidates, outcomes) {
 
       if (!outcome?.snapshot) {
         current.status = outcome?.status === 'permission-needed' ? 'permission-needed' : 'error';
+        current.lastReviewAt = null;
         current.lastError = cleanText(outcome?.error || '페이지를 확인하지 못했습니다.', 300);
         continue;
       }
 
-      const nextSnapshot = outcome.snapshot;
-      const previous = current.snapshot;
-      const changed = Boolean(previous) && !snapshotsEqual(previous, nextSnapshot);
-      current.snapshot = nextSnapshot;
-      current.lastError = null;
-
-      if (changed) {
-        current.lastChangedAt = checkedAt;
-        current.lastChange = {
-          previous,
-          detectedAt: checkedAt
-        };
-        current.unread = true;
-        current.status = 'changed';
+      const applied = applySnapshotOutcome(current, outcome.snapshot, checkedAt);
+      if (applied.changed) {
         changedMonitors.push({ ...current });
-      } else if (!current.unread) {
-        current.status = nextSnapshot.exists ? 'ok' : 'missing';
+      } else if (applied.needsReview) {
+        needsReviewMonitors.push({ ...current });
       }
     }
 
-    return { ok: true, changedMonitors };
+    return { ok: true, changedMonitors, needsReviewMonitors };
   });
 }
 
@@ -798,27 +852,12 @@ async function checkMonitor(id, { reschedule = true } = {}) {
         return { ok: false, reason: 'outdated', error: '확인 중 모니터 설정이 변경되었습니다.' };
       }
 
-      const previous = current.snapshot;
-      const changed = Boolean(previous) && !snapshotsEqual(previous, nextSnapshot);
-      current.snapshot = nextSnapshot;
       current.lastCheckedAt = checkedAt;
       current.nextCheckAt = addHours(checkedAt, current.intervalHours);
-      current.lastError = null;
       current.updatedAt = checkedAt;
+      const applied = applySnapshotOutcome(current, nextSnapshot, checkedAt);
 
-      if (changed) {
-        current.lastChangedAt = checkedAt;
-        current.lastChange = {
-          previous,
-          detectedAt: checkedAt
-        };
-        current.unread = true;
-        current.status = 'changed';
-      } else if (!current.unread) {
-        current.status = nextSnapshot.exists ? 'ok' : 'missing';
-      }
-
-      return { ok: true, changed, monitor: { ...current } };
+      return { ok: true, ...applied, monitor: { ...current } };
     });
 
     if (result?.changed) {
@@ -833,6 +872,40 @@ async function checkMonitor(id, { reschedule = true } = {}) {
     if (reschedule) {
       await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
     }
+  }
+}
+
+function chunkMonitors(monitors, size = MAX_BATCH_ITEMS) {
+  const batches = [];
+  for (let index = 0; index < monitors.length; index += size) {
+    batches.push(monitors.slice(index, index + size));
+  }
+  return batches;
+}
+
+async function checkPage(urlValue) {
+  const url = normalizeUrl(urlValue);
+  if (!url) {
+    return { ok: false, error: '확인할 페이지 주소가 올바르지 않습니다.' };
+  }
+
+  const monitors = (await getMonitors()).filter((monitor) => monitor.enabled && monitor.url === url);
+  if (!monitors.length) {
+    return { ok: false, reason: 'disabled', error: '이 페이지에서 활성화된 추적을 찾을 수 없습니다.' };
+  }
+
+  try {
+    const results = await Promise.all(chunkMonitors(monitors)
+      .map((batch) => checkSelectionSet(batch, { reschedule: false })));
+    const completed = results.filter((result) => result?.ok);
+    const firstFailure = results.find((result) => !result?.ok);
+    const changed = completed.some((result) => result.changedMonitors?.length);
+    const needsReview = completed.some((result) => result.needsReviewMonitors?.length);
+    return firstFailure && !completed.length
+      ? firstFailure
+      : { ok: true, changed, needsReview, checked: completed.length };
+  } finally {
+    await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
   }
 }
 
@@ -855,24 +928,22 @@ async function runDueChecks() {
       if (scheduledIds.has(monitor.id)) {
         continue;
       }
-      const samePageSelections = monitor.selectionSetId
-        ? allMonitors.filter((candidate) => candidate.enabled
-          && candidate.selectionSetId === monitor.selectionSetId
-          && candidate.url === monitor.url)
-        : [monitor];
-      const batch = samePageSelections.length > 1 && samePageSelections.length <= MAX_BATCH_ITEMS
-        ? samePageSelections
-        : [monitor];
-      batch.forEach((candidate) => scheduledIds.add(candidate.id));
-      batches.push(batch);
+      // A page is the unit we render and manage. Check every due page selector
+      // together even when it was created in a different picker session.
+      const samePageMonitors = allMonitors.filter((candidate) => candidate.enabled && candidate.url === monitor.url);
+      const pageBatches = chunkMonitors(samePageMonitors);
+      pageBatches.forEach((batch) => {
+        if (batches.length < MAX_CHECKS_PER_SWEEP && batch.some((candidate) => !scheduledIds.has(candidate.id))) {
+          batch.forEach((candidate) => scheduledIds.add(candidate.id));
+          batches.push(batch);
+        }
+      });
       if (batches.length >= MAX_CHECKS_PER_SWEEP) {
         break;
       }
     }
 
-    await Promise.allSettled(batches.map((batch) => batch.length > 1
-      ? checkSelectionSet(batch, { reschedule: false })
-      : checkMonitor(batch[0].id, { reschedule: false })));
+    await Promise.allSettled(batches.map((batch) => checkSelectionSet(batch, { reschedule: false })));
   } finally {
     sweepRunning = false;
     await scheduleNextAlarm();
@@ -907,7 +978,7 @@ async function createMonitors(message, sender) {
     seenSelectors.add(selector);
     items.push({
       selector,
-      text: cleanText(rawItem.text),
+      text: cleanSnapshotText(rawItem.text),
       name: cleanText(rawItem.name, 120)
     });
   }
@@ -944,6 +1015,7 @@ async function createMonitors(message, sender) {
       capturedAt: createdAt
     }),
     lastChange: null,
+    lastReviewAt: null,
     lastError: null,
     status: 'ok',
     unread: false
@@ -1013,6 +1085,7 @@ async function saveMonitor(message) {
       monitor.snapshot = null;
       monitor.lastChange = null;
       monitor.lastChangedAt = null;
+      monitor.lastReviewAt = null;
       monitor.lastCheckedAt = null;
       monitor.unread = false;
       monitor.status = monitor.enabled ? 'needs-baseline' : requestedEnabled ? 'permission-needed' : 'needs-baseline';
@@ -1021,7 +1094,7 @@ async function saveMonitor(message) {
       monitor.status = 'permission-needed';
       monitor.lastError = '이 사이트의 접근 권한이 필요합니다.';
     } else if (!requestedEnabled && monitor.status === 'permission-needed') {
-      monitor.status = monitor.snapshot ? (monitor.snapshot.exists ? 'ok' : 'missing') : 'needs-baseline';
+      monitor.status = statusForStoredSnapshot(monitor.snapshot);
       monitor.lastError = null;
     }
 
@@ -1058,10 +1131,10 @@ async function setMonitorEnabled(message) {
     current.updatedAt = nowIso();
     current.nextCheckAt = enabled ? nowIso() : current.nextCheckAt;
     if (enabled && current.status === 'permission-needed') {
-      current.status = current.snapshot ? (current.snapshot.exists ? 'ok' : 'missing') : 'needs-baseline';
+      current.status = statusForStoredSnapshot(current.snapshot);
       current.lastError = null;
     } else if (!enabled && current.status === 'permission-needed') {
-      current.status = current.snapshot ? (current.snapshot.exists ? 'ok' : 'missing') : 'needs-baseline';
+      current.status = statusForStoredSnapshot(current.snapshot);
       current.lastError = null;
     }
   });
@@ -1087,6 +1160,111 @@ async function deleteMonitor(id) {
   return { ok: true };
 }
 
+function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) {
+  const reset = {
+    ...monitor,
+    id: copy ? createId() : monitor.id,
+    revision: createRevision(),
+    url,
+    // Page grouping is derived from URL, so old one-off picker batches no longer
+    // have any behavioural meaning after an address is reused.
+    selectionSetId: null,
+    selectionOrder: null,
+    ...(copy ? { createdAt: timestamp } : {}),
+    updatedAt: timestamp,
+    lastCheckedAt: null,
+    lastChangedAt: null,
+    nextCheckAt: timestamp,
+    snapshot: null,
+    lastChange: null,
+    lastReviewAt: null,
+    lastError: null,
+    status: 'needs-baseline',
+    unread: false
+  };
+  return reset;
+}
+
+async function reusePageUrl(message, { copy = false } = {}) {
+  const sourceUrl = normalizeUrl(message.sourceUrl);
+  const targetUrl = normalizeUrl(message.targetUrl);
+  if (!sourceUrl || !targetUrl) {
+    return { ok: false, error: '기존 주소와 새 주소를 모두 확인해 주세요.' };
+  }
+  if (sourceUrl === targetUrl) {
+    return { ok: false, error: '새 주소가 기존 주소와 같습니다.' };
+  }
+
+  const sourceMonitors = (await getMonitors()).filter((monitor) => monitor.url === sourceUrl);
+  if (!sourceMonitors.length) {
+    return { ok: false, error: '주소를 재사용할 추적 페이지를 찾을 수 없습니다.' };
+  }
+  if (copy && sourceMonitors.length + (await getMonitors()).length > MAX_MONITORS) {
+    return { ok: false, error: `복제하면 모니터 최대 ${MAX_MONITORS}개 제한을 넘습니다.` };
+  }
+
+  const hasEnabledMonitor = sourceMonitors.some((monitor) => monitor.enabled);
+  if (hasEnabledMonitor && !await hasSitePermission(targetUrl)) {
+    return { ok: false, reason: 'permission', error: '새 사이트의 접근 권한이 필요합니다.' };
+  }
+
+  const timestamp = nowIso();
+  let affected = [];
+  const result = await mutateMonitors((monitors) => {
+    const sourceIds = new Set(sourceMonitors.map((monitor) => monitor.id));
+    if (copy) {
+      const clones = monitors
+        .filter((monitor) => sourceIds.has(monitor.id))
+        .map((monitor) => resetMonitorForPageUrl(monitor, targetUrl, timestamp, { copy: true }));
+      if (monitors.length + clones.length > MAX_MONITORS) {
+        return { ok: false, error: `복제하면 모니터 최대 ${MAX_MONITORS}개 제한을 넘습니다.` };
+      }
+      monitors.push(...clones);
+      affected = clones;
+    } else {
+      affected = monitors
+        .filter((monitor) => sourceIds.has(monitor.id))
+        .map((monitor) => resetMonitorForPageUrl(monitor, targetUrl, timestamp));
+      const replacementById = new Map(affected.map((monitor) => [monitor.id, monitor]));
+      monitors.forEach((monitor, index) => {
+        if (replacementById.has(monitor.id)) {
+          monitors[index] = replacementById.get(monitor.id);
+        }
+      });
+    }
+    return { ok: true, monitors: affected, count: affected.length };
+  });
+
+  if (!result?.ok) return result;
+  if (!copy) {
+    await releaseUnusedSitePermission(sourceUrl);
+  }
+  await refreshBadge();
+  await scheduleNextAlarm();
+  return result;
+}
+
+async function deletePage(urlValue) {
+  const url = normalizeUrl(urlValue);
+  if (!url) return { ok: false, error: '삭제할 페이지 주소가 올바르지 않습니다.' };
+
+  let deletedCount = 0;
+  await mutateMonitors((monitors) => {
+    for (let index = monitors.length - 1; index >= 0; index -= 1) {
+      if (monitors[index].url === url) {
+        monitors.splice(index, 1);
+        deletedCount += 1;
+      }
+    }
+  });
+  if (!deletedCount) return { ok: false, error: '삭제할 추적 페이지를 찾을 수 없습니다.' };
+
+  await releaseUnusedSitePermission(url);
+  await refreshBadge();
+  await scheduleNextAlarm();
+  return { ok: true, deletedCount };
+}
+
 async function acknowledgeMonitor(id) {
   await mutateMonitors((monitors) => {
     const monitor = monitors.find((item) => item.id === id);
@@ -1095,7 +1273,7 @@ async function acknowledgeMonitor(id) {
     }
     monitor.unread = false;
     if (monitor.status === 'changed') {
-      monitor.status = monitor.snapshot?.exists ? 'ok' : 'missing';
+      monitor.status = statusForStoredSnapshot(monitor.snapshot);
     }
     monitor.updatedAt = nowIso();
   });
@@ -1153,7 +1331,7 @@ async function importMonitors(message) {
       monitor.lastError = '가져온 뒤 이 사이트의 접근 권한을 허용해 주세요.';
       disabledForPermission += 1;
     } else if (!monitor.enabled && monitor.status === 'permission-needed') {
-      monitor.status = monitor.snapshot ? (monitor.snapshot.exists ? 'ok' : 'missing') : 'needs-baseline';
+      monitor.status = statusForStoredSnapshot(monitor.snapshot);
       monitor.lastError = null;
     }
     monitor.revision = createRevision();
@@ -1226,6 +1404,10 @@ const messageHandlers = {
   'set-monitor-enabled': (message) => setMonitorEnabled(message),
   'delete-monitor': (message) => deleteMonitor(message.id),
   'check-monitor': (message) => checkMonitor(message.id),
+  'check-page': (message) => checkPage(message.url),
+  'move-page-url': (message) => reusePageUrl(message),
+  'copy-page-url': (message) => reusePageUrl(message, { copy: true }),
+  'delete-page': (message) => deletePage(message.url),
   'acknowledge-monitor': (message) => acknowledgeMonitor(message.id),
   'open-monitor-window': (message) => openMonitorWindow(message.id),
   'import-monitors': (message) => importMonitors(message),

@@ -5,6 +5,7 @@
   const message = document.querySelector('#message');
   const monitorCount = document.querySelector('#monitorCount');
   const changedCount = document.querySelector('#changedCount');
+  const attentionCount = document.querySelector('#attentionCount');
   const recentList = document.querySelector('#recentList');
   let activeTab;
 
@@ -45,12 +46,16 @@
     const response = await send({ type: 'get-state' });
     const monitors = response?.monitors ?? [];
     const changed = monitors.filter((monitor) => monitor.unread);
+    const needsAttention = (monitor) => (monitor.enabled || monitor.status === 'permission-needed')
+      && ['needs-review', 'error', 'permission-needed'].includes(monitor.status);
+    const attention = monitors.filter(needsAttention);
     monitorCount.textContent = String(monitors.filter((monitor) => monitor.enabled).length);
     changedCount.textContent = String(changed.length);
+    attentionCount.textContent = String(attention.length);
     recentList.replaceChildren();
 
-    const items = [...changed, ...monitors.filter((monitor) => !monitor.unread)]
-      .sort((left, right) => Date.parse(right.lastChangedAt ?? right.updatedAt) - Date.parse(left.lastChangedAt ?? left.updatedAt))
+    const items = [...changed, ...attention.filter((monitor) => !monitor.unread), ...monitors.filter((monitor) => !monitor.unread && !needsAttention(monitor))]
+      .sort((left, right) => Date.parse(right.lastChangedAt ?? right.lastReviewAt ?? right.updatedAt) - Date.parse(left.lastChangedAt ?? left.lastReviewAt ?? left.updatedAt))
       .slice(0, 3);
 
     if (!items.length) {
@@ -70,7 +75,9 @@
       name.textContent = monitor.name;
       const meta = document.createElement('div');
       meta.className = 'recent-meta';
-      meta.textContent = monitor.unread ? `변경 감지 · ${formatWhen(monitor.lastChangedAt)}` : hostLabel(monitor.url);
+      meta.textContent = monitor.status === 'needs-review'
+        ? '확인 필요 · 요소를 찾지 못함'
+        : monitor.unread ? `변경 감지 · ${formatWhen(monitor.lastChangedAt)}` : hostLabel(monitor.url);
       text.append(name, meta);
       const open = document.createElement('button');
       open.type = 'button';

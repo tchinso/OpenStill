@@ -19,10 +19,11 @@ h1 { font-size: 15px; letter-spacing: -.01em; }
 .primary:disabled { cursor: not-allowed; opacity: .55; }
 .permission-note { margin-top: 8px; color: #9eb0c7; font-size: 10px; line-height: 1.4; }
 .message { min-height: 15px; margin-top: 8px; color: #ffaea6; font-size: 11px; line-height: 1.35; }
-.overview { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 14px 0 17px; }
+.overview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin: 14px 0 17px; }
 .overview div { padding: 10px 12px; border-radius: 11px; background: #192638; }
 .overview span { display: block; color: #dfeaf8; font-size: 20px; font-weight: 780; letter-spacing: -.04em; }
 .overview .changed span { color: #ff9e91; }
+.overview .attention span { color: #ffd08c; }
 .overview small { color: #9eb0c7; font-size: 10px; }
 .section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
 .section-title h2 { font-size: 12px; }

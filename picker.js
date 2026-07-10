@@ -18,6 +18,21 @@
     return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
   }
 
+  function cleanSnapshotText(value, maxLength = 10_000) {
+    return String(value ?? '')
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map((line) => line.replace(/[\t\f\v ]+/g, ' ').trim())
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+      .slice(0, maxLength);
+  }
+
+  function snapshotTextFor(element) {
+    return cleanSnapshotText(element?.innerText || element?.textContent);
+  }
+
   function escapeCss(value) {
     if (globalThis.CSS?.escape) {
       return globalThis.CSS.escape(String(value));
@@ -657,7 +672,7 @@
         this.selections.push({
           element,
           selector,
-          text: cleanText(element.textContent),
+          text: snapshotTextFor(element),
           matchCount: 1
         });
         this.activeSelectionIndex = this.selections.length - 1;
@@ -771,7 +786,7 @@
 
         active.selector = selector;
         active.element = matches[0];
-        active.text = cleanText(matches[0].textContent);
+        active.text = snapshotTextFor(matches[0]);
         active.matchCount = 1;
         this.selectedElement = matches[0];
         const preview = document.createElement('div');
@@ -831,7 +846,7 @@
           }
           seenElements.add(matches[0]);
           selection.element = matches[0];
-          selection.text = cleanText(matches[0].textContent);
+          selection.text = snapshotTextFor(matches[0]);
           selection.matchCount = 1;
         } catch (error) {
           this.activeSelectionIndex = index;
