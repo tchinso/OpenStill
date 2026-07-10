@@ -1,16 +1,18 @@
 'use strict';
 
-const MONITORS_KEY = 'openStill.monitors.v1';
+const MONITORS_KEY = 'openStill.monitors.v2';
 const SETTINGS_KEY = 'openStill.settings.v1';
 const PENDING_PICKERS_KEY = 'openStill.pending-pickers.v1';
 const ALARM_NAME = 'openStill.next-check';
 
 const MIN_INTERVAL_HOURS = 1;
 const MAX_INTERVAL_HOURS = 14 * 24;
-// Two bounded snapshots per monitor (current + last changed-from value) stay within
-// chrome.storage.local's default 10 MB quota without requesting unlimitedStorage.
+// Two bounded collection snapshots per monitored URL (current + last changed-from
+// value) stay within chrome.storage.local's default 10 MB quota without requesting
+// unlimitedStorage.
 const MAX_MONITORS = 100;
-const MAX_BATCH_ITEMS = 20;
+const MAX_SELECTORS_PER_MONITOR = 20;
+const MAX_COLLECTION_ITEMS = 200;
 const MAX_SNAPSHOT_CHARS = 10_000;
 const PARSE_TIMEOUT_MS = 12_000;
 const SOUND_DEBOUNCE_MS = 3_000;
@@ -139,6 +141,31 @@ function cleanSelector(value) {
   return selector && selector.length <= 2_000 ? selector : null;
 }
 
+function cleanSelectors(value) {
+  const source = Array.isArray(value) ? value : [value];
+  if (!source.length || source.length > MAX_SELECTORS_PER_MONITOR) {
+    return null;
+  }
+
+  const selectors = [];
+  const seen = new Set();
+  for (const item of source) {
+    const selector = cleanSelector(typeof item === 'string' ? item : item?.selector);
+    if (!selector) {
+      return null;
+    }
+    if (!seen.has(selector)) {
+      selectors.push(selector);
+      seen.add(selector);
+    }
+  }
+  return selectors.length ? selectors : null;
+}
+
+function snapshotTextFromItems(items) {
+  return items.map((item) => item.text).join('\n\n');
+}
+
 function normalizeSnapshot(value) {
   if (!value || typeof value !== 'object' || typeof value.exists !== 'boolean') {
     return null;
@@ -149,10 +176,25 @@ function normalizeSnapshot(value) {
     : typeof value.matchCount === 'string' && /^\d+$/.test(value.matchCount.trim())
       ? Number(value.matchCount)
       : Number.NaN;
+  const rawItems = Array.isArray(value.items) ? value.items : [];
+  const itemCount = Math.min(rawItems.length, MAX_COLLECTION_ITEMS);
+  const separatorLength = Math.max(0, itemCount - 1) * 2;
+  const perItemLimit = itemCount
+    ? Math.max(0, Math.floor(Math.max(0, MAX_SNAPSHOT_CHARS - separatorLength) / itemCount))
+    : 0;
+  const items = rawItems.slice(0, MAX_COLLECTION_ITEMS).map((item) => ({
+    text: cleanSnapshotText(item?.text, perItemLimit)
+  }));
+  const safeMatchCount = Number.isInteger(matchCount) && matchCount >= 0
+    ? matchCount
+    : items.length;
+  const exists = Boolean(value.exists) && safeMatchCount > 0;
+
   return {
-    exists: value.exists,
-    matchCount: Number.isInteger(matchCount) && matchCount >= 0 ? matchCount : value.exists ? 1 : 0,
-    text: cleanSnapshotText(value.text),
+    exists,
+    matchCount: exists ? safeMatchCount : 0,
+    text: exists ? snapshotTextFromItems(items) : '',
+    items: exists ? items : [],
     capturedAt: asIso(value.capturedAt, null)
   };
 }
@@ -161,7 +203,8 @@ function snapshotsEqual(left, right) {
   return Boolean(left && right)
     && left.exists === right.exists
     && left.matchCount === right.matchCount
-    && left.text === right.text;
+    && left.items.length === right.items.length
+    && left.items.every((item, index) => item.text === right.items[index]?.text);
 }
 
 function normalizeMonitor(value) {
@@ -170,19 +213,16 @@ function normalizeMonitor(value) {
   }
 
   const url = normalizeUrl(value.url);
-  const selector = cleanSelector(value.selector);
+  const selectors = cleanSelectors(value.selectors);
   const intervalHours = clampInterval(value.intervalHours);
-  if (!url || !selector || !intervalHours) {
+  if (!url || !selectors || !intervalHours) {
     return null;
   }
   const createdAt = asIso(value.createdAt, nowIso());
   const lastCheckedAt = asIso(value.lastCheckedAt, null);
   const calculatedNextCheck = lastCheckedAt ? addHours(lastCheckedAt, intervalHours) : nowIso();
   const requestedNextCheck = asIso(value.nextCheckAt, null);
-  // Older development builds called this state "missing". It now deliberately
-  // means "needs review": a logged-out page must not be reported as a content change.
-  const requestedStatus = value.status === 'missing' ? 'needs-review' : value.status;
-  const status = VALID_STATUSES.has(requestedStatus) ? requestedStatus : 'ok';
+  const status = VALID_STATUSES.has(value.status) ? value.status : 'ok';
   const normalizedSnapshot = normalizeSnapshot(value.snapshot);
   // A no-match result is never a baseline. Keeping it here would make the
   // next successful render look like an element deletion/reappearance change.
@@ -196,10 +236,9 @@ function normalizeMonitor(value) {
     : null;
 
   const id = typeof value.id === 'string' && value.id ? value.id.slice(0, 100) : createId();
-  // Stable fallback keeps early/hand-written exports working until their next edit.
   const revision = typeof value.revision === 'string' && value.revision.length <= 100
     ? value.revision
-    : `legacy:${id}:${asIso(value.updatedAt, createdAt)}`;
+    : createRevision();
 
   return {
     id,
@@ -207,10 +246,8 @@ function normalizeMonitor(value) {
     name: cleanText(value.name, 120) || cleanText(value.pageTitle, 120) || new URL(url).hostname,
     url,
     pageTitle: cleanText(value.pageTitle, 180),
-    selector,
+    selectors,
     labels: cleanLabels(value.labels),
-    selectionSetId: typeof value.selectionSetId === 'string' && value.selectionSetId.length <= 100 ? value.selectionSetId : null,
-    selectionOrder: Number.isInteger(value.selectionOrder) && value.selectionOrder >= 0 ? value.selectionOrder : null,
     intervalHours,
     enabled: value.enabled !== false,
     createdAt,
@@ -447,81 +484,7 @@ function waitForRenderedTab(tabId) {
   return { promise, cancel };
 }
 
-async function inspectRenderedDocument(selector, minimumWaitMilliseconds, quietMilliseconds, settleTimeoutMilliseconds) {
-  const root = document.documentElement;
-  if (root) {
-    await new Promise((resolve) => {
-      const startedAt = performance.now();
-      let lastMutationAt = startedAt;
-      const observer = new MutationObserver(() => {
-        lastMutationAt = performance.now();
-      });
-      observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true });
-      const tick = () => {
-        const now = performance.now();
-        const elapsed = now - startedAt;
-        if ((elapsed >= minimumWaitMilliseconds && now - lastMutationAt >= quietMilliseconds) || elapsed >= settleTimeoutMilliseconds) {
-          observer.disconnect();
-          resolve();
-          return;
-        }
-        setTimeout(tick, Math.min(100, quietMilliseconds));
-      };
-      setTimeout(tick, Math.min(100, quietMilliseconds));
-    });
-  }
-
-  try {
-    const matches = document.querySelectorAll(selector);
-    const first = matches[0];
-    return {
-      ok: true,
-      exists: Boolean(first),
-      matchCount: matches.length,
-      text: first ? String(first.innerText || first.textContent || '').slice(0, 10_000) : ''
-    };
-  } catch (error) {
-    return { ok: false, error: 'CSS 선택자를 해석할 수 없습니다: ' + error.message };
-  }
-}
-
-async function captureRenderedSnapshot(monitor) {
-  const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
-  if (!Number.isInteger(tab?.id)) {
-    throw new Error('검사용 백그라운드 탭을 만들지 못했습니다.');
-  }
-
-  let ready;
-  try {
-    ready = waitForRenderedTab(tab.id);
-    await chrome.tabs.update(tab.id, { url: monitor.url, active: false });
-    await ready.promise;
-    const execution = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: inspectRenderedDocument,
-      args: [monitor.selector, RENDER_MINIMUM_WAIT_MS, RENDER_QUIET_MS, RENDER_SETTLE_TIMEOUT_MS]
-    });
-    const result = execution[0]?.result;
-    if (!result?.ok) {
-      throw new Error(result?.error || '렌더링된 페이지에서 선택자를 확인하지 못했습니다.');
-    }
-    const snapshot = {
-      exists: Boolean(result.exists),
-      matchCount: Number.isInteger(result.matchCount) ? result.matchCount : 0,
-      text: cleanSnapshotText(result.text),
-      capturedAt: nowIso()
-    };
-    if (snapshot.matchCount > 1) {
-      throw new Error('CSS 선택자가 현재 ' + snapshot.matchCount + '개 요소와 일치합니다. 하나만 일치하도록 선택자를 수정해 주세요.');
-    }
-    return snapshot;
-  } finally {
-    ready?.cancel();
-    await chrome.tabs.remove(tab.id).catch(() => undefined);
-  }
-}
-
-async function inspectRenderedDocumentBatch(selectors, minimumWaitMilliseconds, quietMilliseconds, settleTimeoutMilliseconds) {
+async function inspectRenderedDocumentCollection(selectors, minimumWaitMilliseconds, quietMilliseconds, settleTimeoutMilliseconds) {
   const selectorList = Array.isArray(selectors) ? selectors : [];
   const root = document.documentElement;
   if (root) {
@@ -546,73 +509,70 @@ async function inspectRenderedDocumentBatch(selectors, minimumWaitMilliseconds, 
     });
   }
 
-  const snapshots = selectorList.map((selector) => {
-    try {
-      const matches = document.querySelectorAll(selector);
-      const first = matches[0];
-      return {
-        ok: true,
-        exists: Boolean(first),
-        matchCount: matches.length,
-        text: first ? String(first.innerText || first.textContent || '').slice(0, 10_000) : ''
-      };
-    } catch (error) {
-      return { ok: false, error: 'CSS 선택자를 해석할 수 없습니다: ' + error.message };
+  try {
+    const selected = new Set();
+    for (const selector of selectorList) {
+      document.querySelectorAll(selector).forEach((element) => selected.add(element));
     }
-  });
-  return { ok: true, snapshots };
+
+    const roots = [...selected].filter((element) => {
+      for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+        if (selected.has(parent)) return false;
+      }
+      return true;
+    }).sort((left, right) => {
+      if (left === right) return 0;
+      const position = left.compareDocumentPosition(right);
+      if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+
+    return {
+      ok: true,
+      exists: roots.length > 0,
+      matchCount: roots.length,
+      items: roots.map((element) => ({
+        text: String(element.innerText || element.textContent || '').slice(0, 10_000)
+      }))
+    };
+  } catch (error) {
+    return { ok: false, error: 'CSS 선택자를 해석할 수 없습니다: ' + error.message };
+  }
 }
 
-async function captureRenderedSnapshots(monitors) {
-  if (!Array.isArray(monitors) || !monitors.length) {
-    return new Map();
-  }
-  const url = monitors[0].url;
-  if (!monitors.every((monitor) => monitor.url === url)) {
-    throw new Error('하나의 선택 묶음에는 같은 페이지의 요소만 포함할 수 있습니다.');
-  }
-
+async function captureRenderedSnapshot(monitor) {
   const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
   if (!Number.isInteger(tab?.id)) {
-    throw new Error('검사용 백그라운드 탭을 만들지 못했습니다.');
+    throw new Error('Could not create a background tab for checking.');
   }
 
   let ready;
   try {
     ready = waitForRenderedTab(tab.id);
-    await chrome.tabs.update(tab.id, { url, active: false });
+    await chrome.tabs.update(tab.id, { url: monitor.url, active: false });
     await ready.promise;
     const execution = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: inspectRenderedDocumentBatch,
-      args: [monitors.map((monitor) => monitor.selector), RENDER_MINIMUM_WAIT_MS, RENDER_QUIET_MS, RENDER_SETTLE_TIMEOUT_MS]
+      func: inspectRenderedDocumentCollection,
+      args: [monitor.selectors, RENDER_MINIMUM_WAIT_MS, RENDER_QUIET_MS, RENDER_SETTLE_TIMEOUT_MS]
     });
     const result = execution[0]?.result;
-    if (!result?.ok || !Array.isArray(result.snapshots) || result.snapshots.length !== monitors.length) {
-      throw new Error('렌더링된 페이지를 확인하지 못했습니다.');
+    if (!result?.ok) {
+      throw new Error(result?.error || '렌더링된 페이지를 확인하지 못했습니다.');
     }
 
-    const capturedAt = nowIso();
-    const outcomes = new Map();
-    monitors.forEach((monitor, index) => {
-      const rendered = result.snapshots[index];
-      if (!rendered?.ok) {
-        outcomes.set(monitor.id, { error: cleanText(rendered?.error || 'CSS 선택자를 해석할 수 없습니다.', 300) });
-        return;
-      }
-      const snapshot = {
-        exists: Boolean(rendered.exists),
-        matchCount: Number.isInteger(rendered.matchCount) ? rendered.matchCount : 0,
-        text: cleanSnapshotText(rendered.text),
-        capturedAt
-      };
-      if (snapshot.matchCount > 1) {
-        outcomes.set(monitor.id, { error: 'CSS 선택자가 현재 ' + snapshot.matchCount + '개의 요소와 일치합니다.' });
-      } else {
-        outcomes.set(monitor.id, { snapshot });
-      }
+    const snapshot = normalizeSnapshot({
+      exists: Boolean(result.exists),
+      matchCount: Number.isInteger(result.matchCount) ? result.matchCount : 0,
+      items: result.items,
+      text: Array.isArray(result.items) ? result.items.map((item) => item.text).join('\n\n') : '',
+      capturedAt: nowIso()
     });
-    return outcomes;
+    if (!snapshot) {
+      throw new Error('선택자 목록 결과를 정리하지 못했습니다.');
+    }
+    return snapshot;
   } finally {
     ready?.cancel();
     await chrome.tabs.remove(tab.id).catch(() => undefined);
@@ -692,10 +652,6 @@ async function setCheckFailure(id, expectedRevision, status, errorMessage) {
   });
 }
 
-function outcomesWithError(monitors, status, error) {
-  return new Map(monitors.map((monitor) => [monitor.id, { status, error }]));
-}
-
 function statusForStoredSnapshot(snapshot) {
   if (!snapshot) return 'needs-baseline';
   return snapshot.exists ? 'ok' : 'needs-review';
@@ -723,6 +679,7 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
     monitor.lastChangedAt = checkedAt;
     monitor.lastChange = {
       previous,
+      current: nextSnapshot,
       detectedAt: checkedAt
     };
     monitor.unread = true;
@@ -733,88 +690,6 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
   }
 
   return { changed, needsReview: false };
-}
-
-async function commitCheckOutcomes(candidates, outcomes) {
-  const checkedAt = nowIso();
-  return mutateMonitors((monitors) => {
-    const currentById = new Map(monitors.map((monitor) => [monitor.id, monitor]));
-    const valid = candidates.every((candidate) => {
-      const current = currentById.get(candidate.id);
-      return current && current.enabled && current.revision === candidate.revision;
-    });
-    if (!valid) {
-      return { ok: false, reason: 'outdated', changedMonitors: [], needsReviewMonitors: [] };
-    }
-
-    const changedMonitors = [];
-    const needsReviewMonitors = [];
-    for (const candidate of candidates) {
-      const current = currentById.get(candidate.id);
-      const outcome = outcomes.get(candidate.id);
-      current.lastCheckedAt = checkedAt;
-      current.nextCheckAt = addHours(checkedAt, current.intervalHours);
-      current.updatedAt = checkedAt;
-
-      if (!outcome?.snapshot) {
-        current.status = outcome?.status === 'permission-needed' ? 'permission-needed' : 'error';
-        current.lastReviewAt = null;
-        current.lastError = cleanText(outcome?.error || '페이지를 확인하지 못했습니다.', 300);
-        continue;
-      }
-
-      const applied = applySnapshotOutcome(current, outcome.snapshot, checkedAt);
-      if (applied.changed) {
-        changedMonitors.push({ ...current });
-      } else if (applied.needsReview) {
-        needsReviewMonitors.push({ ...current });
-      }
-    }
-
-    return { ok: true, changedMonitors, needsReviewMonitors };
-  });
-}
-
-async function checkSelectionSet(candidates, { reschedule = true } = {}) {
-  const monitors = [...new Map(candidates
-    .filter((monitor) => monitor?.enabled)
-    .map((monitor) => [monitor.id, monitor])).values()];
-  if (!monitors.length) {
-    return { ok: false, reason: 'disabled' };
-  }
-  if (monitors.some((monitor) => checksInProgress.has(monitor.id))) {
-    return { ok: false, reason: 'checking' };
-  }
-
-  monitors.forEach((monitor) => checksInProgress.add(monitor.id));
-  try {
-    let outcomes;
-    if (!monitors.every((monitor) => monitor.url === monitors[0].url)) {
-      outcomes = outcomesWithError(monitors, 'error', '하나의 선택 묶음에는 같은 페이지의 요소만 포함할 수 있습니다.');
-    } else if (!await hasSitePermission(monitors[0].url)) {
-      outcomes = outcomesWithError(monitors, 'permission-needed', '사이트 접근 권한이 필요합니다.');
-    } else {
-      try {
-        outcomes = await captureRenderedSnapshots(monitors);
-      } catch (error) {
-        outcomes = outcomesWithError(monitors, 'error', responseError(error));
-      }
-    }
-
-    const result = await commitCheckOutcomes(monitors, outcomes);
-    if (result.ok) {
-      await Promise.all(result.changedMonitors.map((monitor) => announceChange(monitor)));
-      await refreshBadge();
-    }
-    return result;
-  } catch (error) {
-    return { ok: false, error: responseError(error) };
-  } finally {
-    monitors.forEach((monitor) => checksInProgress.delete(monitor.id));
-    if (reschedule) {
-      await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
-    }
-  }
 }
 
 async function checkMonitor(id, { reschedule = true } = {}) {
@@ -875,35 +750,22 @@ async function checkMonitor(id, { reschedule = true } = {}) {
   }
 }
 
-function chunkMonitors(monitors, size = MAX_BATCH_ITEMS) {
-  const batches = [];
-  for (let index = 0; index < monitors.length; index += size) {
-    batches.push(monitors.slice(index, index + size));
-  }
-  return batches;
-}
-
 async function checkPage(urlValue) {
   const url = normalizeUrl(urlValue);
   if (!url) {
     return { ok: false, error: '확인할 페이지 주소가 올바르지 않습니다.' };
   }
 
-  const monitors = (await getMonitors()).filter((monitor) => monitor.enabled && monitor.url === url);
-  if (!monitors.length) {
+  const monitor = (await getMonitors()).find((item) => item.enabled && item.url === url);
+  if (!monitor) {
     return { ok: false, reason: 'disabled', error: '이 페이지에서 활성화된 추적을 찾을 수 없습니다.' };
   }
 
   try {
-    const results = await Promise.all(chunkMonitors(monitors)
-      .map((batch) => checkSelectionSet(batch, { reschedule: false })));
-    const completed = results.filter((result) => result?.ok);
-    const firstFailure = results.find((result) => !result?.ok);
-    const changed = completed.some((result) => result.changedMonitors?.length);
-    const needsReview = completed.some((result) => result.needsReviewMonitors?.length);
-    return firstFailure && !completed.length
-      ? firstFailure
-      : { ok: true, changed, needsReview, checked: completed.length };
+    const result = await checkMonitor(monitor.id, { reschedule: false });
+    return result?.ok
+      ? { ok: true, changed: Boolean(result.changed), needsReview: Boolean(result.needsReview), checked: 1 }
+      : result;
   } finally {
     await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
   }
@@ -917,163 +779,195 @@ async function runDueChecks() {
   sweepRunning = true;
   try {
     const now = Date.now();
-    const allMonitors = await getMonitors();
-    const due = allMonitors
+    const due = (await getMonitors())
       .filter((monitor) => monitor.enabled && dueTimestamp(monitor) <= now)
       .sort((left, right) => dueTimestamp(left) - dueTimestamp(right));
-    const scheduledIds = new Set();
-    const batches = [];
 
+    const scheduledUrls = new Set();
+    const scheduled = [];
     for (const monitor of due) {
-      if (scheduledIds.has(monitor.id)) {
-        continue;
-      }
-      // A page is the unit we render and manage. Check every due page selector
-      // together even when it was created in a different picker session.
-      const samePageMonitors = allMonitors.filter((candidate) => candidate.enabled && candidate.url === monitor.url);
-      const pageBatches = chunkMonitors(samePageMonitors);
-      pageBatches.forEach((batch) => {
-        if (batches.length < MAX_CHECKS_PER_SWEEP && batch.some((candidate) => !scheduledIds.has(candidate.id))) {
-          batch.forEach((candidate) => scheduledIds.add(candidate.id));
-          batches.push(batch);
-        }
-      });
-      if (batches.length >= MAX_CHECKS_PER_SWEEP) {
-        break;
-      }
+      if (scheduledUrls.has(monitor.url)) continue;
+      scheduledUrls.add(monitor.url);
+      scheduled.push(monitor);
+      if (scheduled.length >= MAX_CHECKS_PER_SWEEP) break;
     }
 
-    await Promise.allSettled(batches.map((batch) => checkSelectionSet(batch, { reschedule: false })));
+    await Promise.allSettled(scheduled.map((monitor) => checkMonitor(monitor.id, { reschedule: false })));
   } finally {
     sweepRunning = false;
     await scheduleNextAlarm();
   }
 }
 
-async function createMonitors(message, sender) {
-  const url = normalizeUrl(message.url);
-  const intervalHours = clampInterval(message.intervalHours);
+function selectorsEqual(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((selector, index) => selector === right[index]);
+}
+
+function pickerItemsFromMessage(message) {
   const rawItems = Array.isArray(message.items)
     ? message.items
-    : [{ selector: message.selector, text: message.text, matchCount: message.matchCount, name: message.name }];
-  if (!url || !intervalHours || !rawItems.length || rawItems.length > MAX_BATCH_ITEMS) {
-    return { ok: false, error: `URL, 1시간~14일 간격, 그리고 1~${MAX_BATCH_ITEMS}개의 선택 요소를 확인해 주세요.` };
+    : Array.isArray(message.selectors)
+      ? message.selectors.map((selector) => ({ selector }))
+      : [{ selector: message.selector }];
+
+  if (!rawItems.length || rawItems.length > MAX_SELECTORS_PER_MONITOR) {
+    return null;
   }
 
   const items = [];
   const seenSelectors = new Set();
   for (const rawItem of rawItems) {
-    const selector = cleanSelector(rawItem?.selector);
-    if (!selector || Number(rawItem?.matchCount) !== 1) {
-      return { ok: false, error: '각 CSS 선택자는 정확히 하나의 요소와 일치해야 합니다.' };
-    }
-    if (seenSelectors.has(selector)) {
-      return { ok: false, error: '같은 CSS 선택자를 두 번 저장할 수 없습니다.' };
-    }
-    try {
-      await validateSelectorSyntax(selector);
-    } catch (error) {
-      return { ok: false, error: responseError(error) };
-    }
+    const selector = cleanSelector(typeof rawItem === 'string' ? rawItem : rawItem?.selector);
+    if (!selector) return null;
+    if (seenSelectors.has(selector)) continue;
     seenSelectors.add(selector);
-    items.push({
-      selector,
-      text: cleanSnapshotText(rawItem.text),
-      name: cleanText(rawItem.name, 120)
-    });
+
+    items.push({ selector });
+  }
+  return items.length ? items : null;
+}
+
+async function validateSelectorList(selectors) {
+  for (const selector of selectors) {
+    await validateSelectorSyntax(selector);
+  }
+}
+
+async function createMonitors(message, sender) {
+  const url = normalizeUrl(message.url);
+  const intervalHours = clampInterval(message.intervalHours);
+  const pickerItems = pickerItemsFromMessage(message);
+  if (!url || !intervalHours || !pickerItems) {
+    return { ok: false, error: 'URL, 확인 간격, 그리고 하나 이상의 CSS 선택자를 확인해 주세요.' };
+  }
+
+  try {
+    await validateSelectorList(pickerItems.map((item) => item.selector));
+  } catch (error) {
+    return { ok: false, error: responseError(error) };
   }
   if (!await hasSitePermission(url)) {
     return { ok: false, error: '저장하기 전에 이 사이트의 접근 권한을 허용해 주세요.' };
   }
 
-  const createdAt = nowIso();
+  const timestamp = nowIso();
   const pageTitle = cleanText(message.pageTitle, 180);
   const baseName = cleanText(message.name, 120) || pageTitle || new URL(url).hostname;
   const labels = cleanLabels(message.labels);
-  const selectionSetId = items.length > 1 ? createId() : null;
-  const monitorsToCreate = items.map((item, index) => ({
-    id: createId(),
-    revision: createRevision(),
-    name: item.name || (items.length > 1 ? `${baseName} · ${index + 1}` : baseName),
-    url,
-    pageTitle,
-    selector: item.selector,
-    labels,
-    selectionSetId,
-    selectionOrder: selectionSetId ? index : null,
-    intervalHours,
-    enabled: true,
-    createdAt,
-    updatedAt: createdAt,
-    lastCheckedAt: createdAt,
-    lastChangedAt: null,
-    nextCheckAt: addHours(createdAt, intervalHours),
-    snapshot: normalizeSnapshot({
-      exists: true,
-      matchCount: 1,
-      text: item.text,
-      capturedAt: createdAt
-    }),
-    lastChange: null,
-    lastReviewAt: null,
-    lastError: null,
-    status: 'ok',
-    unread: false
-  }));
-
-  await mutateMonitors((monitors) => {
-    if (monitors.length + monitorsToCreate.length > MAX_MONITORS) {
-      throw new Error(`모니터는 최대 ${MAX_MONITORS}개까지 저장할 수 있습니다.`);
+  const result = await mutateMonitors((monitors) => {
+    const existing = monitors.find((monitor) => monitor.url === url);
+    if (existing) {
+      const knownSelectors = new Set(existing.selectors);
+      const additions = pickerItems.filter((item) => !knownSelectors.has(item.selector));
+      if (additions.length) {
+        if (existing.selectors.length + additions.length > MAX_SELECTORS_PER_MONITOR) {
+          return { ok: false, error: `한 주소에는 CSS 선택자를 최대 ${MAX_SELECTORS_PER_MONITOR}개까지 저장할 수 있습니다.` };
+        }
+        existing.selectors = [...existing.selectors, ...additions.map((item) => item.selector)];
+        existing.revision = createRevision();
+        existing.updatedAt = timestamp;
+        // A picker session only knows the elements selected in that session,
+        // not the DOM order of the already-saved selectors.  Do not append its
+        // text to an old collection snapshot: that would manufacture a change
+        // on the next rendered check.  The due-now check below establishes one
+        // complete, DOM-ordered baseline for the expanded collection.
+        existing.snapshot = null;
+        existing.lastChange = null;
+        existing.lastCheckedAt = null;
+        existing.lastChangedAt = null;
+        existing.lastReviewAt = null;
+        existing.lastError = null;
+        existing.unread = false;
+        existing.status = 'needs-baseline';
+        existing.nextCheckAt = timestamp;
+      }
+      return { ok: true, monitor: { ...existing } };
     }
-    monitors.push(...monitorsToCreate);
-    return monitorsToCreate;
+
+    if (monitors.length >= MAX_MONITORS) {
+      throw new Error('추적은 최대 개수에 도달했습니다.');
+    }
+
+    const monitor = {
+      id: createId(),
+      revision: createRevision(),
+      name: baseName,
+      url,
+      pageTitle,
+      selectors: pickerItems.map((item) => item.selector),
+      labels,
+      intervalHours,
+      enabled: true,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastCheckedAt: null,
+      lastChangedAt: null,
+      // Establish the first baseline from the same rendered collection used
+      // for later checks, rather than from click order in the picker.
+      nextCheckAt: timestamp,
+      snapshot: null,
+      lastChange: null,
+      lastReviewAt: null,
+      lastError: null,
+      status: 'needs-baseline',
+      unread: false
+    };
+    monitors.push(monitor);
+    return { ok: true, monitor: { ...monitor } };
   });
+
+  if (!result?.ok) return result;
   await forgetPendingPicker(sender?.tab?.id);
   await scheduleNextAlarm();
-  return { ok: true, monitors: monitorsToCreate, count: monitorsToCreate.length };
+  return { ok: true, monitor: result.monitor, monitors: [result.monitor], count: 1 };
 }
 
 async function createMonitor(message, sender) {
-  const response = await createMonitors({
+  return createMonitors({
     ...message,
     items: [{
-      selector: message.selector,
-      text: message.text,
-      matchCount: message.matchCount,
-      name: message.name
+      selector: message.selector
     }]
   }, sender);
-  return response.ok ? { ok: true, monitor: response.monitors[0] } : response;
 }
 
 async function saveMonitor(message) {
   const url = normalizeUrl(message.url);
-  const selector = cleanSelector(message.selector);
+  const selectors = cleanSelectors(Object.hasOwn(message, 'selectors') ? message.selectors : message.selector);
   const intervalHours = clampInterval(message.intervalHours);
-  if (!message.id || !url || !selector || !intervalHours) {
-    return { ok: false, error: 'URL, CSS 선택자, 1시간~14일의 간격을 확인해 주세요.' };
+  if (!message.id || !url || !selectors || !intervalHours) {
+    return { ok: false, error: 'URL, CSS 선택자, 확인 간격을 확인해 주세요.' };
   }
 
   try {
-    await validateSelectorSyntax(selector);
+    await validateSelectorList(selectors);
   } catch (error) {
     return { ok: false, error: responseError(error) };
   }
 
   const existing = (await getMonitors()).find((item) => item.id === message.id);
-  const previousUrl = existing?.url;
+  if (!existing) {
+    return { ok: false, error: '추적을 찾을 수 없습니다.' };
+  }
+  const previousUrl = existing.url;
   const permissionGranted = await hasSitePermission(url);
   const result = await mutateMonitors((monitors) => {
     const monitor = monitors.find((item) => item.id === message.id);
     if (!monitor) {
-      return { ok: false, error: '모니터를 찾을 수 없습니다.' };
+      return { ok: false, error: '추적을 찾을 수 없습니다.' };
+    }
+    if (monitors.some((item) => item.id !== monitor.id && item.url === url)) {
+      return { ok: false, error: '이 주소는 이미 다른 추적으로 관리되고 있습니다.' };
     }
 
-    const selectionChanged = monitor.url !== url || monitor.selector !== selector;
+    const selectionChanged = monitor.url !== url || !selectorsEqual(monitor.selectors, selectors);
     monitor.name = cleanText(message.name, 120) || monitor.name;
     monitor.revision = createRevision();
     monitor.url = url;
-    monitor.selector = selector;
+    monitor.selectors = [...selectors];
     monitor.labels = cleanLabels(message.labels);
     monitor.intervalHours = intervalHours;
     const requestedEnabled = message.enabled !== false;
@@ -1103,7 +997,7 @@ async function saveMonitor(message) {
 
   await refreshBadge();
   await scheduleNextAlarm();
-  if (previousUrl) {
+  if (previousUrl !== url) {
     await releaseUnusedSitePermission(previousUrl);
   }
   return result;
@@ -1161,15 +1055,12 @@ async function deleteMonitor(id) {
 }
 
 function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) {
-  const reset = {
+  return {
     ...monitor,
     id: copy ? createId() : monitor.id,
     revision: createRevision(),
     url,
-    // Page grouping is derived from URL, so old one-off picker batches no longer
-    // have any behavioural meaning after an address is reused.
-    selectionSetId: null,
-    selectionOrder: null,
+    selectors: [...monitor.selectors],
     ...(copy ? { createdAt: timestamp } : {}),
     updatedAt: timestamp,
     lastCheckedAt: null,
@@ -1182,7 +1073,6 @@ function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) 
     status: 'needs-baseline',
     unread: false
   };
-  return reset;
 }
 
 async function reusePageUrl(message, { copy = false } = {}) {
@@ -1195,44 +1085,41 @@ async function reusePageUrl(message, { copy = false } = {}) {
     return { ok: false, error: '새 주소가 기존 주소와 같습니다.' };
   }
 
-  const sourceMonitors = (await getMonitors()).filter((monitor) => monitor.url === sourceUrl);
-  if (!sourceMonitors.length) {
+  const monitors = await getMonitors();
+  const sourceMonitor = monitors.find((monitor) => monitor.url === sourceUrl);
+  if (!sourceMonitor) {
     return { ok: false, error: '주소를 재사용할 추적 페이지를 찾을 수 없습니다.' };
   }
-  if (copy && sourceMonitors.length + (await getMonitors()).length > MAX_MONITORS) {
-    return { ok: false, error: `복제하면 모니터 최대 ${MAX_MONITORS}개 제한을 넘습니다.` };
+  if (monitors.some((monitor) => monitor.url === targetUrl)) {
+    return { ok: false, error: '새 주소는 이미 추적 중입니다.' };
   }
-
-  const hasEnabledMonitor = sourceMonitors.some((monitor) => monitor.enabled);
-  if (hasEnabledMonitor && !await hasSitePermission(targetUrl)) {
+  if (copy && monitors.length >= MAX_MONITORS) {
+    return { ok: false, error: '추적은 최대 개수에 도달했습니다.' };
+  }
+  if (sourceMonitor.enabled && !await hasSitePermission(targetUrl)) {
     return { ok: false, reason: 'permission', error: '새 사이트의 접근 권한이 필요합니다.' };
   }
 
   const timestamp = nowIso();
-  let affected = [];
-  const result = await mutateMonitors((monitors) => {
-    const sourceIds = new Set(sourceMonitors.map((monitor) => monitor.id));
-    if (copy) {
-      const clones = monitors
-        .filter((monitor) => sourceIds.has(monitor.id))
-        .map((monitor) => resetMonitorForPageUrl(monitor, targetUrl, timestamp, { copy: true }));
-      if (monitors.length + clones.length > MAX_MONITORS) {
-        return { ok: false, error: `복제하면 모니터 최대 ${MAX_MONITORS}개 제한을 넘습니다.` };
-      }
-      monitors.push(...clones);
-      affected = clones;
-    } else {
-      affected = monitors
-        .filter((monitor) => sourceIds.has(monitor.id))
-        .map((monitor) => resetMonitorForPageUrl(monitor, targetUrl, timestamp));
-      const replacementById = new Map(affected.map((monitor) => [monitor.id, monitor]));
-      monitors.forEach((monitor, index) => {
-        if (replacementById.has(monitor.id)) {
-          monitors[index] = replacementById.get(monitor.id);
-        }
-      });
+  const result = await mutateMonitors((currentMonitors) => {
+    const sourceIndex = currentMonitors.findIndex((monitor) => monitor.id === sourceMonitor.id);
+    if (sourceIndex < 0) {
+      return { ok: false, error: '주소를 재사용할 추적 페이지를 찾을 수 없습니다.' };
     }
-    return { ok: true, monitors: affected, count: affected.length };
+    if (currentMonitors.some((monitor) => monitor.id !== sourceMonitor.id && monitor.url === targetUrl)) {
+      return { ok: false, error: '새 주소는 이미 추적 중입니다.' };
+    }
+
+    const affected = resetMonitorForPageUrl(currentMonitors[sourceIndex], targetUrl, timestamp, { copy });
+    if (copy) {
+      if (currentMonitors.length >= MAX_MONITORS) {
+        return { ok: false, error: '추적은 최대 개수에 도달했습니다.' };
+      }
+      currentMonitors.push(affected);
+    } else {
+      currentMonitors[sourceIndex] = affected;
+    }
+    return { ok: true, monitor: { ...affected }, monitors: [{ ...affected }], count: 1 };
   });
 
   if (!result?.ok) return result;
@@ -1248,21 +1135,19 @@ async function deletePage(urlValue) {
   const url = normalizeUrl(urlValue);
   if (!url) return { ok: false, error: '삭제할 페이지 주소가 올바르지 않습니다.' };
 
-  let deletedCount = 0;
+  let deleted;
   await mutateMonitors((monitors) => {
-    for (let index = monitors.length - 1; index >= 0; index -= 1) {
-      if (monitors[index].url === url) {
-        monitors.splice(index, 1);
-        deletedCount += 1;
-      }
+    const index = monitors.findIndex((monitor) => monitor.url === url);
+    if (index >= 0) {
+      deleted = monitors.splice(index, 1)[0];
     }
   });
-  if (!deletedCount) return { ok: false, error: '삭제할 추적 페이지를 찾을 수 없습니다.' };
+  if (!deleted) return { ok: false, error: '삭제할 추적 페이지를 찾을 수 없습니다.' };
 
   await releaseUnusedSitePermission(url);
   await refreshBadge();
   await scheduleNextAlarm();
-  return { ok: true, deletedCount };
+  return { ok: true, deletedCount: 1 };
 }
 
 async function acknowledgeMonitor(id) {
@@ -1303,38 +1188,49 @@ async function importMonitors(message) {
   const sourceMonitors = Array.isArray(message.monitors) ? message.monitors : [];
   const rawMonitors = sourceMonitors.slice(0, MAX_MONITORS);
   const prepared = [];
+  const preparedUrls = new Set();
+  const usedIds = new Set();
   let rejected = Math.max(0, sourceMonitors.length - MAX_MONITORS);
   let imported = 0;
   let disabledForPermission = 0;
-  const usedIds = new Set();
 
   for (const raw of rawMonitors) {
-    const monitor = normalizeMonitor(raw);
-    if (!monitor) {
+    if (!raw || !Array.isArray(raw.selectors)) {
       rejected += 1;
       continue;
     }
-    if (usedIds.has(monitor.id)) {
-      monitor.id = createId();
-    }
-    usedIds.add(monitor.id);
 
+    const monitor = normalizeMonitor(raw);
+    if (!monitor || preparedUrls.has(monitor.url)) {
+      rejected += 1;
+      continue;
+    }
     try {
-      await validateSelectorSyntax(monitor.selector);
+      await validateSelectorList(monitor.selectors);
     } catch {
       rejected += 1;
       continue;
     }
+
+    if (usedIds.has(monitor.id)) {
+      monitor.id = createId();
+    }
+    usedIds.add(monitor.id);
+    preparedUrls.add(monitor.url);
+    monitor.revision = createRevision();
+
+    if (!monitor.snapshot && monitor.status === 'ok') {
+      monitor.status = 'needs-baseline';
+    }
     if (monitor.enabled && !await hasSitePermission(monitor.url)) {
       monitor.enabled = false;
       monitor.status = 'permission-needed';
-      monitor.lastError = '가져온 뒤 이 사이트의 접근 권한을 허용해 주세요.';
+      monitor.lastError = '가져온 추적에 이 사이트의 접근 권한이 필요합니다.';
       disabledForPermission += 1;
     } else if (!monitor.enabled && monitor.status === 'permission-needed') {
       monitor.status = statusForStoredSnapshot(monitor.snapshot);
       monitor.lastError = null;
     }
-    monitor.revision = createRevision();
     prepared.push(monitor);
   }
 
@@ -1343,10 +1239,19 @@ async function importMonitors(message) {
       monitors.splice(0, monitors.length);
     }
 
-    for (const monitor of prepared) {
-      const index = monitors.findIndex((item) => item.id === monitor.id);
-      if (index >= 0) {
-        monitors[index] = monitor;
+    for (const preparedMonitor of prepared) {
+      const monitor = {
+        ...preparedMonitor,
+        selectors: [...preparedMonitor.selectors]
+      };
+      const urlIndex = monitors.findIndex((item) => item.url === monitor.url);
+      const idCollision = monitors.some((item) => item.id === monitor.id && item.url !== monitor.url);
+      if (idCollision) {
+        monitor.id = createId();
+      }
+
+      if (urlIndex >= 0) {
+        monitors[urlIndex] = monitor;
         imported += 1;
       } else if (monitors.length < MAX_MONITORS) {
         monitors.push(monitor);

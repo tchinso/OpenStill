@@ -8,9 +8,12 @@
 
   const MAX_HIGHLIGHTS = 20;
   const MAX_SELECTIONS = 20;
+  // The quick pass runs while the pointer is moving.  The full pass only runs
+  // when an element is committed, so it can spend more work finding a concise
+  // semantic path instead of falling back to a brittle chain of nth-childs.
   const SELECTOR_SEARCH = Object.freeze({
-    quick: { queryBudget: 120, beamWidth: 18, maxParts: 3 },
-    full: { queryBudget: 700, beamWidth: 56, maxParts: 5 }
+    quick: { queryBudget: 180, beamWidth: 28, maxParts: 4 },
+    full: { queryBudget: 2_400, beamWidth: 112, maxParts: 7 }
   });
   const selectorCache = new WeakMap();
 
@@ -31,6 +34,32 @@
 
   function snapshotTextFor(element) {
     return cleanSnapshotText(element?.innerText || element?.textContent);
+  }
+
+  function uniqueElementsInDocumentOrder(elements) {
+    const unique = [...new Set(Array.from(elements ?? []).filter((element) => (
+      element instanceof Element
+      && element.isConnected
+      && document.documentElement.contains(element)
+    )))];
+    return unique.sort((left, right) => {
+      if (left === right) return 0;
+      return left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    });
+  }
+
+  function removeNestedElements(elements) {
+    const ordered = uniqueElementsInDocumentOrder(elements);
+    return ordered.filter((element, index) => !ordered
+      .slice(0, index)
+      .some((ancestor) => ancestor.contains(element)));
+  }
+
+  function snapshotTextForElements(elements) {
+    return cleanSnapshotText(uniqueElementsInDocumentOrder(elements)
+      .map((element) => snapshotTextFor(element))
+      .filter(Boolean)
+      .join('\n\n'));
   }
 
   function escapeCss(value) {
@@ -121,11 +150,17 @@
     return [...fragments];
   }
 
-  function addSelectorFeature(features, css, cost) {
+  function addSelectorFeature(features, css, cost, { semantic = false, positional = false } = {}) {
     if (!css || css.length > 180) return;
     const prior = features.get(css);
     if (!prior || cost < prior.cost) {
-      features.set(css, { css, cost });
+      features.set(css, { css, cost, semantic, positional });
+    } else if (cost === prior.cost && (semantic || positional)) {
+      features.set(css, {
+        ...prior,
+        semantic: prior.semantic || semantic,
+        positional: prior.positional || positional
+      });
     }
   }
 
@@ -135,59 +170,82 @@
     const features = new Map();
 
     if (element.id && isSemanticIdentifier(element.id)) {
-      addSelectorFeature(features, '#' + escapeCss(element.id), 0.7);
+      addSelectorFeature(features, '#' + escapeCss(element.id), 0.7, { semantic: true });
     }
 
-    const attributeNames = ['data-testid', 'data-test', 'data-cy', 'data-qa', 'data-id', 'name', 'role', 'type', 'for'];
+    const attributeNames = new Set([
+      'data-testid', 'data-test', 'data-cy', 'data-qa', 'data-id',
+      'name', 'role', 'type', 'for', 'aria-label', 'aria-labelledby', 'title'
+    ]);
+    for (const attribute of element.attributes) {
+      if (/^data-[a-z][a-z0-9_-]*$/i.test(attribute.name)) {
+        attributeNames.add(attribute.name);
+      }
+    }
     for (const name of attributeNames) {
       const value = element.getAttribute(name);
       if (value && isSafeSelectorAttribute(value)) {
         const attribute = '[' + name + "='" + escapeCssString(value) + "']";
-        addSelectorFeature(features, attribute, 2.2);
-        addSelectorFeature(features, tag + attribute, 2.8);
+        addSelectorFeature(features, attribute, 2.2, { semantic: true });
+        addSelectorFeature(features, tag + attribute, 2.8, { semantic: true });
       }
     }
 
     const stableClasses = [...element.classList].filter(isSemanticClass);
     for (const className of stableClasses) {
       const cssClass = '.' + escapeCss(className);
-      addSelectorFeature(features, cssClass, 3.1);
-      addSelectorFeature(features, tag + cssClass, 3.9);
+      addSelectorFeature(features, cssClass, 3.1, { semantic: true });
+      addSelectorFeature(features, tag + cssClass, 3.9, { semantic: true });
     }
     for (let index = 0; index < Math.min(stableClasses.length, 5); index += 1) {
       for (let next = index + 1; next < Math.min(stableClasses.length, 5); next += 1) {
-        addSelectorFeature(features, '.' + escapeCss(stableClasses[index]) + '.' + escapeCss(stableClasses[next]), 5.1);
+        addSelectorFeature(
+          features,
+          '.' + escapeCss(stableClasses[index]) + '.' + escapeCss(stableClasses[next]),
+          5.1,
+          { semantic: true }
+        );
       }
     }
 
     for (const className of element.classList) {
       for (const fragment of partialClassFragments(className)) {
         const partial = "[class*='" + escapeCssString(fragment) + "']";
-        addSelectorFeature(features, partial, 5.8);
-        addSelectorFeature(features, tag + partial, 6.4);
+        addSelectorFeature(features, partial, 5.8, { semantic: true });
+        addSelectorFeature(features, tag + partial, 6.4, { semantic: true });
       }
     }
 
     const childPosition = elementChildPosition(element);
     const typePosition = elementTypePosition(element);
     if (childPosition === 1) {
-      addSelectorFeature(features, tag + ':first-child', 8.2);
+      addSelectorFeature(features, tag + ':first-child', 8.2, { positional: true });
     } else if (element.parentElement?.lastElementChild === element) {
-      addSelectorFeature(features, tag + ':last-child', 8.5);
+      addSelectorFeature(features, tag + ':last-child', 8.5, { positional: true });
     } else if (childPosition) {
-      addSelectorFeature(features, tag + ':nth-child(' + childPosition + ')', 14 + Math.min(childPosition, 8) * 0.3);
+      addSelectorFeature(
+        features,
+        tag + ':nth-child(' + childPosition + ')',
+        14 + Math.min(childPosition, 8) * 0.3,
+        { positional: true }
+      );
     }
     if (typePosition === 1 && childPosition !== 1) {
-      addSelectorFeature(features, tag + ':first-of-type', 10.8);
+      addSelectorFeature(features, tag + ':first-of-type', 10.8, { positional: true });
     } else if (typePosition && typePosition > 1) {
-      addSelectorFeature(features, tag + ':nth-of-type(' + typePosition + ')', 15 + Math.min(typePosition, 8) * 0.3);
+      addSelectorFeature(
+        features,
+        tag + ':nth-of-type(' + typePosition + ')',
+        15 + Math.min(typePosition, 8) * 0.3,
+        { positional: true }
+      );
     }
     addSelectorFeature(features, tag, 12);
 
     const ordered = [...features.values()]
       .sort((left, right) => left.cost - right.cost || left.css.length - right.css.length || left.css.localeCompare(right.css));
-    const positional = ordered.filter((feature) => /:(?:first|last)(?:-of-type|-child)?|:nth-(?:child|of-type)\(/.test(feature.css));
-    const ordinary = ordered.filter((feature) => !positional.includes(feature));
+    const positional = ordered.filter((feature) => feature.positional);
+    const ordinary = ordered.filter((feature) => !feature.positional);
     return [...ordinary.slice(0, Math.max(1, maxFeatures - positional.length)), ...positional]
       .sort((left, right) => left.cost - right.cost || left.css.length - right.css.length || left.css.localeCompare(right.css));
   }
@@ -210,19 +268,133 @@
     }
   }
 
+  function candidateRank(candidate) {
+    const semanticParts = candidate.semanticParts ?? 0;
+    const positionalParts = candidate.positionalParts ?? 0;
+    const directParts = candidate.directParts ?? 0;
+    const parts = candidate.parts ?? 1;
+    // Positional and direct-child links are useful tie-breakers, but they are
+    // the first things to become stale when a list is re-rendered.  Prefer a
+    // path that explains the target with semantic classes/attributes instead.
+    return candidate.cost
+      + positionalParts * 2.4
+      + directParts * 1.1
+      + Math.max(0, parts - semanticParts - 1) * 0.6
+      - Math.min(semanticParts, 3) * 0.9;
+  }
+
   function candidateIsBetter(candidate, best) {
     if (!best) return true;
+    const candidateScore = candidateRank(candidate);
+    const bestScore = candidateRank(best);
+    if (candidateScore !== bestScore) return candidateScore < bestScore;
+    if ((candidate.semanticParts ?? 0) !== (best.semanticParts ?? 0)) {
+      return (candidate.semanticParts ?? 0) > (best.semanticParts ?? 0);
+    }
     if (candidate.cost !== best.cost) return candidate.cost < best.cost;
     if (candidate.css.length !== best.css.length) return candidate.css.length < best.css.length;
     return candidate.css.localeCompare(best.css) < 0;
   }
 
-  function strictSelectorFallback(element) {
+  function semanticFallbackFeatures(element, limit, { allowNeutral = false } = {}) {
+    const features = selectorFeatures(element, limit);
+    const semantic = features.filter((feature) => feature.semantic);
+    const positions = features.filter((feature) => feature.positional);
+    const neutral = allowNeutral
+      ? features.filter((feature) => !feature.semantic && !feature.positional).slice(0, 1)
+      : [];
+    return [...semantic, ...positions.slice(0, 2), ...neutral];
+  }
+
+  function semanticDescendantFallback(element) {
+    const path = [];
+    for (let current = element; current && path.length < 12; current = current.parentElement) {
+      path.push(current);
+      if (current === document.body) break;
+    }
+
+    const queryCache = new Map();
+    const budget = { used: 0, limit: 900 };
+    const leafFeatures = semanticFallbackFeatures(element, 30, { allowNeutral: true });
+    let best = null;
+    let frontier = [];
+    const visited = new Set();
+
+    for (const feature of leafFeatures) {
+      visited.add(`0\u0000${feature.css}`);
+      const inspection = inspectCandidate(feature.css, element, queryCache, budget);
+      if (!inspection.containsTarget) continue;
+      const state = {
+        css: feature.css,
+        cost: feature.cost,
+        outerIndex: 0,
+        count: inspection.count,
+        semanticParts: feature.semantic ? 1 : 0,
+        positionalParts: feature.positional ? 1 : 0,
+        directParts: 0,
+        parts: 1
+      };
+      if (inspection.count === 1 && state.semanticParts > 0) {
+        if (candidateIsBetter(state, best)) best = state;
+      } else {
+        frontier.push(state);
+      }
+    }
+
+    for (let round = 1; frontier.length && round < 8 && budget.used < budget.limit; round += 1) {
+      const next = [];
+      const ranked = frontier
+        .sort((left, right) => candidateRank(left) + Math.log2(left.count + 1)
+          - candidateRank(right) - Math.log2(right.count + 1))
+        .slice(0, 72);
+      for (const state of ranked) {
+        for (let pathIndex = state.outerIndex + 1; pathIndex < path.length; pathIndex += 1) {
+          for (const feature of semanticFallbackFeatures(path[pathIndex], 24)) {
+            const css = feature.css + ' ' + state.css;
+            const key = `${pathIndex}\u0000${css}`;
+            if (visited.has(key)) continue;
+            visited.add(key);
+            const inspection = inspectCandidate(css, element, queryCache, budget);
+            if (!inspection.containsTarget) continue;
+            const nextState = {
+              css,
+              cost: state.cost + feature.cost + 0.35,
+              outerIndex: pathIndex,
+              count: inspection.count,
+              semanticParts: state.semanticParts + (feature.semantic ? 1 : 0),
+              positionalParts: state.positionalParts + (feature.positional ? 1 : 0),
+              directParts: state.directParts,
+              parts: state.parts + 1
+            };
+            if (inspection.count === 1 && nextState.semanticParts > 0) {
+              if (candidateIsBetter(nextState, best)) best = nextState;
+            } else {
+              next.push(nextState);
+            }
+          }
+          if (budget.used >= budget.limit) break;
+        }
+      }
+      frontier = next
+        .sort((left, right) => candidateRank(left) + Math.log2(left.count + 1)
+          - candidateRank(right) - Math.log2(right.count + 1))
+        .slice(0, 72);
+    }
+
+    return best?.css || '';
+  }
+
+  function strictSelectorFallback(element, { preferSemantic = true } = {}) {
+    if (preferSemantic) {
+      const semanticSelector = semanticDescendantFallback(element);
+      if (semanticSelector) return semanticSelector;
+    }
+
     const parts = [];
     let current = element;
     for (let depth = 0; current && depth < 16; depth += 1, current = current.parentElement) {
       const tag = current.localName?.toLowerCase() || '*';
-      if (current.id) {
+      if (current.id && isSemanticIdentifier(current.id)) {
         parts.unshift('#' + escapeCss(current.id));
         break;
       }
@@ -231,6 +403,15 @@
       if (current === document.documentElement) break;
     }
     return parts.join(' > ');
+  }
+
+  function selectorStructuralPenalty(selector) {
+    if (!selector) return Number.POSITIVE_INFINITY;
+    const directLinks = (selector.match(/\s>\s/g) ?? []).length;
+    const nthParts = (selector.match(/:nth-(?:child|of-type)\(/g) ?? []).length;
+    const positionalParts = (selector.match(/:(?:first|last)(?:-of-type|-child)?|:nth-(?:child|of-type)\(/g) ?? []).length;
+    const parts = selector.trim().split(/\s+(?:>\s+)?/).filter(Boolean).length;
+    return directLinks * 7 + nthParts * 8 + positionalParts * 1.5 + Math.max(0, parts - 4) * 0.5;
   }
 
   function selectorFor(element, { quick = false } = {}) {
@@ -244,9 +425,10 @@
     if (quick && cached.full && hasSingleMatch(cached.full, element)) return cached.full;
 
     const config = quick ? SELECTOR_SEARCH.quick : SELECTOR_SEARCH.full;
-    const maxFeatures = quick ? 14 : 24;
+    const maxFeatures = quick ? 16 : 28;
     const path = [];
-    for (let current = element; current && path.length < 9; current = current.parentElement) {
+    const maxPathDepth = quick ? 8 : 12;
+    for (let current = element; current && path.length < maxPathDepth; current = current.parentElement) {
       path.push(current);
       if (current === document.body) break;
     }
@@ -258,7 +440,16 @@
     for (const feature of selectorFeatures(element, maxFeatures)) {
       const inspection = inspectCandidate(feature.css, element, queryCache, budget);
       if (!inspection.containsTarget) continue;
-      const state = { css: feature.css, cost: feature.cost, outerIndex: 0, count: inspection.count };
+      const state = {
+        css: feature.css,
+        cost: feature.cost,
+        outerIndex: 0,
+        count: inspection.count,
+        semanticParts: feature.semantic ? 1 : 0,
+        positionalParts: feature.positional ? 1 : 0,
+        directParts: 0,
+        parts: 1
+      };
       if (inspection.count === 1) {
         if (candidateIsBetter(state, best)) best = state;
       } else {
@@ -270,7 +461,10 @@
     for (let round = 1; frontier.length && round < config.maxParts && budget.used < budget.limit; round += 1) {
       const next = [];
       const ranked = frontier
-        .sort((left, right) => left.cost + Math.log2(left.count + 1) - (right.cost + Math.log2(right.count + 1)))
+        .sort((left, right) => (
+          candidateRank(left) + Math.log2(left.count + 1)
+          - candidateRank(right) - Math.log2(right.count + 1)
+        ))
         .slice(0, config.beamWidth);
       for (const state of ranked) {
         for (let pathIndex = state.outerIndex + 1; pathIndex < path.length; pathIndex += 1) {
@@ -287,7 +481,11 @@
                 css,
                 cost: state.cost + feature.cost + (connector === ' > ' ? 2.1 : 0.55),
                 outerIndex: pathIndex,
-                count: inspection.count
+                count: inspection.count,
+                semanticParts: state.semanticParts + (feature.semantic ? 1 : 0),
+                positionalParts: state.positionalParts + (feature.positional ? 1 : 0),
+                directParts: state.directParts + (connector === ' > ' ? 1 : 0),
+                parts: state.parts + 1
               };
               if (inspection.count === 1) {
                 if (candidateIsBetter(nextState, best)) best = nextState;
@@ -300,11 +498,24 @@
         }
       }
       frontier = next
-        .sort((left, right) => left.cost + Math.log2(left.count + 1) - (right.cost + Math.log2(right.count + 1)))
+        .sort((left, right) => (
+          candidateRank(left) + Math.log2(left.count + 1)
+          - candidateRank(right) - Math.log2(right.count + 1)
+        ))
         .slice(0, config.beamWidth);
     }
 
-    const selector = best?.css || strictSelectorFallback(element);
+    let selector = best?.css || '';
+    // A semantic descendant path is often less brittle than a technically
+    // valid direct-child chain on utility-class-heavy list pages.  Prefer it
+    // only when it meaningfully removes structural constraints.
+    if (!quick) {
+      const semanticSelector = semanticDescendantFallback(element);
+      if (semanticSelector && selectorStructuralPenalty(semanticSelector) + 0.5 < selectorStructuralPenalty(selector)) {
+        selector = semanticSelector;
+      }
+    }
+    if (!selector) selector = strictSelectorFallback(element, { preferSemantic: !quick });
     cached[quick ? 'quick' : 'full'] = selector;
     selectorCache.set(element, cached);
     return selector;
@@ -400,7 +611,7 @@
           <div class="body">
             <p class="hint" id="pickHint"><b>선택 모드</b> · 마우스를 올리면 선택자가 보입니다. Esc를 누르면 닫습니다.</p>
             <form class="form" id="form" hidden novalidate>
-              <p class="notice">요소를 여러 개 고른 뒤 한 번에 저장할 수 있습니다. 각 선택자는 하나의 요소에만 일치해야 합니다.</p>
+              <p class="notice">요소를 여러 개 고른 뒤 한 번에 저장할 수 있습니다. 선택자 결과 전체는 한 주소의 목록으로 함께 비교됩니다.</p>
               <p class="selection-summary" id="selectionSummary">선택한 요소 0개</p>
               <div class="selection-list" id="selectionList"></div>
               <label>CSS 선택자
@@ -568,6 +779,17 @@
       return this.selections[this.activeSelectionIndex] ?? null;
     }
 
+    setSelectionMatchInfo(selection, matches, includedElements = matches) {
+      const matchedElements = uniqueElementsInDocumentOrder(matches);
+      const elements = uniqueElementsInDocumentOrder(includedElements);
+      selection.matchedElements = matchedElements;
+      selection.elements = elements;
+      selection.element = elements[0] ?? matchedElements[0] ?? null;
+      selection.totalMatchCount = matchedElements.length;
+      selection.matchCount = elements.length;
+      selection.text = snapshotTextForElements(elements);
+    }
+
     renderSelectionList() {
       this.selectionSummary.textContent = '선택한 요소 ' + this.selections.length + '개';
       this.saveButton.textContent = this.selections.length > 1 ? this.selections.length + '개 추적 저장' : '추적 저장';
@@ -586,6 +808,8 @@
         preview.className = 'selection-text';
         preview.textContent = cleanText(selection.text, 130) || '(텍스트 없음)';
         selectButton.append(css, preview);
+        const matchCount = selection.totalMatchCount ?? selection.matchCount ?? 0;
+        preview.textContent = `${matchCount}개 일치 · ${cleanText(selection.text, 130) || '(텍스트 없음)'}`;
         const removeButton = document.createElement('button');
         removeButton.type = 'button';
         removeButton.className = 'remove-selection';
@@ -603,7 +827,9 @@
       const selection = this.selections[index];
       this.selectedElement = selection.element;
       this.selectorInput.value = selection.selector;
-      this.matchElements = selection.element ? [selection.element] : [];
+      this.matchElements = selection.matchedElements?.length
+        ? selection.matchedElements
+        : selection.elements ?? (selection.element ? [selection.element] : []);
       this.renderSelectionList();
       this.validateSelector();
     }
@@ -635,7 +861,8 @@
       this.selectedElement = selection.element;
       this.selectorInput.value = selection.selector;
       if (!this.nameInput.value) {
-        this.nameInput.value = cleanText(document.title, 100) || selection.element.localName.toLowerCase() + ' 요소';
+        this.nameInput.value = cleanText(document.title, 100)
+          || selection.element?.localName?.toLowerCase() + ' 요소';
       }
       this.tooltip.hidden = true;
       this.renderSelectionList();
@@ -655,29 +882,31 @@
         this.message.textContent = '생성한 CSS 선택자를 검증하지 못했습니다.';
         return;
       }
-      if (matches.length !== 1 || matches[0] !== element) {
-        this.message.textContent = '정확히 하나의 요소를 가리키는 선택자를 만들지 못했습니다.';
+      if (!matches.length || !matches.includes(element)) {
+        this.message.textContent = '생성한 CSS 선택자가 선택한 요소를 포함하지 않습니다.';
         return;
       }
 
-      const existingIndex = this.selections.findIndex((selection) => selection.element === element || selection.selector === selector);
+      const existingIndex = this.selections.findIndex((selection) => (
+        selection.selector === selector
+        || selection.element === element
+        || selection.matchedElements?.includes(element)
+      ));
       if (existingIndex >= 0) {
         this.activeSelectionIndex = existingIndex;
+        this.setSelectionMatchInfo(this.selections[existingIndex], matches);
       } else {
         if (this.selections.length >= MAX_SELECTIONS) {
           this.showEditor();
           this.message.textContent = '한 번에 선택할 수 있는 요소는 최대 ' + MAX_SELECTIONS + '개입니다.';
           return;
         }
-        this.selections.push({
-          element,
-          selector,
-          text: snapshotTextFor(element),
-          matchCount: 1
-        });
+        const selection = { selector };
+        this.setSelectionMatchInfo(selection, matches);
+        this.selections.push(selection);
         this.activeSelectionIndex = this.selections.length - 1;
       }
-      this.matchElements = [element];
+      this.matchElements = matches;
       this.showEditor();
       this.selectorInput.focus();
       this.selectorInput.select();
@@ -705,11 +934,22 @@
         drawn.add(element);
       };
 
-      this.selections.slice(0, MAX_HIGHLIGHTS).forEach((selection, index) => {
-        draw(selection.element, 'match selected' + (index === this.activeSelectionIndex ? ' primary' : ''));
+      this.selections.forEach((selection, selectionIndex) => {
+        const elements = selection.elements?.length
+          ? selection.elements
+          : selection.matchedElements ?? (selection.element ? [selection.element] : []);
+        elements.forEach((element, elementIndex) => {
+          if (drawn.size < MAX_HIGHLIGHTS) {
+            draw(element, 'match selected' + (
+              selectionIndex === this.activeSelectionIndex && elementIndex === 0 ? ' primary' : ''
+            ));
+          }
+        });
       });
-      this.matchElements.slice(0, MAX_HIGHLIGHTS).forEach((element, index) => {
-        draw(element, 'match' + (index === 0 ? ' primary' : ''));
+      this.matchElements.forEach((element, index) => {
+        if (drawn.size < MAX_HIGHLIGHTS) {
+          draw(element, 'match' + (index === 0 ? ' primary' : ''));
+        }
       });
     }
 
@@ -777,22 +1017,23 @@
         const matches = [...document.querySelectorAll(selector)];
         this.matchElements = matches;
         this.renderHighlights();
-        if (matches.length !== 1) {
-          this.validity.textContent = matches.length + '개 요소와 일치합니다. 정확히 1개가 되도록 선택자를 다듬어 주세요.';
+        if (!matches.length) {
+          this.validity.textContent = '일치하는 요소가 없습니다. CSS 선택자를 확인해 주세요.';
           this.validity.classList.add('error');
           this.saveButton.disabled = true;
           return false;
         }
 
         active.selector = selector;
-        active.element = matches[0];
-        active.text = snapshotTextFor(matches[0]);
-        active.matchCount = 1;
-        this.selectedElement = matches[0];
+        this.setSelectionMatchInfo(active, matches);
+        this.selectedElement = active.element;
         const preview = document.createElement('div');
         preview.className = 'preview';
         preview.textContent = active.text.slice(0, 700) || '(텍스트 없음)';
-        this.validity.replaceChildren(document.createTextNode('1개 요소와 일치합니다.'), preview);
+        const message = matches.length === 1
+          ? '1개 요소와 일치합니다.'
+          : `${matches.length}개 요소와 일치합니다. 모두 함께 추적합니다.`;
+        this.validity.replaceChildren(document.createTextNode(message), preview);
         this.validity.classList.add('ok');
         this.renderSelectionList();
         this.saveButton.disabled = !(totalHours >= 1 && totalHours <= 336 && this.selections.length);
@@ -810,57 +1051,87 @@
         this.message.textContent = '최소 한 개의 요소를 선택해 주세요.';
         return false;
       }
-      const seenSelectors = new Set();
-      const seenElements = new Set();
+
+      const activeSelection = this.currentSelection();
+      const resolved = [];
       for (let index = 0; index < this.selections.length; index += 1) {
         const selection = this.selections[index];
-        if (seenSelectors.has(selection.selector)) {
+        const selector = selection.selector.trim();
+        if (!selector) {
           this.activeSelectionIndex = index;
-          this.selectorInput.value = selection.selector;
-          this.message.textContent = '같은 CSS 선택자가 두 번 포함되어 있습니다.';
+          this.selectorInput.value = '';
+          this.message.textContent = (index + 1) + '번째 CSS 선택자를 입력해 주세요.';
           this.renderSelectionList();
           return false;
         }
-        seenSelectors.add(selection.selector);
         try {
-          const matches = [...document.querySelectorAll(selection.selector)];
-          if (matches.length !== 1) {
+          const matches = uniqueElementsInDocumentOrder(document.querySelectorAll(selector));
+          if (!matches.length) {
             this.activeSelectionIndex = index;
-            this.selectorInput.value = selection.selector;
-            this.message.textContent = (index + 1) + '번째 선택자가 현재 ' + matches.length + '개 요소와 일치합니다.';
-            this.renderSelectionList();
-            this.validateSelector();
-            return false;
-          }
-          if (seenElements.has(matches[0])) {
-            this.activeSelectionIndex = index;
-            this.selectorInput.value = selection.selector;
-            this.message.textContent = (index + 1) + '번째 선택자는 이미 고른 실제 요소와 겹칩니다.';
-            this.matchElements = [matches[0]];
+            this.selectorInput.value = selector;
+            this.message.textContent = (index + 1) + '번째 선택자와 일치하는 요소가 없습니다.';
+            this.matchElements = [];
             this.renderHighlights();
-            this.validity.textContent = '이미 선택한 실제 요소와 겹치는 CSS 선택자입니다.';
+            this.validity.textContent = '일치하는 요소가 없습니다. CSS 선택자를 확인해 주세요.';
             this.validity.className = 'validity error';
             this.saveButton.disabled = true;
             this.renderSelectionList();
             return false;
           }
-          seenElements.add(matches[0]);
-          selection.element = matches[0];
-          selection.text = snapshotTextFor(matches[0]);
-          selection.matchCount = 1;
+          resolved.push({ selection, matches });
         } catch (error) {
           this.activeSelectionIndex = index;
-          this.selectorInput.value = selection.selector;
+          this.selectorInput.value = selector;
           this.message.textContent = (index + 1) + '번째 CSS 선택자가 유효하지 않습니다: ' + error.message;
           this.renderSelectionList();
           return false;
         }
       }
-      this.activeSelectionIndex = Math.min(Math.max(this.activeSelectionIndex, 0), this.selections.length - 1);
-      this.selectorInput.value = this.selections[this.activeSelectionIndex].selector;
-      this.matchElements = [this.selections[this.activeSelectionIndex].element];
+
+      // Reference-style grouped capture keeps a DOM node only once.  Resolve
+      // the complete union first so an ancestor wins over its selected child,
+      // then assign each remaining root to the first selector that contains it.
+      const roots = removeNestedElements(resolved.flatMap(({ matches }) => matches));
+      const ownedBySelection = new Map(resolved.map(({ selection }) => [selection, []]));
+      for (const root of roots) {
+        const owner = resolved.find(({ matches }) => matches.includes(root));
+        if (owner) {
+          ownedBySelection.get(owner.selection).push(root);
+        }
+      }
+
+      const retained = [];
+      for (const { selection, matches } of resolved) {
+        const ownedElements = ownedBySelection.get(selection) ?? [];
+        if (!ownedElements.length) continue;
+        this.setSelectionMatchInfo(selection, matches, ownedElements);
+        retained.push(selection);
+      }
+
+      const removedCount = this.selections.length - retained.length;
+      this.selections = retained;
+      if (!this.selections.length) {
+        this.activeSelectionIndex = -1;
+        this.message.textContent = '선택한 요소가 모두 다른 선택자에 포함됩니다. CSS 선택자를 다시 확인해 주세요.';
+        this.saveButton.disabled = true;
+        this.renderSelectionList();
+        return false;
+      }
+
+      let activeIndex = this.selections.indexOf(activeSelection);
+      if (activeIndex < 0) {
+        activeIndex = Math.min(Math.max(this.activeSelectionIndex, 0), this.selections.length - 1);
+      }
+      this.activeSelectionIndex = activeIndex;
+      const active = this.selections[activeIndex];
+      this.selectedElement = active.element;
+      this.selectorInput.value = active.selector;
+      this.matchElements = active.matchedElements?.length ? active.matchedElements : active.elements;
       this.renderHighlights();
       this.renderSelectionList();
+      if (removedCount) {
+        this.message.textContent = `중복되거나 상위 선택에 포함된 ${removedCount}개 선택을 합쳐 저장합니다.`;
+      }
       return true;
     }
 
@@ -883,7 +1154,7 @@
       this.cancelButton.disabled = true;
       this.selectAgainButton.disabled = true;
       this.message.style.color = '#aebed2';
-      this.message.textContent = this.selections.length + '개 요소의 기준 텍스트를 저장하는 중입니다…';
+        this.message.textContent = this.selections.length + '개 선택 결과를 이 주소의 하나의 기준 목록으로 저장하는 중입니다…';
 
       try {
         const response = await chrome.runtime.sendMessage({
@@ -894,9 +1165,7 @@
           labels: this.labelsInput.value.split(','),
           intervalHours: totalHours,
           items: this.selections.map((selection) => ({
-            selector: selection.selector,
-            text: selection.text,
-            matchCount: selection.matchCount
+            selector: selection.selector
           }))
         });
         if (!response?.ok) {
@@ -905,7 +1174,8 @@
         this.saved = true;
         this.saving = false;
         this.message.style.color = '#77edbd';
-        this.message.textContent = (response.count || this.selections.length) + '개 요소를 저장했습니다. 다음 확인 시 변경 여부를 알려드릴게요.';
+        const selectorCount = response.monitor?.selectors?.length ?? this.selections.length;
+        this.message.textContent = `${selectorCount}개 선택자를 이 주소의 하나의 추적에 저장했습니다. 다음 확인에서 기준 목록을 만든 뒤 이후 변경을 알려드릴게요.`;
         this.subtitle.textContent = '추적이 시작되었습니다';
         setTimeout(() => this.destroy(), 1_100);
       } catch (error) {

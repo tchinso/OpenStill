@@ -28,7 +28,7 @@
     editId: document.querySelector('#editId'),
     editName: document.querySelector('#editName'),
     editUrl: document.querySelector('#editUrl'),
-    editSelector: document.querySelector('#editSelector'),
+    editSelectors: document.querySelector('#editSelectors'),
     editLabels: document.querySelector('#editLabels'),
     editDays: document.querySelector('#editDays'),
     editHours: document.querySelector('#editHours'),
@@ -62,6 +62,32 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+
+  function selectorsOf(monitor) {
+    const selectors = Array.isArray(monitor?.selectors) ? monitor.selectors : [];
+    return selectors
+      .map((item) => typeof item === 'string' ? item : item?.selector ?? item?.css)
+      .map((selector) => String(selector ?? '').trim())
+      .filter(Boolean);
+  }
+
+  function selectorPreview(monitor) {
+    const selectors = selectorsOf(monitor);
+    if (!selectors.length) return 'CSS 선택자가 없습니다.';
+    const first = selectors[0];
+    return selectors.length === 1 ? first : `${selectors.length}개 선택자 · ${first}`;
+  }
+
+  function snapshotItems(snapshot) {
+    if (Array.isArray(snapshot?.items) && snapshot.items.length) {
+      return snapshot.items
+        .map((item) => typeof item === 'string' ? item : item?.text)
+        .map((text) => String(text ?? '').trim())
+        .filter(Boolean);
+    }
+    const text = String(snapshot?.text ?? '').trim();
+    return text ? text.split('\n').filter(Boolean) : [];
   }
 
   function formatDuration(hours) {
@@ -151,7 +177,7 @@
     if (filters.status === 'paused' && monitor.enabled) return false;
     const query = filters.query.trim().toLocaleLowerCase('ko-KR');
     if (!query) return true;
-    const haystack = [monitor.name, monitor.url, monitor.selector, ...(monitor.labels ?? [])]
+    const haystack = [monitor.name, monitor.url, ...selectorsOf(monitor), ...(monitor.labels ?? [])]
       .join(' ')
       .toLocaleLowerCase('ko-KR');
     return haystack.includes(query);
@@ -272,7 +298,7 @@
     const card = element('article', `tracking-card${monitor.unread ? ' unread' : ''}${needsAttention(monitor) ? ' needs-attention' : ''}`);
     const top = element('div', 'tracking-top');
     const title = element('div', 'tracking-title');
-    title.append(element('h4', '', monitor.name), element('p', 'selector-preview', monitor.selector));
+    title.append(element('h4', '', monitor.name), element('p', 'selector-preview', selectorPreview(monitor)));
     const status = statusInfo(monitor);
     top.append(title, element('span', `status ${status.key}`, status.label));
     card.append(top);
@@ -294,6 +320,7 @@
 
     const details = element('div', 'tracking-details');
     const rows = [
+      ['선택', `${selectorsOf(monitor).length}개`],
       ['간격', formatDuration(monitor.intervalHours)],
       ['마지막 확인', formatDate(monitor.lastCheckedAt)],
       ['마지막 변경', formatDate(monitor.lastChangedAt)]
@@ -333,13 +360,13 @@
       element('p', 'page-url', page.url)
     );
 
-    const total = page.monitors.length;
-    const changed = page.monitors.filter((monitor) => monitor.unread).length;
-    const attention = page.monitors.filter(needsAttention).length;
+    const selectorCount = page.monitors.reduce((count, monitor) => count + selectorsOf(monitor).length, 0);
+    const changed = page.monitors.some((monitor) => monitor.unread) ? 1 : 0;
+    const attention = page.monitors.some(needsAttention) ? 1 : 0;
     const summary = element('div', 'page-summary');
-    summary.append(element('span', 'page-count', `${page.visibleMonitors.length}/${total}개 추적`));
-    if (changed) summary.append(element('span', 'page-badge changed', `변경 ${changed}`));
-    if (attention) summary.append(element('span', 'page-badge attention', `확인 ${attention}`));
+    summary.append(element('span', 'page-count', `${selectorCount}개 선택자`));
+    if (changed) summary.append(element('span', 'page-badge changed', '변경 감지'));
+    if (attention) summary.append(element('span', 'page-badge attention', '확인 필요'));
     top.append(heading, summary);
     pageElement.append(top);
 
@@ -394,7 +421,7 @@
         all: '모든 추적'
       };
       elements.listTitle.textContent = headings[filters.status] ?? headings.all;
-      elements.listDescription.textContent = '사이트 → 페이지 → CSS 선택자 순서로 함께 관리합니다.';
+      elements.listDescription.textContent = '사이트 → 페이지(주소) → CSS 선택자 목록 순서로 하나의 추적을 관리합니다.';
     }
     elements.visibleCount.textContent = `${sites.length}개 사이트 · ${visibleMonitorCount}개 추적`;
   }
@@ -483,7 +510,7 @@
     elements.editId.value = monitor.id;
     elements.editName.value = monitor.name;
     elements.editUrl.value = monitor.url;
-    elements.editSelector.value = monitor.selector;
+    elements.editSelectors.value = selectorsOf(monitor).join('\n');
     elements.editLabels.value = (monitor.labels ?? []).join(', ');
     elements.editDays.value = String(Math.floor(monitor.intervalHours / 24));
     elements.editHours.value = String(monitor.intervalHours % 24);
@@ -497,8 +524,11 @@
     const id = elements.editId.value;
     const totalHours = updateEditorInterval();
     const url = elements.editUrl.value.trim();
-    const selector = elements.editSelector.value.trim();
-    if (!id || !url || !selector || totalHours < MIN_HOURS || totalHours > MAX_HOURS) {
+    const selectors = [...new Set(elements.editSelectors.value
+      .split(/\r?\n/)
+      .map((selector) => selector.trim())
+      .filter(Boolean))];
+    if (!id || !url || !selectors.length || totalHours < MIN_HOURS || totalHours > MAX_HOURS) {
       elements.editorMessage.textContent = '필수 정보와 확인 간격을 확인해 주세요.';
       return;
     }
@@ -515,7 +545,7 @@
       id,
       name: elements.editName.value,
       url,
-      selector,
+      selectors,
       labels: elements.editLabels.value.split(','),
       intervalHours: totalHours,
       enabled
@@ -688,22 +718,20 @@
     appendLineBreak(target);
   }
 
-  function renderSnapshotDiff(previousText, currentText) {
+  function renderSnapshotDiff(previousSnapshot, currentSnapshot) {
     const previousTarget = elements.previousSnapshot;
     const currentTarget = elements.currentSnapshot;
     previousTarget.replaceChildren();
     currentTarget.replaceChildren();
 
-    const before = String(previousText ?? '');
-    const after = String(currentText ?? '');
-    if (!before && !after) {
+    const beforeLines = snapshotItems(previousSnapshot);
+    const afterLines = snapshotItems(currentSnapshot);
+    if (!beforeLines.length && !afterLines.length) {
       pushText(previousTarget, '(텍스트 없음)');
       pushText(currentTarget, '(텍스트 없음)');
       return;
     }
 
-    const beforeLines = before ? before.split('\n') : [];
-    const afterLines = after ? after.split('\n') : [];
     const operations = buildDiffOperations(beforeLines, afterLines);
     let removedLines = [];
     let addedLines = [];
@@ -742,8 +770,8 @@
     elements.changeTitle.textContent = monitor.name;
     elements.changeWhen.textContent = `감지 시각: ${formatDate(monitor.lastChangedAt ?? lastChange?.detectedAt)}`;
     renderSnapshotDiff(
-      lastChange?.previous?.exists ? lastChange.previous.text : '',
-      current?.exists ? current.text : ''
+      lastChange?.previous?.exists ? lastChange.previous : null,
+      current?.exists ? current : null
     );
     elements.changeDialog.showModal();
   }
@@ -875,7 +903,7 @@
   function exportMonitors() {
     const payload = {
       format: 'openstill-export',
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportedAt: new Date().toISOString(),
       monitors: state.monitors
     };
@@ -893,7 +921,7 @@
     try {
       if (file.size > MAX_IMPORT_BYTES) throw new Error('8 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
       const parsed = JSON.parse(await file.text());
-      if (parsed?.format !== 'openstill-export' || parsed?.schemaVersion !== 1 || !Array.isArray(parsed?.monitors)) {
+      if (parsed?.format !== 'openstill-export' || parsed?.schemaVersion !== 2 || !Array.isArray(parsed?.monitors)) {
         throw new Error('OpenStill 내보내기 파일 형식이 아닙니다.');
       }
       const response = await send({ type: 'import-monitors', monitors: parsed.monitors, mode: 'merge' });
