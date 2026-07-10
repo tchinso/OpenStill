@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpenStill 관리</title>
+    <link rel="stylesheet" href="dashboard.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="OpenStill 홈"><span class="brand-icon">✓</span><span>OpenStill</span></a>
+      <p>선택한 페이지 요소의 변화를 로컬에서 확인합니다.</p>
+      <div class="header-actions">
+        <label class="sound-toggle" title="변경 감지 시 두 음의 알림음을 재생합니다."><input id="soundEnabled" type="checkbox"><span>변경 소리</span></label>
+        <button id="exportButton" class="button secondary" type="button">내보내기</button>
+        <button id="importButton" class="button secondary" type="button">불러오기</button>
+        <input id="importInput" type="file" accept="application/json,.json" hidden>
+      </div>
+    </header>
+
+    <main id="top" class="page-shell">
+      <section class="disclosure" aria-label="작동 방식 안내">
+        <span class="disclosure-mark">i</span>
+        <p><strong>권한과 데이터:</strong> 사용자가 선택한 사이트에만 연결하며, URL·선택자·텍스트는 이 브라우저에만 저장됩니다. 정기 확인은 해당 사이트를 비활성 임시 탭에서 렌더링한 뒤 선택 요소를 비교합니다.</p>
+      </section>
+
+      <section class="overview" aria-label="현황">
+        <article><span id="summaryTotal" class="summary-number">0</span><span class="summary-label">전체 모니터</span></article>
+        <article><span id="summaryActive" class="summary-number success">0</span><span class="summary-label">추적 중</span></article>
+        <article><span id="summaryChanged" class="summary-number warning">0</span><span class="summary-label">확인할 변경</span></article>
+        <article><span id="summaryAttention" class="summary-number muted">0</span><span class="summary-label">확인 필요</span></article>
+      </section>
+
+      <section class="toolbar" aria-label="목록 도구">
+        <label class="search"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="이름, 주소, 선택자로 검색"></label>
+        <select id="statusFilter" aria-label="상태로 필터링">
+          <option value="all">모든 상태</option>
+          <option value="changed">변경 감지됨</option>
+          <option value="active">추적 중</option>
+          <option value="attention">권한/오류 확인</option>
+          <option value="paused">일시정지</option>
+        </select>
+        <p class="new-monitor-tip">새 요소는 추적할 웹페이지를 열고 브라우저 툴바의 <strong>OpenStill</strong> 버튼에서 선택하세요.</p>
+      </section>
+
+      <section class="content-grid">
+        <aside class="label-panel" aria-label="라벨별 모아보기">
+          <div class="aside-heading"><h2>라벨</h2><span id="labelCount"></span></div>
+          <nav id="labelList" class="label-list"></nav>
+        </aside>
+
+        <section class="monitor-panel" aria-label="저장된 모니터">
+          <div class="monitor-heading"><div><h1 id="listTitle">모든 모니터</h1><p id="listDescription">선택한 요소를 주기적으로 확인합니다.</p></div><span id="visibleCount" class="visible-count"></span></div>
+          <div id="monitorList" class="monitor-list"></div>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="editorDialog" class="dialog editor-dialog">
+      <form id="editorForm" method="dialog">
+        <div class="dialog-heading"><div><p class="eyebrow">모니터 설정</p><h2>추적 정보 편집</h2></div><button class="icon-button" type="button" data-close-dialog="editorDialog" aria-label="닫기">×</button></div>
+        <input id="editId" type="hidden">
+        <label>표시 이름<input id="editName" maxlength="120" required></label>
+        <label>웹페이지 주소<input id="editUrl" type="url" inputmode="url" required></label>
+        <label>CSS 선택자<input id="editSelector" spellcheck="false" maxlength="2000" required></label>
+        <label>라벨 <span class="field-help">쉼표로 여러 개를 구분</span><input id="editLabels" maxlength="500" placeholder="예: 공지, 가격"></label>
+        <fieldset><legend>확인 간격</legend><div class="interval-inputs"><label><span>일</span><select id="editDays"></select></label><label><span>시간</span><select id="editHours"></select></label></div><p id="editIntervalHelp" class="field-help"></p></fieldset>
+        <label class="check-row"><input id="editEnabled" type="checkbox"><span>정기 확인 사용</span></label>
+        <p id="editorMessage" class="form-message" role="alert"></p>
+        <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="editorDialog">취소</button><button class="button primary" type="submit">저장</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="changeDialog" class="dialog change-dialog">
+      <div class="dialog-heading"><div><p class="eyebrow">변경 내용</p><h2 id="changeTitle">변경 감지</h2></div><button class="icon-button" type="button" data-close-dialog="changeDialog" aria-label="닫기">×</button></div>
+      <p id="changeWhen" class="field-help"></p>
+      <div class="snapshot-grid"><section><h3>이전 텍스트</h3><pre id="previousSnapshot"></pre></section><section><h3>현재 텍스트</h3><pre id="currentSnapshot"></pre></section></div>
+      <div class="dialog-actions"><button id="changeOpenPage" class="button secondary" type="button">작은 창에서 열기</button><button id="acknowledgeButton" class="button primary" type="button">확인 완료</button></div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="dashboard.js"></script>
+  </body>
+</html>
