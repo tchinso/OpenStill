@@ -1185,28 +1185,45 @@
       this.cancelButton.disabled = true;
       this.selectAgainButton.disabled = true;
       this.message.style.color = '#aebed2';
-        this.message.textContent = this.selections.length + '개 선택 결과를 이 주소의 하나의 기준 목록으로 저장하는 중입니다…';
+      this.message.textContent = this.selections.length + '개 선택 결과를 이 주소의 하나의 기준 목록으로 저장하는 중입니다…';
 
       try {
+        const selectorDraft = {
+          format: 'openstill-selector-draft',
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+          monitor: {
+            url: location.href,
+            pageTitle: document.title,
+            name: this.nameInput.value,
+            labels: this.labelsInput.value.split(','),
+            intervalHours: totalHours,
+            selectors: this.selections.map((selection) => selection.selector)
+          }
+        };
         const response = await chrome.runtime.sendMessage({
           type: 'create-monitors',
-          url: location.href,
-          pageTitle: document.title,
-          name: this.nameInput.value,
-          labels: this.labelsInput.value.split(','),
-          intervalHours: totalHours,
-          items: this.selections.map((selection) => ({
-            selector: selection.selector
+          url: selectorDraft.monitor.url,
+          pageTitle: selectorDraft.monitor.pageTitle,
+          name: selectorDraft.monitor.name,
+          labels: selectorDraft.monitor.labels,
+          intervalHours: selectorDraft.monitor.intervalHours,
+          items: selectorDraft.monitor.selectors.map((selector) => ({
+            selector
           }))
         });
         if (!response?.ok) {
           throw new Error(response?.error || '저장에 실패했습니다.');
         }
+        const copied = await chrome.runtime.sendMessage({
+          type: 'copy-selector-draft',
+          draft: selectorDraft
+        }).then((copyResponse) => Boolean(copyResponse?.ok)).catch(() => false);
         this.saved = true;
         this.saving = false;
         this.message.style.color = '#77edbd';
         const selectorCount = response.monitor?.selectors?.length ?? this.selections.length;
-        this.message.textContent = `${selectorCount}개 선택자를 이 주소의 하나의 추적에 저장했습니다. 다음 확인에서 기준 목록을 만든 뒤 이후 변경을 알려드릴게요.`;
+        this.message.textContent = `${selectorCount}개 선택자를 이 주소의 하나의 추적에 저장했습니다. 다음 확인에서 기준 목록을 만든 뒤 이후 변경을 알려드릴게요.${copied ? ' 대시보드에 붙여넣을 선택 초안도 클립보드에 복사했습니다.' : ' 선택 초안 클립보드 복사는 브라우저 설정 때문에 건너뛰었습니다.'}`;
         this.subtitle.textContent = '추적이 시작되었습니다';
         setTimeout(() => this.destroy(), 1_100);
       } catch (error) {

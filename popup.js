@@ -24,11 +24,6 @@
     try { return new URL(url).hostname; } catch { return ''; }
   }
 
-  function sitePattern(url) {
-    const parsed = new URL(url);
-    return `${parsed.protocol}//${parsed.host}/*`;
-  }
-
   function isSupportedPage(tab) {
     try {
       const url = new URL(tab?.url ?? '');
@@ -110,23 +105,12 @@
     if (!isSupportedPage(activeTab)) return;
     message.textContent = '';
     pickButton.disabled = true;
-    pickButton.textContent = '권한을 확인하는 중…';
-    let newlyGranted = false;
+    pickButton.textContent = '페이지를 준비하는 중…';
     try {
-      const origins = [sitePattern(activeTab.url)];
-      const alreadyGranted = await chrome.permissions.contains({ origins });
-      const granted = alreadyGranted || await chrome.permissions.request({ origins });
-      newlyGranted = granted && !alreadyGranted;
-      if (!granted) {
-        throw new Error('선택한 사이트의 접근 권한이 필요합니다. 권한을 허용한 뒤 다시 시도해 주세요.');
-      }
       const response = await send({ type: 'start-picker', tabId: activeTab.id, url: activeTab.url });
       if (!response?.ok) throw new Error(response?.error || '선택기를 열 수 없습니다.');
       window.close();
     } catch (error) {
-      if (newlyGranted) {
-        await send({ type: 'release-unclaimed-origin', url: activeTab.url, tabId: activeTab.id }).catch(() => undefined);
-      }
       message.textContent = error.message || '선택기를 열 수 없습니다.';
       pickButton.disabled = false;
       pickButton.textContent = '이 페이지에서 요소 선택';

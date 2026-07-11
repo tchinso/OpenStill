@@ -2,24 +2,36 @@
 
 const MONITORS_KEY = 'openStill.monitors.v2';
 const SETTINGS_KEY = 'openStill.settings.v1';
+const DESKTOP_CONFIG_KEY = 'openStill.desktop.v1';
 const PENDING_PICKERS_KEY = 'openStill.pending-pickers.v1';
 const ALARM_NAME = 'openStill.next-check';
+const DESKTOP_ALARM_NAME = 'openStill.desktop-poll';
+const DESKTOP_NATIVE_HOST = 'com.openstill.desktop';
+const DESKTOP_PROTOCOL = 'openstill.desktop/v1';
 
 const MIN_INTERVAL_HOURS = 1;
 const MAX_INTERVAL_HOURS = 14 * 24;
-// Two bounded collection snapshots per monitored URL (current + last changed-from
-// value) stay within chrome.storage.local's default 10 MB quota without requesting
-// unlimitedStorage.
-const MAX_MONITORS = 100;
+// The browser keeps an operational cache while the optional Desktop companion keeps
+// the portable local copy. unlimitedStorage prevents a few large snapshots from
+// blocking a legitimate import of hundreds of user-configured trackers.
+const MAX_MONITORS = 1_000;
 const MAX_SELECTORS_PER_MONITOR = 20;
 const MAX_COLLECTION_ITEMS = 200;
 const MAX_SNAPSHOT_CHARS = 10_000;
 const PARSE_TIMEOUT_MS = 12_000;
 const SOUND_DEBOUNCE_MS = 3_000;
 const MAX_CHECKS_PER_SWEEP = 6;
+const MAX_BATCH_CHECKS = 1_000;
+const MAX_CONCURRENT_BATCH_CHECKS = 3;
+const DESKTOP_MESSAGE_TIMEOUT_MS = 20_000;
+const DESKTOP_POLL_MINUTES = 1;
+const DESKTOP_JOB_LIMIT = 3;
 const PENDING_PICKER_TTL_MS = 2 * 60 * 60 * 1000;
 const RENDER_LOAD_TIMEOUT_MS = 30_000;
-const RENDER_MINIMUM_WAIT_MS = 2_000;
+// Never inspect a page or calculate picker coordinates before the top-level load
+// event has completed and this additional settling period has elapsed.
+const RENDER_MINIMUM_WAIT_MS = 2_500;
+const PICKER_READY_DELAY_MS = 2_500;
 const RENDER_QUIET_MS = 650;
 const RENDER_SETTLE_TIMEOUT_MS = 5_000;
 // Match the reference runner's empty-selection behavior: after the initial
@@ -45,6 +57,19 @@ let sweepRunning = false;
 let lastSoundAt = 0;
 const checksInProgress = new Set();
 let alarmQueue = Promise.resolve();
+let desktopPort;
+let desktopPortToken;
+const desktopRequests = new Map();
+let desktopSyncPromise;
+let desktopSyncQueued = false;
+let desktopJobsRunning = false;
+let desktopStatus = {
+  connected: false,
+  profileId: null,
+  revision: null,
+  lastSyncedAt: null,
+  lastError: null
+};
 
 function cleanText(value, maxLength = MAX_SNAPSHOT_CHARS) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -315,6 +340,7 @@ function mutateMonitors(mutator) {
     const state = await getState();
     const result = await mutator(state.monitors);
     await chrome.storage.local.set({ [MONITORS_KEY]: state.monitors });
+    void queueDesktopStateSync();
     return result;
   });
 
@@ -326,15 +352,374 @@ async function updateSettings(settingsPatch) {
   const state = await getState();
   const settings = normalizeSettings({ ...state.settings, ...settingsPatch });
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+  void queueDesktopStateSync();
   return settings;
 }
 
-async function hasSitePermission(url) {
-  try {
-    return await chrome.permissions.contains({ origins: [originPattern(url)] });
-  } catch {
-    return false;
+function cleanDesktopToken(value) {
+  if (typeof value !== 'string') return '';
+  const token = value.trim();
+  return token.length >= 32 && token.length <= 512 && !/\s/.test(token) ? token : '';
+}
+
+function cleanDesktopProfileId(value) {
+  const profileId = typeof value === 'string' ? value.trim().slice(0, 100) : '';
+  return profileId && !/\s/.test(profileId) ? profileId : createId();
+}
+
+function normalizeDesktopConfig(value) {
+  return {
+    profileId: cleanDesktopProfileId(value?.profileId),
+    token: cleanDesktopToken(value?.token)
+  };
+}
+
+async function getDesktopConfig() {
+  const stored = await chrome.storage.local.get(DESKTOP_CONFIG_KEY);
+  const config = normalizeDesktopConfig(stored[DESKTOP_CONFIG_KEY]);
+  const current = stored[DESKTOP_CONFIG_KEY];
+  if (!current || current.profileId !== config.profileId || current.token !== config.token) {
+    await chrome.storage.local.set({ [DESKTOP_CONFIG_KEY]: config });
   }
+  return config;
+}
+
+async function saveDesktopConfig(token) {
+  const current = await getDesktopConfig();
+  const config = { ...current, token: cleanDesktopToken(token) };
+  if (token && !config.token) {
+    throw new Error('Desktop 연결 토큰 형식을 확인해 주세요.');
+  }
+  await chrome.storage.local.set({ [DESKTOP_CONFIG_KEY]: config });
+  if (desktopPort && desktopPortToken !== config.token) {
+    desktopPort.disconnect();
+  }
+  return config;
+}
+
+function desktopError(message) {
+  desktopStatus = { ...desktopStatus, connected: false, lastError: cleanText(message, 300) || 'Desktop에 연결하지 못했습니다.' };
+}
+
+function rejectDesktopRequests(error) {
+  for (const pending of desktopRequests.values()) {
+    clearTimeout(pending.timeoutId);
+    pending.reject(error);
+  }
+  desktopRequests.clear();
+}
+
+function handleDesktopMessage(message) {
+  if (!message || message.protocol !== DESKTOP_PROTOCOL || typeof message.id !== 'string') {
+    return;
+  }
+  const pending = desktopRequests.get(message.id);
+  if (!pending) return;
+  desktopRequests.delete(message.id);
+  clearTimeout(pending.timeoutId);
+  if (message.ok) {
+    const payload = message.payload && typeof message.payload === 'object' ? message.payload : {};
+    if (Number.isInteger(payload.revision)) {
+      desktopStatus = { ...desktopStatus, revision: payload.revision, lastError: null };
+    }
+    pending.resolve(payload);
+  } else {
+    pending.reject(new Error(cleanText(message.error?.message, 300) || 'Desktop 요청을 처리하지 못했습니다.'));
+  }
+}
+
+function handleDesktopDisconnect() {
+  const message = chrome.runtime.lastError?.message || 'OpenStill Desktop 연결이 끊어졌습니다.';
+  desktopPort = undefined;
+  desktopPortToken = undefined;
+  desktopError(message);
+  rejectDesktopRequests(new Error(message));
+}
+
+async function ensureDesktopPort(config) {
+  if (!config.token) {
+    throw new Error('OpenStill Desktop 연결 토큰을 먼저 입력해 주세요.');
+  }
+  if (desktopPort && desktopPortToken === config.token) {
+    return desktopPort;
+  }
+  if (desktopPort) {
+    desktopPort.disconnect();
+  }
+  if (typeof chrome.runtime.connectNative !== 'function') {
+    throw new Error('이 Chrome 환경에서는 Native Messaging을 사용할 수 없습니다.');
+  }
+  try {
+    const port = chrome.runtime.connectNative(DESKTOP_NATIVE_HOST);
+    port.onMessage.addListener(handleDesktopMessage);
+    port.onDisconnect.addListener(handleDesktopDisconnect);
+    desktopPort = port;
+    desktopPortToken = config.token;
+    desktopStatus = { ...desktopStatus, connected: true, profileId: config.profileId, lastError: null };
+    return port;
+  } catch (error) {
+    desktopError(responseError(error));
+    throw error;
+  }
+}
+
+async function desktopRequest(type, payload = {}) {
+  const config = await getDesktopConfig();
+  const port = await ensureDesktopPort(config);
+  const id = createId();
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      desktopRequests.delete(id);
+      reject(new Error('OpenStill Desktop 응답 시간이 초과되었습니다. Desktop과 Chrome이 실행 중인지 확인해 주세요.'));
+    }, DESKTOP_MESSAGE_TIMEOUT_MS);
+    desktopRequests.set(id, { resolve, reject, timeoutId });
+    try {
+      port.postMessage({
+        protocol: DESKTOP_PROTOCOL,
+        id,
+        token: config.token,
+        type,
+        payload: { ...payload, profile_id: config.profileId }
+      });
+    } catch (error) {
+      desktopRequests.delete(id);
+      clearTimeout(timeoutId);
+      reject(error);
+    }
+  });
+}
+
+async function getDesktopStatus() {
+  const config = await getDesktopConfig();
+  return {
+    ok: true,
+    configured: Boolean(config.token),
+    connected: Boolean(desktopPort && desktopStatus.connected),
+    profileId: config.profileId,
+    revision: desktopStatus.revision,
+    lastSyncedAt: desktopStatus.lastSyncedAt,
+    lastError: desktopStatus.lastError
+  };
+}
+
+function desktopStateFromBrowser(state) {
+  const monitors = state.monitors.map((monitor) => ({
+    id: monitor.id,
+    revision: monitor.revision,
+    name: monitor.name,
+    url: monitor.url,
+    pageTitle: monitor.pageTitle,
+    selectors: [...monitor.selectors],
+    labels: [...monitor.labels],
+    enabled: monitor.enabled,
+    createdAt: monitor.createdAt,
+    updatedAt: monitor.updatedAt
+  }));
+  const schedules = state.monitors.map((monitor) => ({
+    id: `schedule:${monitor.id}`,
+    monitor_id: monitor.id,
+    interval_seconds: monitor.intervalHours * 60 * 60,
+    next_run_at: monitor.nextCheckAt,
+    enabled: monitor.enabled,
+    updated_at: monitor.updatedAt
+  }));
+  const results = state.monitors.flatMap((monitor) => {
+    if (!monitor.snapshot && !monitor.lastChange && !monitor.lastCheckedAt && monitor.status === 'needs-baseline') {
+      return [];
+    }
+    return [{
+      monitor_id: monitor.id,
+      snapshot: monitor.snapshot,
+      last_change: monitor.lastChange
+        ? {
+            previous: monitor.lastChange.previous,
+            current: monitor.lastChange.current,
+            detectedAt: monitor.lastChange.detectedAt
+          }
+        : null,
+      last_checked_at: monitor.lastCheckedAt,
+      last_changed_at: monitor.lastChangedAt,
+      last_review_at: monitor.lastReviewAt,
+      status: monitor.status,
+      unread: monitor.unread,
+      last_error: monitor.lastError
+    }];
+  });
+  return {
+    format: 'openstill-desktop-state',
+    schema_version: 1,
+    monitors,
+    schedules,
+    results
+  };
+}
+
+function intervalHoursFromDesktopSchedule(schedule, fallback = 1) {
+  const seconds = Number(schedule?.interval_seconds ?? schedule?.intervalSeconds);
+  if (!Number.isFinite(seconds)) return fallback;
+  return clampInterval(Math.ceil(seconds / (60 * 60))) ?? fallback;
+}
+
+function browserMonitorFromDesktop(monitor, schedule, result) {
+  const lastChange = result?.last_change ?? result?.lastChange;
+  return normalizeMonitor({
+    ...monitor,
+    intervalHours: intervalHoursFromDesktopSchedule(schedule),
+    enabled: monitor?.enabled !== false && schedule?.enabled !== false,
+    nextCheckAt: schedule?.next_run_at ?? schedule?.nextRunAt ?? nowIso(),
+    snapshot: result?.snapshot ?? null,
+    lastChange: lastChange
+      ? {
+          previous: lastChange.previous,
+          current: lastChange.current,
+          detectedAt: lastChange.detectedAt
+        }
+      : null,
+    lastCheckedAt: result?.last_checked_at ?? result?.lastCheckedAt ?? null,
+    lastChangedAt: result?.last_changed_at ?? result?.lastChangedAt ?? null,
+    lastReviewAt: result?.last_review_at ?? result?.lastReviewAt ?? null,
+    lastError: result?.last_error ?? result?.lastError ?? null,
+    status: result?.status ?? 'needs-baseline',
+    unread: Boolean(result?.unread)
+  });
+}
+
+async function cacheDesktopState(state) {
+  if (!state || typeof state !== 'object' || !Array.isArray(state.monitors)) {
+    throw new Error('OpenStill Desktop이 유효한 상태 데이터를 보내지 않았습니다.');
+  }
+  const schedules = new Map((Array.isArray(state.schedules) ? state.schedules : [])
+    .filter((schedule) => schedule && typeof schedule === 'object')
+    .map((schedule) => [schedule.monitor_id ?? schedule.monitorId, schedule]));
+  const results = new Map((Array.isArray(state.results) ? state.results : [])
+    .filter((result) => result && typeof result === 'object')
+    .map((result) => [result.monitor_id ?? result.monitorId, result]));
+  const monitors = state.monitors
+    .map((monitor) => browserMonitorFromDesktop(monitor, schedules.get(monitor?.id), results.get(monitor?.id)))
+    .filter(Boolean)
+    .slice(0, MAX_MONITORS);
+  await chrome.storage.local.set({ [MONITORS_KEY]: monitors });
+  await refreshBadge(monitors);
+  await scheduleNextAlarm();
+  return monitors;
+}
+
+async function fetchDesktopState() {
+  const aggregate = {
+    format: 'openstill-desktop-state',
+    schema_version: 1,
+    monitors: [],
+    schedules: [],
+    results: []
+  };
+  let cursor = null;
+  let pageCount = 0;
+  do {
+    const response = await desktopRequest('get-state', {
+      limit: 500,
+      cursor,
+      include_results: true
+    });
+    const state = response.state;
+    if (!state || !Array.isArray(state.monitors) || !Array.isArray(state.schedules) || !Array.isArray(state.results)) {
+      throw new Error('OpenStill Desktop 상태 응답 형식을 확인할 수 없습니다.');
+    }
+    aggregate.monitors.push(...state.monitors);
+    aggregate.schedules.push(...state.schedules);
+    aggregate.results.push(...state.results);
+    cursor = response.nextCursor ?? null;
+    pageCount += 1;
+  } while (cursor && pageCount < 3);
+  if (cursor) throw new Error('OpenStill Desktop 상태가 허용된 최대 개수를 초과했습니다.');
+  return aggregate;
+}
+
+async function syncDesktopState() {
+  if (desktopSyncPromise) return desktopSyncPromise;
+  desktopSyncPromise = (async () => {
+    const config = await getDesktopConfig();
+    if (!config.token) return null;
+    const state = await getState();
+    const response = await desktopRequest('replace-state', { state: desktopStateFromBrowser(state) });
+    desktopStatus = {
+      ...desktopStatus,
+      connected: true,
+      profileId: config.profileId,
+      revision: response.revision ?? desktopStatus.revision,
+      lastSyncedAt: nowIso(),
+      lastError: null
+    };
+    return response;
+  })().catch((error) => {
+    desktopError(responseError(error));
+    throw error;
+  }).finally(() => {
+    desktopSyncPromise = undefined;
+  });
+  return desktopSyncPromise;
+}
+
+function queueDesktopStateSync() {
+  if (desktopSyncQueued) return;
+  desktopSyncQueued = true;
+  setTimeout(() => {
+    desktopSyncQueued = false;
+    void syncDesktopState().catch(() => undefined);
+  }, 0);
+}
+
+async function ensureDesktopPollAlarm() {
+  const config = await getDesktopConfig();
+  await chrome.alarms.clear(DESKTOP_ALARM_NAME);
+  if (config.token) {
+    await chrome.alarms.create(DESKTOP_ALARM_NAME, { periodInMinutes: DESKTOP_POLL_MINUTES });
+  }
+}
+
+async function connectDesktop(message = {}) {
+  if (message && typeof message === 'object' && Object.hasOwn(message, 'token')) {
+    await saveDesktopConfig(message.token);
+  }
+  const config = await getDesktopConfig();
+  if (!config.token) {
+    return { ok: false, error: 'OpenStill Desktop에서 표시한 연결 토큰을 입력해 주세요.' };
+  }
+  try {
+    const hello = await desktopRequest('hello', {
+      extension_id: chrome.runtime.id,
+      limit: 1,
+      include_results: false
+    });
+    desktopStatus = {
+      ...desktopStatus,
+      connected: true,
+      profileId: hello.profileId ?? config.profileId,
+      revision: hello.revision ?? desktopStatus.revision,
+      lastError: null
+    };
+    if (hello.state?.monitors?.length) {
+      await cacheDesktopState(await fetchDesktopState());
+    } else if ((await getMonitors()).length) {
+      await syncDesktopState();
+    }
+    await ensureDesktopPollAlarm();
+    return { ok: true, ...(await getDesktopStatus()) };
+  } catch (error) {
+    desktopError(responseError(error));
+    return { ok: false, error: desktopStatus.lastError };
+  }
+}
+
+async function openDesktopDashboard() {
+  await chrome.tabs.create({ url: 'http://127.0.0.1:8765/', active: true });
+  return { ok: true };
+}
+
+async function hasSitePermission(url) {
+  // HTTP/HTTPS host access is a required install-time permission. Keep this
+  // guard so every caller still rejects unsupported schemes, but do not make
+  // users approve hundreds of imported origins one at a time.
+  return Boolean(normalizeUrl(url));
 }
 
 async function getPendingPickers() {
@@ -360,14 +745,11 @@ async function forgetPendingPicker(tabId) {
 }
 
 async function releaseUnusedOriginPermission(pattern) {
-  await storageQueue.catch(() => undefined);
-  const monitors = await getMonitors();
-  const pending = await getPendingPickers();
-  const stillUsed = monitors.some((monitor) => originPattern(monitor.url) === pattern)
-    || Object.values(pending).some((entry) => entry?.origin === pattern);
-  if (!stillUsed) {
-    await chrome.permissions.remove({ origins: [pattern] }).catch(() => undefined);
-  }
+  // Host access is now declared in manifest.json, so Chrome does not allow it
+  // to be removed per origin at runtime. The picker bookkeeping still calls
+  // this helper when a user cancels selection; making it a no-op keeps that
+  // lifecycle explicit without attempting to mutate required permissions.
+  void pattern;
 }
 
 async function releaseUnusedSitePermission(url) {
@@ -404,17 +786,8 @@ async function clearExpiredPendingPickers() {
 }
 
 async function cleanupUnusedSitePermissions() {
-  const monitors = await getMonitors();
-  const usedOrigins = new Set(monitors.map((monitor) => originPattern(monitor.url)));
-  const pending = await getPendingPickers();
-  Object.values(pending).forEach((entry) => {
-    if (entry?.origin) usedOrigins.add(entry.origin);
-  });
-  const { origins = [] } = await chrome.permissions.getAll();
-  const exactSiteOrigins = origins.filter((origin) => /^https?:\/\/[^*/]+\/\*$/.test(origin));
-  await Promise.all(exactSiteOrigins
-    .filter((origin) => !usedOrigins.has(origin))
-    .map((origin) => chrome.permissions.remove({ origins: [origin] }).catch(() => undefined)));
+  // See releaseUnusedOriginPermission: broad HTTP/HTTPS access is required at
+  // installation time for batch imports and scheduled checks.
 }
 
 function responseError(error) {
@@ -441,8 +814,8 @@ async function ensureOffscreenDocument() {
   if (!offscreenCreation) {
     offscreenCreation = chrome.offscreen.createDocument({
       url: 'offscreen.html',
-      reasons: ['DOM_PARSER', 'AUDIO_PLAYBACK'],
-      justification: 'OpenStill validates user-entered CSS selector syntax and plays a local change alert tone.'
+      reasons: ['DOM_PARSER', 'AUDIO_PLAYBACK', 'CLIPBOARD'],
+      justification: 'OpenStill validates CSS selectors, plays a local alert tone, and copies a user-requested selector draft for the same-device Dashboard.'
     }).catch(async (error) => {
       const contextsAfterFailure = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
       if (!contextsAfterFailure.some((context) => context.documentUrl === offscreenUrl)) {
@@ -480,21 +853,63 @@ async function validateSelectorSyntax(selector) {
   await parseMonitoredHtml('', selector);
 }
 
+function normalizeSelectorDraft(value) {
+  if (!value || typeof value !== 'object') return null;
+  const source = value.monitor && typeof value.monitor === 'object' ? value.monitor : value;
+  const url = normalizeUrl(source.url);
+  const selectors = cleanSelectors(source.selectors);
+  const intervalHours = clampInterval(source.intervalHours);
+  if (!url || !selectors || !intervalHours) return null;
+  return {
+    format: 'openstill-selector-draft',
+    schemaVersion: 1,
+    createdAt: asIso(value.createdAt, nowIso()),
+    monitor: {
+      url,
+      pageTitle: cleanText(source.pageTitle, 180),
+      name: cleanText(source.name, 120) || new URL(url).hostname,
+      labels: cleanLabels(source.labels),
+      intervalHours,
+      selectors
+    }
+  };
+}
+
+async function copySelectorDraft(message) {
+  const draft = normalizeSelectorDraft(message?.draft);
+  if (!draft) {
+    return { ok: false, error: '복사할 선택 초안의 URL, 선택자, 확인 간격을 확인해 주세요.' };
+  }
+  const text = JSON.stringify(draft, null, 2);
+  if (text.length > 128_000) {
+    return { ok: false, error: '선택 초안이 너무 커서 클립보드에 복사할 수 없습니다.' };
+  }
+
+  await ensureOffscreenDocument();
+  const result = await chrome.runtime.sendMessage({ type: 'copy-selector-draft', text });
+  if (!result?.ok) {
+    return { ok: false, error: result?.error || '선택 초안을 클립보드에 복사하지 못했습니다.' };
+  }
+  return { ok: true, draft };
+}
+
 function waitForRenderedTab(tabId) {
   let cancel = () => undefined;
   const promise = new Promise((resolve, reject) => {
-    let sawLoading = false;
+    let settled = false;
     const timeoutId = setTimeout(() => {
-      cleanup();
-      reject(new Error('렌더링된 페이지를 여는 데 30초가 넘게 걸렸습니다.'));
+      finish(() => reject(new Error('렌더링된 페이지를 여는 데 30초가 넘게 걸렸습니다.')));
     }, RENDER_LOAD_TIMEOUT_MS);
+    const finish = (settle) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      settle();
+    };
     const listener = (updatedTabId, changeInfo) => {
       if (updatedTabId !== tabId) return;
-      if (changeInfo.status === 'loading') {
-        sawLoading = true;
-      } else if (changeInfo.status === 'complete' && sawLoading) {
-        cleanup();
-        resolve();
+      if (changeInfo.status === 'complete') {
+        finish(resolve);
       }
     };
     const cleanup = () => {
@@ -503,8 +918,35 @@ function waitForRenderedTab(tabId) {
     };
     cancel = cleanup;
     chrome.tabs.onUpdated.addListener(listener);
+
+    // A fast cached page can finish before the listener above is attached.
+    // We only create this tab for the target URL, so an already-complete state
+    // is a valid full-load signal as well.
+    if (typeof chrome.tabs.get === 'function') {
+      void chrome.tabs.get(tabId).then((tab) => {
+        if (tab?.status === 'complete') finish(resolve);
+      }).catch(() => undefined);
+    }
   });
   return { promise, cancel };
+}
+
+async function waitForPageLoadAndPickerDelay(tabId) {
+  const execution = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (delayMilliseconds) => {
+      if (document.readyState !== 'complete') {
+        await new Promise((resolve) => window.addEventListener('load', resolve, { once: true }));
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMilliseconds));
+      return document.readyState;
+    },
+    args: [PICKER_READY_DELAY_MS]
+  });
+
+  if (execution[0]?.result !== 'complete') {
+    throw new Error('페이지가 완전히 로드되기 전에 선택기를 시작할 수 없습니다.');
+  }
 }
 
 // Reference-compatible CSS monitor capture. All scheduled captures use this
@@ -784,7 +1226,15 @@ async function inspectLegacyRenderedDocumentCollection(selectors, minimumWaitMil
 }
 
 async function captureRenderedSnapshot(monitor) {
-  const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+  // Pinned tabs are Chrome's favicon-only, leftmost tab UI. They make a
+  // scheduled check visible without taking focus or leaving a titled tab in
+  // the strip; the tab is always removed in finally below.
+  const tab = await chrome.tabs.create({
+    url: monitor.url,
+    active: false,
+    pinned: true,
+    index: 0
+  });
   if (!Number.isInteger(tab?.id)) {
     throw new Error('Could not create a background tab for checking.');
   }
@@ -792,7 +1242,6 @@ async function captureRenderedSnapshot(monitor) {
   let ready;
   try {
     ready = waitForRenderedTab(tab.id);
-    await chrome.tabs.update(tab.id, { url: monitor.url, active: false });
     await ready.promise;
     const execution = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -825,7 +1274,12 @@ async function captureRenderedSnapshot(monitor) {
     return snapshot;
   } finally {
     ready?.cancel();
-    await chrome.tabs.remove(tab.id).catch(() => undefined);
+    await chrome.tabs.remove(tab.id).catch(async () => {
+      // A browser can occasionally reject removal while a pinned tab is being
+      // animated into the strip. Unpin and make one final best-effort removal.
+      await chrome.tabs.update(tab.id, { pinned: false }).catch(() => undefined);
+      await chrome.tabs.remove(tab.id).catch(() => undefined);
+    });
   }
 }
 
@@ -1026,7 +1480,170 @@ async function checkPage(urlValue) {
   }
 }
 
+function batchMonitorIds(value) {
+  const ids = Array.isArray(value) ? value : [];
+  const unique = [];
+  const seen = new Set();
+  for (const valueId of ids) {
+    const id = typeof valueId === 'string' ? valueId.trim().slice(0, 100) : '';
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      unique.push(id);
+      if (unique.length >= MAX_BATCH_CHECKS) break;
+    }
+  }
+  return unique;
+}
+
+async function checkMonitors(message) {
+  const requestedIds = batchMonitorIds(message?.ids);
+  if (!requestedIds.length) {
+    return { ok: false, error: '확인할 추적을 하나 이상 선택해 주세요.' };
+  }
+
+  const knownIds = new Set((await getMonitors()).map((monitor) => monitor.id));
+  const ids = requestedIds.filter((id) => knownIds.has(id));
+  if (!ids.length) {
+    return { ok: false, error: '선택한 추적을 찾을 수 없습니다.' };
+  }
+
+  const outcomes = new Array(ids.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < ids.length) {
+      const index = cursor;
+      cursor += 1;
+      const id = ids[index];
+      try {
+        outcomes[index] = await checkMonitor(id, { reschedule: false });
+      } catch (error) {
+        outcomes[index] = { ok: false, error: responseError(error) };
+      }
+    }
+  };
+
+  try {
+    await Promise.all(Array.from(
+      { length: Math.min(MAX_CONCURRENT_BATCH_CHECKS, ids.length) },
+      () => worker()
+    ));
+  } finally {
+    await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
+  }
+
+  const completed = outcomes.filter((outcome) => outcome?.ok).length;
+  const changed = outcomes.filter((outcome) => outcome?.ok && outcome.changed).length;
+  const needsReview = outcomes.filter((outcome) => outcome?.ok && outcome.needsReview).length;
+  const failed = outcomes.filter((outcome) => !outcome?.ok).length;
+  return {
+    ok: true,
+    requested: requestedIds.length,
+    found: ids.length,
+    completed,
+    changed,
+    needsReview,
+    failed,
+    missing: requestedIds.length - ids.length
+  };
+}
+
+function desktopMonitorForJob(job) {
+  const rawMonitor = job?.monitor;
+  if (!rawMonitor || typeof rawMonitor !== 'object') return null;
+  return normalizeMonitor({
+    ...rawMonitor,
+    intervalHours: intervalHoursFromDesktopSchedule(job.schedule),
+    enabled: rawMonitor.enabled !== false && job.schedule?.enabled !== false,
+    nextCheckAt: job.schedule?.next_run_at ?? job.schedule?.nextRunAt ?? nowIso(),
+    snapshot: null,
+    lastChange: null,
+    lastCheckedAt: null,
+    lastChangedAt: null,
+    lastReviewAt: null,
+    lastError: null,
+    status: 'needs-baseline',
+    unread: false
+  });
+}
+
+function desktopResultFromMonitor(monitor) {
+  return {
+    snapshot: monitor.snapshot,
+    last_change: monitor.lastChange
+      ? {
+          previous: monitor.lastChange.previous,
+          current: monitor.lastChange.current,
+          detectedAt: monitor.lastChange.detectedAt
+        }
+      : null,
+    last_checked_at: monitor.lastCheckedAt,
+    last_changed_at: monitor.lastChangedAt,
+    last_review_at: monitor.lastReviewAt,
+    status: monitor.status,
+    unread: monitor.unread,
+    last_error: monitor.lastError
+  };
+}
+
+async function runDesktopDueJobs() {
+  const config = await getDesktopConfig();
+  if (!config.token) return false;
+  if (desktopJobsRunning) return true;
+  desktopJobsRunning = true;
+  try {
+    if (!desktopPort) {
+      const connected = await connectDesktop();
+      if (!connected.ok) return false;
+    }
+    if (desktopSyncPromise) await desktopSyncPromise.catch(() => undefined);
+    await cacheDesktopState(await fetchDesktopState());
+    const response = await desktopRequest('due-jobs', {
+      limit: DESKTOP_JOB_LIMIT,
+      lease_seconds: 120
+    });
+    const jobs = Array.isArray(response.jobs) ? response.jobs : [];
+    for (const job of jobs) {
+      const monitor = desktopMonitorForJob(job);
+      if (!monitor || typeof job?.lease_id !== 'string' || !job.schedule?.id) continue;
+      const cached = (await getMonitors()).find((item) => item.id === monitor.id);
+      const resultMonitor = cached ? { ...cached, selectors: [...cached.selectors], labels: [...cached.labels] } : monitor;
+      const checkedAt = nowIso();
+      try {
+        const snapshot = await captureRenderedSnapshot(monitor);
+        resultMonitor.lastCheckedAt = checkedAt;
+        resultMonitor.updatedAt = checkedAt;
+        const outcome = applySnapshotOutcome(resultMonitor, snapshot, checkedAt);
+        if (outcome.changed) {
+          await announceChange(resultMonitor);
+        }
+      } catch (error) {
+        resultMonitor.lastCheckedAt = checkedAt;
+        resultMonitor.updatedAt = checkedAt;
+        resultMonitor.status = 'error';
+        resultMonitor.lastError = responseError(error);
+      }
+      await desktopRequest('check-result', {
+        monitor_id: monitor.id,
+        schedule_id: job.schedule.id,
+        lease_id: job.lease_id,
+        result: desktopResultFromMonitor(resultMonitor)
+      });
+    }
+    await cacheDesktopState(await fetchDesktopState());
+    desktopStatus = { ...desktopStatus, connected: true, lastSyncedAt: nowIso(), lastError: null };
+    return true;
+  } catch (error) {
+    desktopError(responseError(error));
+    return false;
+  } finally {
+    desktopJobsRunning = false;
+  }
+}
+
 async function runDueChecks() {
+  if (await runDesktopDueJobs()) {
+    return;
+  }
   if (sweepRunning) {
     return;
   }
@@ -1547,6 +2164,10 @@ async function startPicker(tabId, url) {
     await rememberPendingPicker(tabId, normalizedUrl);
   }
   try {
+    // picker.js reads getBoundingClientRect() to position its highlights. Wait
+    // until the document has finished loading, then keep the requested 2.5 s
+    // settling window before asking it for any element coordinates.
+    await waitForPageLoadAndPickerDelay(tabId);
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['selector-engine.js', 'picker.js']
@@ -1567,6 +2188,7 @@ const messageHandlers = {
   'set-monitor-enabled': (message) => setMonitorEnabled(message),
   'delete-monitor': (message) => deleteMonitor(message.id),
   'check-monitor': (message) => checkMonitor(message.id),
+  'check-monitors': (message) => checkMonitors(message),
   'check-page': (message) => checkPage(message.url),
   'move-page-url': (message) => reusePageUrl(message),
   'copy-page-url': (message) => reusePageUrl(message, { copy: true }),
@@ -1574,6 +2196,14 @@ const messageHandlers = {
   'acknowledge-monitor': (message) => acknowledgeMonitor(message.id),
   'open-monitor-window': (message) => openMonitorWindow(message.id),
   'import-monitors': (message) => importMonitors(message),
+  'copy-selector-draft': (message) => copySelectorDraft(message),
+  'get-desktop-status': () => getDesktopStatus(),
+  'connect-desktop': (message) => connectDesktop(message),
+  'sync-desktop': async () => {
+    await syncDesktopState();
+    return { ok: true, ...(await getDesktopStatus()) };
+  },
+  'open-desktop-dashboard': () => openDesktopDashboard(),
   'open-dashboard': () => openDashboard(),
   'release-unclaimed-origin': (message, sender) => releaseUnclaimedOrigin(message, sender),
   'save-settings': async (message) => ({ ok: true, settings: await updateSettings(message.settings) })
@@ -1594,6 +2224,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
     void runDueChecks();
+  }
+  if (alarm.name === DESKTOP_ALARM_NAME) {
+    void runDesktopDueJobs();
   }
 });
 
@@ -1623,6 +2256,11 @@ async function initialize({ cleanupPermissions = false } = {}) {
     await cleanupUnusedSitePermissions();
   }
   await scheduleNextAlarm();
+  await ensureDesktopPollAlarm();
+  const desktopConfig = await getDesktopConfig();
+  if (desktopConfig.token) {
+    void connectDesktop().catch(() => undefined);
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {

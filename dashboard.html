@@ -12,6 +12,7 @@
       <p>선택한 페이지 요소의 변화를 로컬에서 확인합니다.</p>
       <div class="header-actions">
         <label class="sound-toggle" title="변경 감지 시 두 음의 알림음을 재생합니다."><input id="soundEnabled" type="checkbox"><span>변경 소리</span></label>
+        <button id="desktopButton" class="button secondary" type="button">Desktop</button>
         <button id="exportButton" class="button secondary" type="button">내보내기</button>
         <button id="importButton" class="button secondary" type="button">불러오기</button>
         <input id="importInput" type="file" accept="application/json,.json" hidden>
@@ -41,6 +42,14 @@
           <option value="paused">일시정지</option>
         </select>
         <p class="new-monitor-tip">새 요소는 추적할 웹페이지를 열고 브라우저 툴바의 <strong>OpenStill</strong> 버튼에서 선택하세요.</p>
+      </section>
+
+      <section class="bulk-actions" aria-label="선택한 추적 일괄 확인">
+        <label class="bulk-select-label"><input id="selectVisible" type="checkbox"><span>현재 목록 전체 선택</span></label>
+        <span id="selectedCount" class="selected-count">0개 선택</span>
+        <button id="checkSelected" class="button secondary" type="button" disabled>선택 항목 확인</button>
+        <button id="clearSelection" class="button secondary" type="button" disabled>선택 해제</button>
+        <p id="bulkStatus" class="bulk-status" role="status" aria-live="polite"></p>
       </section>
 
       <section class="content-grid">
@@ -80,6 +89,17 @@
         <p class="field-help">CSS 선택자, 표시 이름, 라벨, 확인 간격은 그대로 유지합니다. 새 주소에서는 첫 확인을 기준값으로 저장합니다.</p>
         <p id="pageUrlMessage" class="form-message" role="alert"></p>
         <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="pageUrlDialog">취소</button><button id="pageUrlSave" class="button primary" type="submit">주소 변경</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="desktopDialog" class="dialog desktop-dialog">
+      <form id="desktopForm" method="dialog">
+        <div class="dialog-heading"><div><p class="eyebrow">OpenStill Desktop</p><h2>같은 PC의 대시보드 연결</h2></div><button class="icon-button" type="button" data-close-dialog="desktopDialog" aria-label="닫기">×</button></div>
+        <p class="field-help">Desktop EXE에서 표시한 연결 토큰을 붙여넣습니다. URL·선택자·일정·결과는 인터넷이 아닌 같은 PC의 Desktop SQLite 데이터베이스로만 동기화됩니다.</p>
+        <label>연결 토큰<input id="desktopToken" type="password" autocomplete="off" spellcheck="false" maxlength="512" placeholder="Desktop에서 표시한 토큰"></label>
+        <p id="desktopConnectionStatus" class="field-help"></p>
+        <p id="desktopMessage" class="form-message" role="alert"></p>
+        <div class="dialog-actions"><button id="openDesktopDashboard" class="button secondary" type="button">Desktop 페이지 열기</button><button class="button primary" type="submit">연결 및 동기화</button></div>
       </form>
     </dialog>
 

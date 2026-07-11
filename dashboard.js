@@ -1,18 +1,27 @@
 (() => {
   const MIN_HOURS = 1;
   const MAX_HOURS = 14 * 24;
-  const MAX_IMPORT_BYTES = 8 * 1024 * 1024;
+  const MAX_IMPORT_BYTES = 32 * 1024 * 1024;
+  const SELECTED_CHECK_CHUNK_SIZE = 6;
   const state = { monitors: [], settings: { soundEnabled: true } };
   const filters = { label: '', status: 'all', query: '' };
+  const selectedMonitorIds = new Set();
   let toastTimer;
+  let batchCheckRunning = false;
 
   const elements = {
     soundEnabled: document.querySelector('#soundEnabled'),
+    desktopButton: document.querySelector('#desktopButton'),
     exportButton: document.querySelector('#exportButton'),
     importButton: document.querySelector('#importButton'),
     importInput: document.querySelector('#importInput'),
     searchInput: document.querySelector('#searchInput'),
     statusFilter: document.querySelector('#statusFilter'),
+    selectVisible: document.querySelector('#selectVisible'),
+    selectedCount: document.querySelector('#selectedCount'),
+    checkSelected: document.querySelector('#checkSelected'),
+    clearSelection: document.querySelector('#clearSelection'),
+    bulkStatus: document.querySelector('#bulkStatus'),
     labelList: document.querySelector('#labelList'),
     labelCount: document.querySelector('#labelCount'),
     listTitle: document.querySelector('#listTitle'),
@@ -43,6 +52,12 @@
     pageUrlInput: document.querySelector('#pageUrlInput'),
     pageUrlMessage: document.querySelector('#pageUrlMessage'),
     pageUrlSave: document.querySelector('#pageUrlSave'),
+    desktopDialog: document.querySelector('#desktopDialog'),
+    desktopForm: document.querySelector('#desktopForm'),
+    desktopToken: document.querySelector('#desktopToken'),
+    desktopConnectionStatus: document.querySelector('#desktopConnectionStatus'),
+    desktopMessage: document.querySelector('#desktopMessage'),
+    openDesktopDashboard: document.querySelector('#openDesktopDashboard'),
     changeDialog: document.querySelector('#changeDialog'),
     changeTitle: document.querySelector('#changeTitle'),
     changeWhen: document.querySelector('#changeWhen'),
@@ -132,10 +147,13 @@
 
   async function requestSitePermission(url) {
     try {
-      const origins = [sitePattern(url)];
-      return await chrome.permissions.contains({ origins }) || await chrome.permissions.request({ origins });
+      // HTTP/HTTPS access is now granted at installation time so a bulk import
+      // can begin without hundreds of origin-by-origin permission prompts.
+      // Retain URL validation at this UI boundary.
+      sitePattern(url);
+      return true;
     } catch (error) {
-      showToast(error.message || '사이트 접근 권한을 요청할 수 없습니다.');
+      showToast(error.message || 'HTTP 또는 HTTPS 주소를 확인해 주세요.');
       return false;
     }
   }
@@ -237,6 +255,41 @@
       .filter((site) => site.pages.length);
   }
 
+  function visibleMonitorIds(sites = getFilteredSiteGroups()) {
+    return sites.flatMap((site) => site.pages.flatMap((page) => (
+      page.visibleMonitors.map((monitor) => monitor.id)
+    )));
+  }
+
+  function pruneSelectedMonitorIds() {
+    const knownIds = new Set(state.monitors.map((monitor) => monitor.id));
+    for (const id of selectedMonitorIds) {
+      if (!knownIds.has(id)) selectedMonitorIds.delete(id);
+    }
+  }
+
+  function renderSelectionControls(sites = getFilteredSiteGroups()) {
+    pruneSelectedMonitorIds();
+    const visibleIds = visibleMonitorIds(sites);
+    const selectedVisible = visibleIds.filter((id) => selectedMonitorIds.has(id)).length;
+    const selectedCount = selectedMonitorIds.size;
+    elements.selectedCount.textContent = `${selectedCount}개 선택`;
+    elements.selectVisible.checked = Boolean(visibleIds.length) && selectedVisible === visibleIds.length;
+    elements.selectVisible.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
+    elements.selectVisible.disabled = batchCheckRunning || !visibleIds.length;
+    elements.checkSelected.disabled = batchCheckRunning || !selectedCount;
+    elements.clearSelection.disabled = batchCheckRunning || !selectedCount;
+  }
+
+  function setVisibleSelection(selected) {
+    const ids = visibleMonitorIds();
+    ids.forEach((id) => {
+      if (selected) selectedMonitorIds.add(id);
+      else selectedMonitorIds.delete(id);
+    });
+    renderMonitors();
+  }
+
   function renderOverview() {
     elements.summaryTotal.textContent = String(state.monitors.length);
     elements.summaryActive.textContent = String(state.monitors.filter((monitor) => monitor.enabled).length);
@@ -295,12 +348,21 @@
   }
 
   function monitorCard(monitor) {
-    const card = element('article', `tracking-card${monitor.unread ? ' unread' : ''}${needsAttention(monitor) ? ' needs-attention' : ''}`);
+    const selected = selectedMonitorIds.has(monitor.id);
+    const card = element('article', `tracking-card${monitor.unread ? ' unread' : ''}${needsAttention(monitor) ? ' needs-attention' : ''}${selected ? ' selected' : ''}`);
     const top = element('div', 'tracking-top');
+    const selectLabel = element('label', 'monitor-select');
+    const selectInput = document.createElement('input');
+    selectInput.type = 'checkbox';
+    selectInput.dataset.selectMonitor = monitor.id;
+    selectInput.checked = selected;
+    selectInput.disabled = batchCheckRunning;
+    selectInput.setAttribute('aria-label', `“${monitor.name}” 추적 선택`);
+    selectLabel.append(selectInput);
     const title = element('div', 'tracking-title');
     title.append(element('h4', '', monitor.name), element('p', 'selector-preview', selectorPreview(monitor)));
     const status = statusInfo(monitor);
-    top.append(title, element('span', `status ${status.key}`, status.label));
+    top.append(selectLabel, title, element('span', `status ${status.key}`, status.label));
     card.append(top);
 
     if (monitor.labels?.length) {
@@ -338,7 +400,7 @@
 
     const actions = element('div', 'card-actions');
     if (monitor.unread) actions.append(makeAction('변경 내용', 'change', monitor.id, 'attention-action'));
-    if (monitor.status === 'permission-needed') actions.append(makeAction('권한 허용 및 시작', 'grant', monitor.id, 'attention-action'));
+    if (monitor.status === 'permission-needed') actions.append(makeAction('추적 시작', 'grant', monitor.id, 'attention-action'));
     actions.append(
       makeAction('지금 확인', 'check', monitor.id),
       makeAction('작은 창', 'open', monitor.id),
@@ -433,6 +495,7 @@
       0
     ), 0);
     updateListHeading(sites, visibleMonitorCount);
+    renderSelectionControls(sites);
     elements.monitorList.replaceChildren();
     if (!sites.length) {
       const empty = element('div', 'empty-state');
@@ -458,6 +521,61 @@
     state.monitors = response.monitors ?? [];
     state.settings = response.settings ?? { soundEnabled: true };
     render();
+  }
+
+  async function refreshDesktopStatus() {
+    try {
+      const response = await send({ type: 'get-desktop-status' });
+      if (!response?.ok) throw new Error(response?.error || 'Desktop 상태를 확인하지 못했습니다.');
+      const status = response.connected
+        ? `연결됨 · 프로필 ${response.profileId}`
+        : response.configured
+          ? `연결 대기 · ${response.lastError || 'Desktop EXE와 Native host 등록을 확인해 주세요.'}`
+          : '연결 토큰이 아직 설정되지 않았습니다.';
+      elements.desktopConnectionStatus.textContent = status;
+      elements.desktopButton.textContent = response.connected ? 'Desktop ✓' : 'Desktop';
+      return response;
+    } catch (error) {
+      elements.desktopConnectionStatus.textContent = error.message || 'Desktop 상태를 확인하지 못했습니다.';
+      elements.desktopButton.textContent = 'Desktop';
+      return null;
+    }
+  }
+
+  async function openDesktopDialog() {
+    elements.desktopMessage.textContent = '';
+    elements.desktopToken.value = '';
+    await refreshDesktopStatus();
+    elements.desktopDialog.showModal();
+    requestAnimationFrame(() => elements.desktopToken.focus());
+  }
+
+  async function saveDesktopConnection() {
+    const token = elements.desktopToken.value.trim();
+    if (!token) {
+      elements.desktopMessage.textContent = 'Desktop에서 표시한 연결 토큰을 붙여넣어 주세요.';
+      return;
+    }
+    const submit = elements.desktopForm.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    elements.desktopMessage.textContent = 'Desktop에 연결하고 로컬 상태를 동기화하는 중입니다…';
+    try {
+      const response = await send({ type: 'connect-desktop', token });
+      if (!response?.ok) throw new Error(response?.error || 'Desktop에 연결하지 못했습니다.');
+      elements.desktopMessage.textContent = '연결되었습니다. Desktop의 기존 일정이 있으면 그 상태를 불러왔습니다.';
+      await refresh();
+      await refreshDesktopStatus();
+    } catch (error) {
+      elements.desktopMessage.textContent = error.message || 'Desktop에 연결하지 못했습니다.';
+      await refreshDesktopStatus();
+    } finally {
+      submit.disabled = false;
+    }
+  }
+
+  async function openDesktopDashboard() {
+    const response = await send({ type: 'open-desktop-dashboard' });
+    if (!response?.ok) showToast(response?.error || 'Desktop 페이지를 열지 못했습니다.');
   }
 
   function showToast(text) {
@@ -808,6 +926,49 @@
     await refresh();
   }
 
+  async function actionCheckSelected() {
+    const ids = [...selectedMonitorIds].filter((id) => Boolean(monitorById(id)));
+    if (!ids.length) {
+      elements.bulkStatus.textContent = '확인할 추적을 선택해 주세요.';
+      renderSelectionControls();
+      return;
+    }
+
+    batchCheckRunning = true;
+    let completed = 0;
+    let changed = 0;
+    let needsReview = 0;
+    let failed = 0;
+    let lastError = '';
+    renderMonitors();
+
+    try {
+      for (let start = 0; start < ids.length; start += SELECTED_CHECK_CHUNK_SIZE) {
+        const chunk = ids.slice(start, start + SELECTED_CHECK_CHUNK_SIZE);
+        elements.bulkStatus.textContent = `${ids.length}개 중 ${start + 1}–${Math.min(start + chunk.length, ids.length)}개를 확인하는 중…`;
+        try {
+          const response = await send({ type: 'check-monitors', ids: chunk });
+          if (!response?.ok) throw new Error(response?.error || '선택한 추적을 확인하지 못했습니다.');
+          completed += response.completed ?? 0;
+          changed += response.changed ?? 0;
+          needsReview += response.needsReview ?? 0;
+          failed += response.failed ?? 0;
+        } catch (error) {
+          failed += chunk.length;
+          lastError = error.message || '선택한 추적을 확인하지 못했습니다.';
+        }
+        await refresh();
+      }
+
+      const summary = `${completed}개 확인 완료${changed ? ` · 변경 ${changed}개` : ''}${needsReview ? ` · 확인 필요 ${needsReview}개` : ''}${failed ? ` · 실패 ${failed}개` : ''}`;
+      elements.bulkStatus.textContent = lastError ? `${summary} · ${lastError}` : summary;
+      showToast(lastError ? `${summary} (${lastError})` : summary);
+    } finally {
+      batchCheckRunning = false;
+      renderMonitors();
+    }
+  }
+
   async function actionGrant(monitor) {
     if (!await requestSitePermission(monitor.url)) {
       showToast('권한을 허용하지 않았습니다.');
@@ -919,7 +1080,7 @@
   async function importMonitors(file) {
     if (!file) return;
     try {
-      if (file.size > MAX_IMPORT_BYTES) throw new Error('8 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
+      if (file.size > MAX_IMPORT_BYTES) throw new Error('32 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
       const parsed = JSON.parse(await file.text());
       if (parsed?.format !== 'openstill-export' || parsed?.schemaVersion !== 2 || !Array.isArray(parsed?.monitors)) {
         throw new Error('OpenStill 내보내기 파일 형식이 아닙니다.');
@@ -936,6 +1097,13 @@
   }
 
   elements.monitorList.addEventListener('click', (event) => void handleCardAction(event));
+  elements.monitorList.addEventListener('change', (event) => {
+    const input = event.target.closest('input[data-select-monitor]');
+    if (!input || batchCheckRunning) return;
+    if (input.checked) selectedMonitorIds.add(input.dataset.selectMonitor);
+    else selectedMonitorIds.delete(input.dataset.selectMonitor);
+    renderMonitors();
+  });
   elements.labelList.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-label]');
     if (!button) return;
@@ -944,10 +1112,21 @@
   });
   elements.searchInput.addEventListener('input', () => { filters.query = elements.searchInput.value; renderMonitors(); });
   elements.statusFilter.addEventListener('change', () => { filters.status = elements.statusFilter.value; renderMonitors(); });
+  elements.selectVisible.addEventListener('change', () => setVisibleSelection(elements.selectVisible.checked));
+  elements.clearSelection.addEventListener('click', () => {
+    if (batchCheckRunning) return;
+    selectedMonitorIds.clear();
+    elements.bulkStatus.textContent = '';
+    renderMonitors();
+  });
+  elements.checkSelected.addEventListener('click', () => void actionCheckSelected());
   elements.soundEnabled.addEventListener('change', async () => {
     await send({ type: 'save-settings', settings: { soundEnabled: elements.soundEnabled.checked } });
     await refresh();
   });
+  elements.desktopButton.addEventListener('click', () => void openDesktopDialog());
+  elements.desktopForm.addEventListener('submit', (event) => { event.preventDefault(); void saveDesktopConnection(); });
+  elements.openDesktopDashboard.addEventListener('click', () => void openDesktopDashboard());
   elements.exportButton.addEventListener('click', exportMonitors);
   elements.importButton.addEventListener('click', () => elements.importInput.click());
   elements.importInput.addEventListener('change', () => void importMonitors(elements.importInput.files?.[0]));
@@ -975,5 +1154,5 @@
   });
 
   populateIntervalSelects();
-  void refresh().catch((error) => showToast(error.message || '데이터를 불러오지 못했습니다.'));
+  void Promise.all([refresh(), refreshDesktopStatus()]).catch((error) => showToast(error.message || '데이터를 불러오지 못했습니다.'));
 })();

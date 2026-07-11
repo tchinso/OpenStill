@@ -1,3 +1,12 @@
 /References
 /dist
 /tests
+/desktop/build
+/desktop/spec
+/desktop/dist
+*.sqlite3
+*-wal
+*-shm
+/desktop/dist
+/desktop/build
+/desktop/__pycache__

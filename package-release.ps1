@@ -57,4 +57,4 @@ if (Test-Path -LiteralPath $archivePath) {
 Compress-Archive -LiteralPath (Get-ChildItem -LiteralPath $stagingDirectory -Force | Select-Object -ExpandProperty FullName) -DestinationPath $archivePath -CompressionLevel Optimal
 
 Write-Output "Created Chrome Web Store ZIP: $archivePath"
-Write-Output 'The package intentionally excludes References/, documentation, and repository metadata.'
+Write-Output 'The package intentionally excludes References/, desktop/, documentation, tests, and repository metadata.'

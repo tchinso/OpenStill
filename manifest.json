@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "OpenStill",
   "short_name": "OpenStill",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "선택한 웹페이지 요소의 텍스트 변경을 주기적으로 확인합니다.",
   "minimum_chrome_version": "116",
   "incognito": "not_allowed",
@@ -29,9 +29,12 @@
     "storage",
     "scripting",
     "notifications",
-    "offscreen"
+    "offscreen",
+    "unlimitedStorage",
+    "nativeMessaging",
+    "clipboardWrite"
   ],
-  "optional_host_permissions": [
+  "host_permissions": [
     "http://*/*",
     "https://*/*"
   ]
