@@ -99,18 +99,6 @@
     }
   }
 
-  async function copySelectorDraft(text) {
-    if (typeof text !== 'string' || !text.trim()) {
-      return { ok: false, error: '복사할 선택 초안이 없습니다.' };
-    }
-    try {
-      await navigator.clipboard.writeText(text);
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: `클립보드에 복사하지 못했습니다: ${error.message}` };
-    }
-  }
-
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'parse-monitor-html') {
       sendResponse(inspectHtml(message.html, message.selector));
@@ -122,9 +110,5 @@
       return true;
     }
 
-    if (message?.type === 'copy-selector-draft') {
-      void copySelectorDraft(message.text).then(sendResponse);
-      return true;
-    }
   });
 })();

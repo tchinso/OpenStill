@@ -12,7 +12,7 @@
       <p>선택한 페이지 요소의 변화를 로컬에서 확인합니다.</p>
       <div class="header-actions">
         <label class="sound-toggle" title="변경 감지 시 두 음의 알림음을 재생합니다."><input id="soundEnabled" type="checkbox"><span>변경 소리</span></label>
-        <button id="desktopButton" class="button secondary" type="button">Desktop</button>
+        <button id="batchUrlButton" class="button secondary" type="button">주소 일괄 변경</button>
         <button id="exportButton" class="button secondary" type="button">내보내기</button>
         <button id="importButton" class="button secondary" type="button">불러오기</button>
         <input id="importInput" type="file" accept="application/json,.json" hidden>
@@ -73,8 +73,8 @@
         <label>웹페이지 주소<input id="editUrl" type="url" inputmode="url" required></label>
         <label>CSS 선택자 <span class="field-help">한 줄에 하나씩 입력합니다. 같은 주소의 선택 결과는 하나의 목록으로 비교됩니다.</span><textarea id="editSelectors" spellcheck="false" maxlength="10000" rows="6" required></textarea></label>
         <label>라벨 <span class="field-help">쉼표로 여러 개를 구분</span><input id="editLabels" maxlength="500" placeholder="예: 공지, 가격"></label>
-        <fieldset><legend>확인 간격</legend><div class="interval-inputs"><label><span>일</span><select id="editDays"></select></label><label><span>시간</span><select id="editHours"></select></label></div><p id="editIntervalHelp" class="field-help"></p></fieldset>
-        <label class="check-row"><input id="editEnabled" type="checkbox"><span>정기 확인 사용</span></label>
+        <fieldset><legend>확인 방식</legend><label><span>방식</span><select id="editScheduleMode"><option value="manual">수동</option><option value="interval">정기 확인</option></select></label><div id="editIntervalInputs" class="interval-inputs"><label><span>일</span><select id="editDays"></select></label><label><span>시간</span><select id="editHours"></select></label></div><p id="editIntervalHelp" class="field-help"></p></fieldset>
+        <label class="check-row"><input id="editEnabled" type="checkbox"><span>추적 사용</span></label>
         <p id="editorMessage" class="form-message" role="alert"></p>
         <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="editorDialog">취소</button><button class="button primary" type="submit">저장</button></div>
       </form>
@@ -86,20 +86,22 @@
         <input id="pageUrlSource" type="hidden">
         <p id="pageUrlDescription" class="field-help"></p>
         <label>새 웹페이지 주소<input id="pageUrlInput" type="url" inputmode="url" required></label>
-        <p class="field-help">CSS 선택자, 표시 이름, 라벨, 확인 간격은 그대로 유지합니다. 새 주소에서는 첫 확인을 기준값으로 저장합니다.</p>
+        <p class="field-help">CSS 선택자, 표시 이름, 라벨, 확인 방식은 그대로 유지합니다. 새 주소에서는 첫 확인을 기준값으로 저장합니다.</p>
         <p id="pageUrlMessage" class="form-message" role="alert"></p>
         <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="pageUrlDialog">취소</button><button id="pageUrlSave" class="button primary" type="submit">주소 변경</button></div>
       </form>
     </dialog>
 
-    <dialog id="desktopDialog" class="dialog desktop-dialog">
-      <form id="desktopForm" method="dialog">
-        <div class="dialog-heading"><div><p class="eyebrow">OpenStill Desktop</p><h2>같은 PC의 대시보드 연결</h2></div><button class="icon-button" type="button" data-close-dialog="desktopDialog" aria-label="닫기">×</button></div>
-        <p class="field-help">Desktop EXE에서 표시한 연결 토큰을 붙여넣습니다. URL·선택자·일정·결과는 인터넷이 아닌 같은 PC의 Desktop SQLite 데이터베이스로만 동기화됩니다.</p>
-        <label>연결 토큰<input id="desktopToken" type="password" autocomplete="off" spellcheck="false" maxlength="512" placeholder="Desktop에서 표시한 토큰"></label>
-        <p id="desktopConnectionStatus" class="field-help"></p>
-        <p id="desktopMessage" class="form-message" role="alert"></p>
-        <div class="dialog-actions"><button id="openDesktopDashboard" class="button secondary" type="button">Desktop 페이지 열기</button><button class="button primary" type="submit">연결 및 동기화</button></div>
+    <dialog id="batchUrlDialog" class="dialog batch-url-dialog">
+      <form id="batchUrlForm" method="dialog">
+        <div class="dialog-heading"><div><p class="eyebrow">사이트 주소</p><h2>주소 일괄 변경</h2></div><button class="icon-button" type="button" data-close-dialog="batchUrlDialog" aria-label="닫기">×</button></div>
+        <p class="field-help">정확히 일치하는 사이트 주소를 가진 모든 추적을 한 번에 옮깁니다. 경로·쿼리·CSS 선택자·확인 방식은 유지합니다.</p>
+        <label>기존 사이트 주소<input id="batchUrlSource" type="text" inputmode="url" autocomplete="off" spellcheck="false" maxlength="255" placeholder="example.com" required></label>
+        <label>새 사이트 주소<input id="batchUrlTarget" type="text" inputmode="url" autocomplete="off" spellcheck="false" maxlength="255" placeholder="example1.com" required></label>
+        <p id="batchUrlPreview" class="field-help" aria-live="polite"></p>
+        <p class="field-help">프로토콜은 그대로 유지합니다. 새 주소가 이미 추적 중인 페이지와 겹치면 데이터 손실을 막기 위해 아무것도 변경하지 않습니다. 변경된 페이지는 다음 수동 또는 정기 확인에서 새 기준값을 저장합니다.</p>
+        <p id="batchUrlMessage" class="form-message" role="alert"></p>
+        <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="batchUrlDialog">취소</button><button id="batchUrlSave" class="button primary" type="submit">일괄 변경</button></div>
       </form>
     </dialog>
 

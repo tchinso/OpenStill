@@ -11,7 +11,7 @@
 
   const elements = {
     soundEnabled: document.querySelector('#soundEnabled'),
-    desktopButton: document.querySelector('#desktopButton'),
+    batchUrlButton: document.querySelector('#batchUrlButton'),
     exportButton: document.querySelector('#exportButton'),
     importButton: document.querySelector('#importButton'),
     importInput: document.querySelector('#importInput'),
@@ -39,6 +39,8 @@
     editUrl: document.querySelector('#editUrl'),
     editSelectors: document.querySelector('#editSelectors'),
     editLabels: document.querySelector('#editLabels'),
+    editScheduleMode: document.querySelector('#editScheduleMode'),
+    editIntervalInputs: document.querySelector('#editIntervalInputs'),
     editDays: document.querySelector('#editDays'),
     editHours: document.querySelector('#editHours'),
     editEnabled: document.querySelector('#editEnabled'),
@@ -52,12 +54,13 @@
     pageUrlInput: document.querySelector('#pageUrlInput'),
     pageUrlMessage: document.querySelector('#pageUrlMessage'),
     pageUrlSave: document.querySelector('#pageUrlSave'),
-    desktopDialog: document.querySelector('#desktopDialog'),
-    desktopForm: document.querySelector('#desktopForm'),
-    desktopToken: document.querySelector('#desktopToken'),
-    desktopConnectionStatus: document.querySelector('#desktopConnectionStatus'),
-    desktopMessage: document.querySelector('#desktopMessage'),
-    openDesktopDashboard: document.querySelector('#openDesktopDashboard'),
+    batchUrlDialog: document.querySelector('#batchUrlDialog'),
+    batchUrlForm: document.querySelector('#batchUrlForm'),
+    batchUrlSource: document.querySelector('#batchUrlSource'),
+    batchUrlTarget: document.querySelector('#batchUrlTarget'),
+    batchUrlPreview: document.querySelector('#batchUrlPreview'),
+    batchUrlMessage: document.querySelector('#batchUrlMessage'),
+    batchUrlSave: document.querySelector('#batchUrlSave'),
     changeDialog: document.querySelector('#changeDialog'),
     changeTitle: document.querySelector('#changeTitle'),
     changeWhen: document.querySelector('#changeWhen'),
@@ -112,6 +115,14 @@
     return `${days ? `${days}일` : ''}${days && rest ? ' ' : ''}${rest ? `${rest}시간` : ''}` || '0시간';
   }
 
+  function scheduleModeOf(monitor) {
+    return monitor?.scheduleMode === 'interval' ? 'interval' : 'manual';
+  }
+
+  function formatSchedule(monitor) {
+    return scheduleModeOf(monitor) === 'manual' ? '수동' : formatDuration(monitor.intervalHours);
+  }
+
   function formatDate(iso) {
     const timestamp = Date.parse(iso ?? '');
     if (!Number.isFinite(timestamp)) return '아직 없음';
@@ -128,6 +139,34 @@
 
   function originOf(url) {
     try { return new URL(url).origin; } catch { return url; }
+  }
+
+  function siteHostFromInput(value) {
+    const raw = String(value ?? '').trim();
+    if (!raw || raw.length > 255) return null;
+    const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`;
+    try {
+      const url = new URL(candidate);
+      if (
+        !['https:', 'http:'].includes(url.protocol)
+        || url.username
+        || url.password
+        || url.pathname !== '/'
+        || url.search
+        || url.hash
+      ) {
+        return null;
+      }
+      return url.host ? url.host.toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function monitorCountForSiteHost(siteHost) {
+    return state.monitors.filter((monitor) => {
+      try { return new URL(monitor.url).host.toLowerCase() === siteHost; } catch { return false; }
+    }).length;
   }
 
   function pagePath(url) {
@@ -383,7 +422,7 @@
     const details = element('div', 'tracking-details');
     const rows = [
       ['선택', `${selectorsOf(monitor).length}개`],
-      ['간격', formatDuration(monitor.intervalHours)],
+      ['확인 방식', formatSchedule(monitor)],
       ['마지막 확인', formatDate(monitor.lastCheckedAt)],
       ['마지막 변경', formatDate(monitor.lastChangedAt)]
     ];
@@ -523,61 +562,6 @@
     render();
   }
 
-  async function refreshDesktopStatus() {
-    try {
-      const response = await send({ type: 'get-desktop-status' });
-      if (!response?.ok) throw new Error(response?.error || 'Desktop 상태를 확인하지 못했습니다.');
-      const status = response.connected
-        ? `연결됨 · 프로필 ${response.profileId}`
-        : response.configured
-          ? `연결 대기 · ${response.lastError || 'Desktop EXE와 Native host 등록을 확인해 주세요.'}`
-          : '연결 토큰이 아직 설정되지 않았습니다.';
-      elements.desktopConnectionStatus.textContent = status;
-      elements.desktopButton.textContent = response.connected ? 'Desktop ✓' : 'Desktop';
-      return response;
-    } catch (error) {
-      elements.desktopConnectionStatus.textContent = error.message || 'Desktop 상태를 확인하지 못했습니다.';
-      elements.desktopButton.textContent = 'Desktop';
-      return null;
-    }
-  }
-
-  async function openDesktopDialog() {
-    elements.desktopMessage.textContent = '';
-    elements.desktopToken.value = '';
-    await refreshDesktopStatus();
-    elements.desktopDialog.showModal();
-    requestAnimationFrame(() => elements.desktopToken.focus());
-  }
-
-  async function saveDesktopConnection() {
-    const token = elements.desktopToken.value.trim();
-    if (!token) {
-      elements.desktopMessage.textContent = 'Desktop에서 표시한 연결 토큰을 붙여넣어 주세요.';
-      return;
-    }
-    const submit = elements.desktopForm.querySelector('button[type="submit"]');
-    submit.disabled = true;
-    elements.desktopMessage.textContent = 'Desktop에 연결하고 로컬 상태를 동기화하는 중입니다…';
-    try {
-      const response = await send({ type: 'connect-desktop', token });
-      if (!response?.ok) throw new Error(response?.error || 'Desktop에 연결하지 못했습니다.');
-      elements.desktopMessage.textContent = '연결되었습니다. Desktop의 기존 일정이 있으면 그 상태를 불러왔습니다.';
-      await refresh();
-      await refreshDesktopStatus();
-    } catch (error) {
-      elements.desktopMessage.textContent = error.message || 'Desktop에 연결하지 못했습니다.';
-      await refreshDesktopStatus();
-    } finally {
-      submit.disabled = false;
-    }
-  }
-
-  async function openDesktopDashboard() {
-    const response = await send({ type: 'open-desktop-dashboard' });
-    if (!response?.ok) showToast(response?.error || 'Desktop 페이지를 열지 못했습니다.');
-  }
-
   function showToast(text) {
     clearTimeout(toastTimer);
     elements.toast.textContent = text;
@@ -608,6 +592,7 @@
   }
 
   function updateEditorInterval() {
+    const scheduleMode = elements.editScheduleMode.value === 'interval' ? 'interval' : 'manual';
     const days = Number(elements.editDays.value);
     let hours = Number(elements.editHours.value);
     if (days === 14 && hours > 0) {
@@ -618,7 +603,10 @@
       option.disabled = days === 14 && Number(option.value) > 0;
     });
     const total = days * 24 + hours;
-    elements.editIntervalHelp.textContent = total >= MIN_HOURS && total <= MAX_HOURS
+    elements.editIntervalInputs.hidden = scheduleMode === 'manual';
+    elements.editIntervalHelp.textContent = scheduleMode === 'manual'
+      ? '자동으로 갱신하지 않습니다. 대시보드의 “지금 확인”으로만 갱신합니다.'
+      : total >= MIN_HOURS && total <= MAX_HOURS
       ? `매 ${formatDuration(total)}마다 확인합니다.`
       : '간격은 최소 1시간, 최대 14일입니다.';
     return total;
@@ -630,6 +618,7 @@
     elements.editUrl.value = monitor.url;
     elements.editSelectors.value = selectorsOf(monitor).join('\n');
     elements.editLabels.value = (monitor.labels ?? []).join(', ');
+    elements.editScheduleMode.value = scheduleModeOf(monitor);
     elements.editDays.value = String(Math.floor(monitor.intervalHours / 24));
     elements.editHours.value = String(monitor.intervalHours % 24);
     elements.editEnabled.checked = monitor.enabled;
@@ -641,12 +630,13 @@
   async function saveEditor() {
     const id = elements.editId.value;
     const totalHours = updateEditorInterval();
+    const scheduleMode = elements.editScheduleMode.value === 'interval' ? 'interval' : 'manual';
     const url = elements.editUrl.value.trim();
     const selectors = [...new Set(elements.editSelectors.value
       .split(/\r?\n/)
       .map((selector) => selector.trim())
       .filter(Boolean))];
-    if (!id || !url || !selectors.length || totalHours < MIN_HOURS || totalHours > MAX_HOURS) {
+    if (!id || !url || !selectors.length || (scheduleMode === 'interval' && (totalHours < MIN_HOURS || totalHours > MAX_HOURS))) {
       elements.editorMessage.textContent = '필수 정보와 확인 간격을 확인해 주세요.';
       return;
     }
@@ -665,6 +655,7 @@
       url,
       selectors,
       labels: elements.editLabels.value.split(','),
+      scheduleMode,
       intervalHours: totalHours,
       enabled
     });
@@ -727,6 +718,71 @@
       ? `${response.count}개 추적을 새 주소에 복제했습니다. 첫 확인에서 기준값을 저장합니다.`
       : `${response.count}개 추적의 주소를 변경했습니다. 첫 확인에서 기준값을 저장합니다.`);
     await refresh();
+  }
+
+  function updateBatchUrlPreview() {
+    const sourceHost = siteHostFromInput(elements.batchUrlSource.value);
+    const targetHost = siteHostFromInput(elements.batchUrlTarget.value);
+    if (!sourceHost) {
+      elements.batchUrlPreview.textContent = '기존 사이트 주소에 example.com처럼 도메인만 입력해 주세요.';
+      return 0;
+    }
+
+    const affected = monitorCountForSiteHost(sourceHost);
+    if (!targetHost) {
+      elements.batchUrlPreview.textContent = `${sourceHost}의 ${affected}개 추적 페이지를 찾았습니다. 새 사이트 주소를 입력해 주세요.`;
+      return affected;
+    }
+    if (sourceHost === targetHost) {
+      elements.batchUrlPreview.textContent = '새 사이트 주소가 기존 주소와 같습니다.';
+      return 0;
+    }
+
+    elements.batchUrlPreview.textContent = `${sourceHost} → ${targetHost}: ${affected}개 추적 페이지의 주소를 변경합니다.`;
+    return affected;
+  }
+
+  function openBatchUrlDialog() {
+    elements.batchUrlSource.value = '';
+    elements.batchUrlTarget.value = '';
+    elements.batchUrlMessage.textContent = '';
+    updateBatchUrlPreview();
+    elements.batchUrlDialog.showModal();
+    requestAnimationFrame(() => elements.batchUrlSource.focus());
+  }
+
+  async function saveBatchUrl() {
+    const sourceHost = siteHostFromInput(elements.batchUrlSource.value);
+    const targetHost = siteHostFromInput(elements.batchUrlTarget.value);
+    if (!sourceHost || !targetHost) {
+      elements.batchUrlMessage.textContent = '기존 및 새 사이트 주소에는 도메인(필요하면 포트)만 입력해 주세요.';
+      return;
+    }
+    if (sourceHost === targetHost) {
+      elements.batchUrlMessage.textContent = '새 사이트 주소가 기존 주소와 같습니다.';
+      return;
+    }
+    if (!monitorCountForSiteHost(sourceHost)) {
+      elements.batchUrlMessage.textContent = '기존 사이트 주소에 해당하는 추적을 찾지 못했습니다.';
+      return;
+    }
+
+    elements.batchUrlSave.disabled = true;
+    elements.batchUrlMessage.textContent = '주소를 안전하게 변경하는 중입니다…';
+    try {
+      const response = await send({ type: 'replace-site-host', sourceHost, targetHost });
+      if (!response?.ok) {
+        elements.batchUrlMessage.textContent = response?.error || '주소를 일괄 변경하지 못했습니다.';
+        return;
+      }
+      elements.batchUrlDialog.close();
+      showToast(`${response.count}개 추적 페이지의 사이트 주소를 변경했습니다. 다음 확인에서 새 기준값을 저장합니다.`);
+      await refresh();
+    } catch (error) {
+      elements.batchUrlMessage.textContent = error.message || '주소를 일괄 변경하지 못했습니다.';
+    } finally {
+      elements.batchUrlSave.disabled = false;
+    }
   }
 
   function pushText(target, text) {
@@ -1124,16 +1180,18 @@
     await send({ type: 'save-settings', settings: { soundEnabled: elements.soundEnabled.checked } });
     await refresh();
   });
-  elements.desktopButton.addEventListener('click', () => void openDesktopDialog());
-  elements.desktopForm.addEventListener('submit', (event) => { event.preventDefault(); void saveDesktopConnection(); });
-  elements.openDesktopDashboard.addEventListener('click', () => void openDesktopDashboard());
+  elements.batchUrlButton.addEventListener('click', openBatchUrlDialog);
   elements.exportButton.addEventListener('click', exportMonitors);
   elements.importButton.addEventListener('click', () => elements.importInput.click());
   elements.importInput.addEventListener('change', () => void importMonitors(elements.importInput.files?.[0]));
   elements.editDays.addEventListener('change', updateEditorInterval);
   elements.editHours.addEventListener('change', updateEditorInterval);
+  elements.editScheduleMode.addEventListener('change', updateEditorInterval);
   elements.editorForm.addEventListener('submit', (event) => { event.preventDefault(); void saveEditor(); });
   elements.pageUrlForm.addEventListener('submit', (event) => { event.preventDefault(); void savePageUrl(); });
+  elements.batchUrlSource.addEventListener('input', updateBatchUrlPreview);
+  elements.batchUrlTarget.addEventListener('input', updateBatchUrlPreview);
+  elements.batchUrlForm.addEventListener('submit', (event) => { event.preventDefault(); void saveBatchUrl(); });
   document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => document.querySelector(`#${button.dataset.closeDialog}`).close()));
   elements.changeOpenPage.addEventListener('click', async () => {
     const response = await send({ type: 'open-monitor-window', id: elements.changeDialog.dataset.id });
@@ -1154,5 +1212,5 @@
   });
 
   populateIntervalSelects();
-  void Promise.all([refresh(), refreshDesktopStatus()]).catch((error) => showToast(error.message || '데이터를 불러오지 못했습니다.'));
+  void refresh().catch((error) => showToast(error.message || '데이터를 불러오지 못했습니다.'));
 })();

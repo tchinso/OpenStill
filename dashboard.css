@@ -116,13 +116,14 @@ select, input:not([type="checkbox"]):not([type="file"]), textarea { border: 1px 
 .dialog-heading h2 { margin: 0; font-size: 18px; }
 .icon-button { width: 30px; height: 30px; border: 0; border-radius: 8px; color: #c4d2e3; background: transparent; font-size: 20px; }
 .icon-button:hover { background: #273950; }
-.editor-dialog label, .page-url-dialog label, .desktop-dialog label { display: grid; gap: 6px; color: #c8d5e6; font-size: 12px; font-weight: 700; }
-.editor-dialog input:not([type="checkbox"]), .editor-dialog select, .editor-dialog textarea, .page-url-dialog input, .desktop-dialog input { width: 100%; padding: 9px 10px; font-size: 12px; }
+.editor-dialog label, .page-url-dialog label, .batch-url-dialog label { display: grid; gap: 6px; color: #c8d5e6; font-size: 12px; font-weight: 700; }
+.editor-dialog input:not([type="checkbox"]), .editor-dialog select, .editor-dialog textarea, .page-url-dialog input, .batch-url-dialog input { width: 100%; padding: 9px 10px; font-size: 12px; }
 .editor-dialog textarea { min-height: 112px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.45; }
 .field-help { color: #8ea2bb; font-size: 11px; font-weight: 500; }
 fieldset { display: grid; gap: 8px; margin: 0; padding: 10px; border: 1px solid #324861; border-radius: 9px; }
 legend { padding: 0 4px; color: #c8d5e6; font-size: 12px; font-weight: 700; }
 .interval-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.interval-inputs[hidden] { display: none; }
 .interval-inputs label { color: #8ea2bb; font-size: 11px; }
 .check-row { display: flex !important; align-items: center; gap: 8px; cursor: pointer; }
 .form-message { min-height: 15px; margin: 0; color: #ffaca5; font-size: 11px; }

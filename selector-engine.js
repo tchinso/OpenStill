@@ -140,7 +140,9 @@
   const metaWords = ['lang'];
   const cssWords = penalWords.concat(stylingWords, cssColorWords, cssPositionWords, cssLayoutWords, fontWords, metaWords);
 
-  // https://mths.be/cssesc v3.0.0, matching the bundled reference's escaping.
+  // cssesc v3.0.0, Copyright Mathias Bynens, MIT License.
+  // Full notice: THIRD_PARTY_NOTICES.md.  Its escaping behavior matches the
+  // bundled reference implementation.
   const cssescObject = {};
   const cssescHasOwnProperty = cssescObject.hasOwnProperty;
   const cssescMerge = (options, defaults) => {
@@ -455,14 +457,23 @@
     }
 
     static buildTree(targetNode, root, options, unsatisfied, filterCallback) {
+      // getMaxDepth walks down from root.  Checking containment before that
+      // walk is essential: an unrelated (or stale) root otherwise has no
+      // child to advance to and would spin forever on the page thread.
+      if (
+        !targetNode
+        || targetNode.nodeType !== 1
+        || !root
+        || typeof root.contains !== 'function'
+        || !root.contains(targetNode)
+      ) {
+        throw new Error('target is not in subtree');
+      }
       const coveredNodes = [];
       const tokens = [];
       const maxDepth = this.getMaxDepth(targetNode, root);
       let depth = maxDepth;
       let currentNode = targetNode;
-      if (!currentNode.contains(targetNode)) {
-        throw new Error('target is not in subtree');
-      }
       while (currentNode && root.contains(currentNode)) {
         this.generateTokens(currentNode, options, depth, 0, tokens, coveredNodes, unsatisfied, filterCallback);
         if (options.siblingNodes) {
@@ -542,12 +553,17 @@
       let currentNode = root;
       while (currentNode !== targetNode) {
         depth += 1;
+        let nextNode = null;
         for (const child of Array.from(currentNode.childNodes)) {
           if (child.contains(targetNode)) {
-            currentNode = child;
+            nextNode = child;
             break;
           }
         }
+        if (!nextNode) {
+          throw new Error('target is not in subtree');
+        }
+        currentNode = nextNode;
       }
       return depth;
     }

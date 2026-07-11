@@ -448,6 +448,17 @@
       } catch (error) {
         console.warn('OpenStill reference selector generation failed.', error);
       }
+
+      // The token-tree generator can time out on a very large or frequently
+      // mutating page.  Do not discard a demonstrably unique semantic path in
+      // that case; unlike the old parent > nth-child fallback, this helper
+      // requires at least one stable-looking ID, attribute, or class.
+      const semanticSelector = semanticDescendantFallback(element);
+      if (semanticSelector && hasSingleMatch(semanticSelector, element)) {
+        cached.full = semanticSelector;
+        selectorCache.set(element, cached);
+        return semanticSelector;
+      }
       return '';
     }
 
@@ -619,6 +630,9 @@
           .remove-selection { width: 26px; height: 26px; color: #ffb5ad !important; border-radius: 6px; font-size: 16px; text-align: center !important; }
           .match.selected { border-color: #42dda3; background: rgb(66 221 163 / 10%); }
           .schedule { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+          .schedule[hidden] { display: none; }
+          .interval-fields { display: grid; gap: 6px; color: #c8d5e6; font-size: 12px; font-weight: 650; }
+          .interval-fields[hidden] { display: none; }
           .schedule label { color: #aebed2; }
           .schedule small { color: #7e91aa; font-weight: 500; }
           .actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 2px; }
@@ -651,13 +665,16 @@
               <div class="validity" id="validity">선택자를 확인하는 중입니다.</div>
               <label>표시 이름 <span style="font-weight:500;color:#7e91aa">여러 개면 번호를 붙여 저장</span><input id="name" name="name" maxlength="120" /></label>
               <label>라벨 <span style="font-weight:500;color:#7e91aa">쉼표로 여러 개를 구분</span><input id="labels" name="labels" maxlength="500" placeholder="예: 채용, 가격" /></label>
-              <label>확인 간격
+              <label>확인 방식
+                <select id="scheduleMode" aria-label="확인 방식"><option value="manual">수동</option><option value="interval">정기 확인</option></select>
+              </label>
+              <div id="intervalFields" class="interval-fields"><span>확인 간격</span>
                 <div class="schedule">
                   <label><small>일</small><select id="days" aria-label="일"></select></label>
                   <label><small>시간</small><select id="hours" aria-label="시간"></select></label>
                 </div>
-              </label>
-              <p class="notice" id="intervalSummary">매 1시간마다 확인합니다.</p>
+              </div>
+              <p class="notice" id="intervalSummary">자동 갱신 없이 수동으로만 확인합니다.</p>
               <p class="message" id="message" role="alert"></p>
               <div class="actions">
                 <button class="button" id="selectAgain" type="button">요소 추가</button>
@@ -676,6 +693,8 @@
       this.selectorInput = this.shadow.querySelector('#selector');
       this.nameInput = this.shadow.querySelector('#name');
       this.labelsInput = this.shadow.querySelector('#labels');
+      this.scheduleModeInput = this.shadow.querySelector('#scheduleMode');
+      this.intervalFields = this.shadow.querySelector('#intervalFields');
       this.daysInput = this.shadow.querySelector('#days');
       this.hoursInput = this.shadow.querySelector('#hours');
       this.validity = this.shadow.querySelector('#validity');
@@ -698,6 +717,7 @@
         this.hoursInput.append(option);
       }
       this.hoursInput.value = '1';
+      this.scheduleModeInput.value = 'manual';
 
       this.closeButton = this.shadow.querySelector('#close');
       this.cancelButton = this.shadow.querySelector('#cancel');
@@ -719,6 +739,7 @@
       });
       this.daysInput.addEventListener('change', () => this.updateInterval());
       this.hoursInput.addEventListener('change', () => this.updateInterval());
+      this.scheduleModeInput.addEventListener('change', () => this.updateInterval());
       this.form.addEventListener('submit', (event) => {
         event.preventDefault();
         void this.save();
@@ -1000,6 +1021,7 @@
     }
 
     updateInterval() {
+      const scheduleMode = this.selectedScheduleMode();
       const days = Number(this.daysInput.value);
       let hours = Number(this.hoursInput.value);
       if (days === 14 && hours !== 0) {
@@ -1010,10 +1032,17 @@
         option.disabled = days === 14 && Number(option.value) > 0;
       });
       const totalHours = days * 24 + hours;
-      this.intervalSummary.textContent = totalHours >= 1 && totalHours <= 336
+      this.intervalFields.hidden = scheduleMode === 'manual';
+      this.intervalSummary.textContent = scheduleMode === 'manual'
+        ? '자동 갱신 없이 수동으로만 확인합니다. 대시보드의 “지금 확인”으로 갱신할 수 있습니다.'
+        : totalHours >= 1 && totalHours <= 336
         ? `매 ${days ? `${days}일 ` : ''}${hours ? `${hours}시간` : ''}`.trim() + '마다 확인합니다.'
         : '간격은 최소 1시간, 최대 14일로 설정해 주세요.';
       this.validateSelector();
+    }
+
+    selectedScheduleMode() {
+      return this.scheduleModeInput.value === 'interval' ? 'interval' : 'manual';
     }
 
     selectedIntervalHours() {
@@ -1026,6 +1055,7 @@
       }
       const selector = this.selectorInput.value.trim();
       const totalHours = this.selectedIntervalHours();
+      const scheduleMode = this.selectedScheduleMode();
       const active = this.currentSelection();
       this.message.textContent = '';
       this.validity.className = 'validity';
@@ -1067,7 +1097,7 @@
         this.validity.replaceChildren(document.createTextNode(message), preview);
         this.validity.classList.add('ok');
         this.renderSelectionList();
-        this.saveButton.disabled = !(totalHours >= 1 && totalHours <= 336 && this.selections.length);
+        this.saveButton.disabled = !((scheduleMode === 'manual' || (totalHours >= 1 && totalHours <= 336)) && this.selections.length);
         return true;
       } catch (error) {
         this.validity.textContent = '유효하지 않은 CSS 선택자입니다: ' + error.message;
@@ -1174,7 +1204,8 @@
         return;
       }
       const totalHours = this.selectedIntervalHours();
-      if (totalHours < 1 || totalHours > 336) {
+      const scheduleMode = this.selectedScheduleMode();
+      if (scheduleMode === 'interval' && (totalHours < 1 || totalHours > 336)) {
         this.message.textContent = '간격은 최소 1시간, 최대 14일입니다.';
         return;
       }
@@ -1188,42 +1219,26 @@
       this.message.textContent = this.selections.length + '개 선택 결과를 이 주소의 하나의 기준 목록으로 저장하는 중입니다…';
 
       try {
-        const selectorDraft = {
-          format: 'openstill-selector-draft',
-          schemaVersion: 1,
-          createdAt: new Date().toISOString(),
-          monitor: {
-            url: location.href,
-            pageTitle: document.title,
-            name: this.nameInput.value,
-            labels: this.labelsInput.value.split(','),
-            intervalHours: totalHours,
-            selectors: this.selections.map((selection) => selection.selector)
-          }
-        };
         const response = await chrome.runtime.sendMessage({
           type: 'create-monitors',
-          url: selectorDraft.monitor.url,
-          pageTitle: selectorDraft.monitor.pageTitle,
-          name: selectorDraft.monitor.name,
-          labels: selectorDraft.monitor.labels,
-          intervalHours: selectorDraft.monitor.intervalHours,
-          items: selectorDraft.monitor.selectors.map((selector) => ({
-            selector
+          url: location.href,
+          pageTitle: document.title,
+          name: this.nameInput.value,
+          labels: this.labelsInput.value.split(','),
+          scheduleMode,
+          intervalHours: totalHours,
+          items: this.selections.map((selection) => ({
+            selector: selection.selector
           }))
         });
         if (!response?.ok) {
           throw new Error(response?.error || '저장에 실패했습니다.');
         }
-        const copied = await chrome.runtime.sendMessage({
-          type: 'copy-selector-draft',
-          draft: selectorDraft
-        }).then((copyResponse) => Boolean(copyResponse?.ok)).catch(() => false);
         this.saved = true;
         this.saving = false;
         this.message.style.color = '#77edbd';
         const selectorCount = response.monitor?.selectors?.length ?? this.selections.length;
-        this.message.textContent = `${selectorCount}개 선택자를 이 주소의 하나의 추적에 저장했습니다. 다음 확인에서 기준 목록을 만든 뒤 이후 변경을 알려드릴게요.${copied ? ' 대시보드에 붙여넣을 선택 초안도 클립보드에 복사했습니다.' : ' 선택 초안 클립보드 복사는 브라우저 설정 때문에 건너뛰었습니다.'}`;
+        this.message.textContent = `${selectorCount}개 선택자를 이 주소의 하나의 추적에 저장했습니다.${scheduleMode === 'manual' ? ' 자동 갱신 없이 대시보드의 “지금 확인”으로 기준값과 변경을 확인할 수 있습니다.' : ' 다음 확인에서 기준 목록을 만든 뒤 이후 변경을 알려드릴게요.'}`;
         this.subtitle.textContent = '추적이 시작되었습니다';
         setTimeout(() => this.destroy(), 1_100);
       } catch (error) {
