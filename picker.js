@@ -424,6 +424,33 @@
     if (quick && cached.quick && hasSingleMatch(cached.quick, element)) return cached.quick;
     if (quick && cached.full && hasSingleMatch(cached.full, element)) return cached.full;
 
+    // The saved selector must come from the same token-tree engine as the
+    // reference implementation. It creates a complete valid seed, verifies
+    // every candidate against the DOM, then removes every needless token.
+    // In particular, do not fall through to a full parent > nth-child chain
+    // when a utility-class-heavy list needs partial class attributes.
+    if (!quick) {
+      try {
+        const referenceSelector = globalThis.__openStillReferenceSelector?.getExtendedCSS;
+        const selector = typeof referenceSelector === 'function'
+          ? referenceSelector([element], {
+            timeout: 500,
+            filterCallback: (_tokenType, name, value) => ![
+              'href', 'src', 'srcset', 'hasinclude__', 'include__', 'title', 'aria-label', 'alt'
+            ].includes(name) && !(value?.length > 30)
+          })
+          : '';
+        if (typeof selector === 'string' && selector && hasSingleMatch(selector, element)) {
+          cached.full = selector;
+          selectorCache.set(element, cached);
+          return selector;
+        }
+      } catch (error) {
+        console.warn('OpenStill reference selector generation failed.', error);
+      }
+      return '';
+    }
+
     const config = quick ? SELECTOR_SEARCH.quick : SELECTOR_SEARCH.full;
     const maxFeatures = quick ? 16 : 28;
     const path = [];
@@ -515,7 +542,11 @@
         selector = semanticSelector;
       }
     }
-    if (!selector) selector = strictSelectorFallback(element, { preferSemantic: !quick });
+    // Never save the old direct-child structural fallback. It is technically
+    // unique today but is exactly the form that breaks when a list gains a
+    // card or a wrapper. If the reference engine could not produce a valid
+    // selector, let the picker ask the user to choose again instead.
+    if (!selector && quick) selector = strictSelectorFallback(element, { preferSemantic: true });
     cached[quick ? 'quick' : 'full'] = selector;
     selectorCache.set(element, cached);
     return selector;

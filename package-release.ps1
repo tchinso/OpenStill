@@ -18,6 +18,7 @@ if (-not $stagingFullPath.StartsWith($rootPrefix, [System.StringComparison]::Ord
 $extensionFiles = @(
   'manifest.json',
   'service-worker.js',
+  'selector-engine.js',
   'picker.js',
   'offscreen.html',
   'offscreen.js',

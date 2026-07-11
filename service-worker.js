@@ -22,6 +22,10 @@ const RENDER_LOAD_TIMEOUT_MS = 30_000;
 const RENDER_MINIMUM_WAIT_MS = 2_000;
 const RENDER_QUIET_MS = 650;
 const RENDER_SETTLE_TIMEOUT_MS = 5_000;
+// Match the reference runner's empty-selection behavior: after the initial
+// rendered capture it retries every five seconds through retryCount 5.
+const RENDER_EMPTY_RETRY_COUNT = 4;
+const RENDER_EMPTY_RETRY_DELAY_MS = 5_000;
 
 const DEFAULT_SETTINGS = Object.freeze({ soundEnabled: true });
 const VALID_STATUSES = new Set([
@@ -56,6 +60,13 @@ function cleanSnapshotText(value, maxLength = MAX_SNAPSHOT_CHARS) {
     .map((line) => line.replace(/[\t\f\v ]+/g, ' ').trim())
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function cleanSnapshotHtml(value, maxLength = MAX_SNAPSHOT_CHARS) {
+  return String(value ?? '')
+    .replace(/\u0000/g, '')
     .trim()
     .slice(0, maxLength);
 }
@@ -166,6 +177,10 @@ function snapshotTextFromItems(items) {
   return items.map((item) => item.text).join('\n\n');
 }
 
+function snapshotHtmlFromItems(items) {
+  return items.map((item) => item.html).filter(Boolean).join('\n');
+}
+
 function normalizeSnapshot(value) {
   if (!value || typeof value !== 'object' || typeof value.exists !== 'boolean') {
     return null;
@@ -185,6 +200,10 @@ function normalizeSnapshot(value) {
   const items = rawItems.slice(0, MAX_COLLECTION_ITEMS).map((item) => ({
     text: cleanSnapshotText(item?.text, perItemLimit)
   }));
+  const html = cleanSnapshotHtml(
+    typeof value.html === 'string' ? value.html : snapshotHtmlFromItems(rawItems),
+    MAX_SNAPSHOT_CHARS
+  );
   const safeMatchCount = Number.isInteger(matchCount) && matchCount >= 0
     ? matchCount
     : items.length;
@@ -194,17 +213,21 @@ function normalizeSnapshot(value) {
     exists,
     matchCount: exists ? safeMatchCount : 0,
     text: exists ? snapshotTextFromItems(items) : '',
+    html: exists ? html : '',
     items: exists ? items : [],
     capturedAt: asIso(value.capturedAt, null)
   };
 }
 
 function snapshotsEqual(left, right) {
+  // The reference monitor compares its filtered text with whitespace ignored.
+  // Match count and individual-root boundaries are presentation metadata, not
+  // a change by themselves (a wrapper or a re-render must not manufacture an
+  // alert when the monitored text is unchanged).
+  const comparableText = (snapshot) => cleanSnapshotText(snapshot?.text).replace(/\s/g, '');
   return Boolean(left && right)
     && left.exists === right.exists
-    && left.matchCount === right.matchCount
-    && left.items.length === right.items.length
-    && left.items.every((item, index) => item.text === right.items[index]?.text);
+    && comparableText(left) === comparableText(right);
 }
 
 function normalizeMonitor(value) {
@@ -484,7 +507,226 @@ function waitForRenderedTab(tabId) {
   return { promise, cancel };
 }
 
-async function inspectRenderedDocumentCollection(selectors, minimumWaitMilliseconds, quietMilliseconds, settleTimeoutMilliseconds) {
+// Reference-compatible CSS monitor capture. All scheduled captures use this
+// clone/filter/text pipeline rather than the old root-innerText collector.
+async function captureReferenceRenderedDocumentCollection(
+  selectors,
+  minimumWaitMilliseconds,
+  quietMilliseconds,
+  settleTimeoutMilliseconds,
+  emptyRetryCount = 4,
+  emptyRetryDelayMilliseconds = 5_000
+) {
+  const selectorList = Array.isArray(selectors)
+    ? selectors.filter((selector) => typeof selector === 'string' && selector.trim())
+    : [];
+  const root = document.documentElement;
+  if (root) {
+    await new Promise((resolve) => {
+      const startedAt = performance.now();
+      let lastMutationAt = startedAt;
+      const observer = new MutationObserver(() => {
+        lastMutationAt = performance.now();
+      });
+      observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true });
+      const tick = () => {
+        const now = performance.now();
+        const elapsed = now - startedAt;
+        if ((elapsed >= minimumWaitMilliseconds && now - lastMutationAt >= quietMilliseconds) || elapsed >= settleTimeoutMilliseconds) {
+          observer.disconnect();
+          resolve();
+          return;
+        }
+        setTimeout(tick, Math.min(100, quietMilliseconds));
+      };
+      setTimeout(tick, Math.min(100, quietMilliseconds));
+    });
+  }
+
+  const blockElements = new Set([
+    'ARTICLE', 'BLOCKQUOTE', 'CAPTION', 'CODE', 'DD', 'DIV', 'FIELDSET', 'FOOTER', 'FORM',
+    'HEADER', 'LI', 'OL', 'SECTION', 'SUMMARY', 'TABLE', 'TBODY', 'TFOOT', 'THEAD', 'TR',
+    'UL', 'IMG', 'BR'
+  ]);
+  const spacedElements = new Set(['A', 'ABBR', 'ACRONYM', 'ADDRESS', 'BUTTON', 'TD']);
+  const excludedElements = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'FRAME', 'IFRAME']);
+  const markerInclude = 'data-openstill-reference-include';
+  const markerAncestor = 'data-openstill-reference-ancestor';
+
+  const compareDocumentOrder = (left, right) => {
+    if (left === right) return 0;
+    const position = left.compareDocumentPosition(right);
+    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  };
+
+  const rootsFor = (elements) => [...elements].filter((element) => {
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      if (elements.has(parent)) return false;
+    }
+    return true;
+  }).sort(compareDocumentOrder);
+
+  // This mirrors the reference extractor rather than using innerText:
+  // preserve block boundaries, retain CSS-hidden text, and ignore only the
+  // same non-content elements filtered by the monitor.
+  const textForElement = (element) => {
+    const buffer = [];
+    const visit = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        buffer.push(node.nodeValue || '');
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE || excludedElements.has(node.tagName)) return;
+      let isBlock = blockElements.has(node.tagName);
+      try {
+        isBlock = isBlock || getComputedStyle(node).display === 'block';
+      } catch {
+        // The semantic block list covers detached or transient elements.
+      }
+      if (isBlock) buffer.push('\n');
+      else if (spacedElements.has(node.tagName)) buffer.push(' ');
+      for (const child of node.childNodes) visit(child);
+    };
+    visit(element);
+    return buffer.join('')
+      .trim()
+      .replace(/\s*\n+(\s*\n+)*/g, '\n')
+      .replace(/[ \t]+/g, ' ');
+  };
+
+  const pathFromDocumentRoot = (element) => {
+    const path = [];
+    let current = element;
+    while (current && current !== document.documentElement) {
+      const parent = current.parentNode;
+      if (!parent) return null;
+      path.unshift(Array.prototype.indexOf.call(parent.childNodes, current));
+      current = parent;
+    }
+    return current === document.documentElement ? path : null;
+  };
+
+  const nodeAtPath = (cloneRoot, path) => {
+    let current = cloneRoot;
+    for (const index of path ?? []) {
+      current = current?.childNodes[index];
+      if (!current) return null;
+    }
+    return current;
+  };
+
+  const cleanClone = (cloneRoot) => {
+    const walker = cloneRoot.ownerDocument.createTreeWalker(cloneRoot, NodeFilter.SHOW_COMMENT);
+    const comments = [];
+    while (walker.nextNode()) comments.push(walker.currentNode);
+    comments.forEach((comment) => comment.remove());
+    cloneRoot.querySelectorAll('script, style, noscript, frame, iframe, link[as="script"], link[rel="stylesheet"]').forEach((node) => node.remove());
+    cloneRoot.querySelectorAll('*').forEach((node) => {
+      for (const attribute of [...node.attributes]) {
+        if (/^on/i.test(attribute.name) || attribute.name === 'style' || attribute.name === 'integrity') {
+          node.removeAttribute(attribute.name);
+        }
+      }
+    });
+    const absoluteUrl = (value) => {
+      try {
+        return new URL(value, document.baseURI).href;
+      } catch {
+        return value;
+      }
+    };
+    cloneRoot.querySelectorAll('a[href]').forEach((node) => node.setAttribute('href', absoluteUrl(node.getAttribute('href'))));
+    cloneRoot.querySelectorAll('audio[src], img[src], video[src]').forEach((node) => node.setAttribute('src', absoluteUrl(node.getAttribute('src'))));
+  };
+
+  // Build the same filtered HTML shape as the reference: retain selected
+  // subtrees and the minimum ancestor path, discard all unrelated page churn.
+  const filteredHtmlForRoots = (roots) => {
+    if (!roots.length || !document.documentElement) return '';
+    const clonedDocument = document.implementation.createHTMLDocument('');
+    const cloneRoot = document.documentElement.cloneNode(true);
+    clonedDocument.replaceChild(cloneRoot, clonedDocument.documentElement);
+    for (const rootElement of roots) {
+      const clone = nodeAtPath(cloneRoot, pathFromDocumentRoot(rootElement));
+      if (!clone || clone.nodeType !== Node.ELEMENT_NODE) continue;
+      clone.setAttribute(markerInclude, '1');
+      for (let parent = clone.parentElement; parent; parent = parent.parentElement) {
+        parent.setAttribute(markerAncestor, '1');
+      }
+    }
+    const prune = (node, insideIncluded = false) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (!insideIncluded) node.remove();
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        node.remove();
+        return;
+      }
+      if (excludedElements.has(node.tagName)) {
+        node.remove();
+        return;
+      }
+      const included = insideIncluded || node.hasAttribute(markerInclude);
+      if (!included && !node.hasAttribute(markerAncestor)) {
+        node.remove();
+        return;
+      }
+      for (const child of [...node.childNodes]) prune(child, included);
+    };
+    prune(cloneRoot);
+    cleanClone(cloneRoot);
+    cloneRoot.removeAttribute(markerInclude);
+    cloneRoot.removeAttribute(markerAncestor);
+    cloneRoot.querySelectorAll(`[${markerInclude}], [${markerAncestor}]`).forEach((node) => {
+      node.removeAttribute(markerInclude);
+      node.removeAttribute(markerAncestor);
+    });
+    return cloneRoot.outerHTML;
+  };
+
+  const capture = () => {
+    const selected = new Set();
+    const selectorMatches = [];
+    for (const selector of selectorList) {
+      const matches = [...document.querySelectorAll(selector)];
+      selectorMatches.push({ selector, matchCount: matches.length });
+      matches.forEach((element) => selected.add(element));
+    }
+    const roots = rootsFor(selected);
+    const items = roots.map((element) => ({ text: textForElement(element) }));
+    const filteredHtml = filteredHtmlForRoots(roots);
+    const text = items.map((item) => item.text).filter(Boolean).join('\n\n');
+    return { roots, items, text, html: filteredHtml, selectorMatches };
+  };
+
+  try {
+    if (!selectorList.length) {
+      return { ok: true, exists: false, matchCount: 0, items: [], selectorMatches: [] };
+    }
+    let result = capture();
+    // Reference runner begins at retryCount 0 and retries while it is <= 4,
+    // giving six total attempts and five 5-second waits for an empty selection.
+    for (let retryCount = 0; !result.text && retryCount <= emptyRetryCount; retryCount += 1) {
+      await new Promise((resolve) => setTimeout(resolve, emptyRetryDelayMilliseconds));
+      result = capture();
+    }
+    return {
+      ok: true,
+      exists: Boolean(result.text),
+      matchCount: result.roots.length,
+      items: result.items,
+      html: result.html,
+      selectorMatches: result.selectorMatches
+    };
+  } catch (error) {
+    return { ok: false, error: 'CSS selector could not be evaluated: ' + error.message };
+  }
+}
+
+async function inspectLegacyRenderedDocumentCollection(selectors, minimumWaitMilliseconds, quietMilliseconds, settleTimeoutMilliseconds) {
   const selectorList = Array.isArray(selectors) ? selectors : [];
   const root = document.documentElement;
   if (root) {
@@ -554,8 +796,15 @@ async function captureRenderedSnapshot(monitor) {
     await ready.promise;
     const execution = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: inspectRenderedDocumentCollection,
-      args: [monitor.selectors, RENDER_MINIMUM_WAIT_MS, RENDER_QUIET_MS, RENDER_SETTLE_TIMEOUT_MS]
+      func: captureReferenceRenderedDocumentCollection,
+      args: [
+        monitor.selectors,
+        RENDER_MINIMUM_WAIT_MS,
+        RENDER_QUIET_MS,
+        RENDER_SETTLE_TIMEOUT_MS,
+        RENDER_EMPTY_RETRY_COUNT,
+        RENDER_EMPTY_RETRY_DELAY_MS
+      ]
     });
     const result = execution[0]?.result;
     if (!result?.ok) {
@@ -567,6 +816,7 @@ async function captureRenderedSnapshot(monitor) {
       matchCount: Number.isInteger(result.matchCount) ? result.matchCount : 0,
       items: result.items,
       text: Array.isArray(result.items) ? result.items.map((item) => item.text).join('\n\n') : '',
+      html: result.html,
       capturedAt: nowIso()
     });
     if (!snapshot) {
@@ -671,7 +921,12 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
 
   const previous = monitor.snapshot;
   const changed = Boolean(previous) && !snapshotsEqual(previous, nextSnapshot);
-  monitor.snapshot = nextSnapshot;
+  // The reference runner only persists a baseline on the first successful
+  // capture or a real filtered-text change. An equal re-render must not churn
+  // the saved HTML/text history merely because its capture timestamp changed.
+  if (!previous || changed) {
+    monitor.snapshot = nextSnapshot;
+  }
   monitor.lastError = null;
   monitor.lastReviewAt = null;
 
@@ -1292,7 +1547,10 @@ async function startPicker(tabId, url) {
     await rememberPendingPicker(tabId, normalizedUrl);
   }
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['picker.js'] });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['selector-engine.js', 'picker.js']
+    });
   } catch (error) {
     await forgetPendingPicker(tabId);
     throw error;
