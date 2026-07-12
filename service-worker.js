@@ -109,6 +109,27 @@ function snapshotFingerprint(value) {
   return `${text.length.toString(36)}:${first.toString(36)}:${second.toString(36)}`;
 }
 
+// The reference comparison does not use literal-string equality when the
+// user elects to keep whitespace significant. It separates words and runs of
+// whitespace, which preserves punctuation and word boundaries while avoiding
+// noisy line-wrap differences from independently rendered pages.
+function comparisonTokens(value) {
+  return String(value ?? '').split(/\s+|\b/g);
+}
+
+function comparisonTokenFingerprint(value) {
+  // NUL cannot survive cleanSnapshotHtml and makes an unambiguous separator
+  // for the otherwise variable-width tokens.
+  return snapshotFingerprint(comparisonTokens(value).join('\u0000'));
+}
+
+function comparisonTokensEqual(left, right) {
+  const leftTokens = comparisonTokens(left);
+  const rightTokens = comparisonTokens(right);
+  return leftTokens.length === rightTokens.length
+    && leftTokens.every((token, index) => token === rightTokens[index]);
+}
+
 function cleanShortText(value, maxLength = 180) {
   return cleanText(value, maxLength);
 }
@@ -307,7 +328,8 @@ function cleanLocatorField(value) {
 }
 
 function cleanLocatorFields(value) {
-  const source = Array.isArray(value) ? value : value === undefined || value === null ? [] : [value];
+  const explicitlyConfigured = value !== undefined && value !== null;
+  const source = Array.isArray(value) ? value : explicitlyConfigured ? [value] : [];
   const fields = [];
   const seen = new Set();
   for (const item of source.slice(0, 12)) {
@@ -319,7 +341,10 @@ function cleanLocatorFields(value) {
       fields.push(field);
     }
   }
-  return fields.length ? fields : [{ type: 'text' }];
+  // Omitted fields mean the familiar text monitor. An explicit empty list is
+  // different: it keeps filtered HTML/data while deliberately contributing no
+  // text, which is useful for a data-mode structural monitor.
+  return fields.length || explicitlyConfigured ? fields : [{ type: 'text' }];
 }
 
 function cleanFramePath(value) {
@@ -597,20 +622,31 @@ function normalizeSnapshot(value) {
   const safeMatchCount = Number.isInteger(matchCount) && matchCount >= 0
     ? matchCount
     : items.length;
-  const exists = Boolean(value.exists) && safeMatchCount > 0;
+  // `exists` records whether the extractor found a meaningful selected root;
+  // it is deliberately independent from whether there is textual content.
+  // An allow-empty monitor must retain its filtered HTML/data even at zero
+  // matches so a later structural reappearance can be compared faithfully.
+  const exists = Boolean(value.exists);
+  const retainPayload = exists
+    || rawItems.length > 0
+    || Boolean(fullText)
+    || Boolean(fullHtml)
+    || Boolean(fullData);
 
   return {
     exists,
-    matchCount: exists ? safeMatchCount : 0,
-    text: exists ? snapshotTextFromItems(items) : '',
-    html: exists ? html : '',
-    data: exists ? data : '',
+    matchCount: safeMatchCount,
+    text: retainPayload ? snapshotTextFromItems(items) : '',
+    html: retainPayload ? html : '',
+    data: retainPayload ? data : '',
     evidenceHtml,
-    items: exists ? items : [],
+    items: retainPayload ? items : [],
     textFingerprint: snapshotFingerprint(fullText),
     compactTextFingerprint: snapshotFingerprint(fullText.replace(/\s/g, '')),
+    tokenTextFingerprint: comparisonTokenFingerprint(fullText),
     dataFingerprint: snapshotFingerprint(fullData),
     compactDataFingerprint: snapshotFingerprint(fullData.replace(/\s/g, '')),
+    tokenDataFingerprint: comparisonTokenFingerprint(fullData),
     textTruncated: fullText.length > MAX_SNAPSHOT_CHARS || rawItems.length > MAX_COLLECTION_ITEMS,
     dataTruncated: fullData.length > MAX_SNAPSHOT_CHARS,
     capturedAt: asIso(value.capturedAt, null)
@@ -623,21 +659,21 @@ function snapshotsEqual(left, right, tracking = null) {
   // `text` preserves the familiar whitespace-insensitive monitor behaviour,
   // while `data` compares the filtered HTML so a changed href/src is visible.
   const options = normalizeTracking(tracking);
-  const normalizeComparable = (value) => options.ignoreWhitespace
-    ? String(value ?? '').replace(/\s/g, '')
-    : String(value ?? '');
   const field = options.dataAttr === 'data' ? 'data' : 'text';
   const fingerprintField = field === 'data'
-    ? options.ignoreWhitespace ? 'compactDataFingerprint' : 'dataFingerprint'
-    : options.ignoreWhitespace ? 'compactTextFingerprint' : 'textFingerprint';
+    ? options.ignoreWhitespace ? 'compactDataFingerprint' : 'tokenDataFingerprint'
+    : options.ignoreWhitespace ? 'compactTextFingerprint' : 'tokenTextFingerprint';
   const truncatedField = field === 'data' ? 'dataTruncated' : 'textTruncated';
   const fingerprintComparable = left?.[fingerprintField] && right?.[fingerprintField]
     && (left?.[truncatedField] || right?.[truncatedField])
     ? left[fingerprintField] === right[fingerprintField]
     : null;
+  const comparable = options.ignoreWhitespace
+    ? String(left?.[field] ?? '').replace(/\s/g, '') === String(right?.[field] ?? '').replace(/\s/g, '')
+    : comparisonTokensEqual(left?.[field], right?.[field]);
   return Boolean(left && right)
     && left.exists === right.exists
-    && (fingerprintComparable ?? (normalizeComparable(left[field]) === normalizeComparable(right[field])));
+    && (fingerprintComparable ?? comparable);
 }
 
 function normalizeMonitor(value) {
@@ -1010,10 +1046,12 @@ async function captureReferenceRenderedDocumentCollection(...args) {
   const isIgnoredElement = (node) => {
     if (node?.nodeType !== Node.ELEMENT_NODE) return true;
     if (['NOSCRIPT', 'FRAME', 'IFRAME'].includes(node.tagName)) return true;
-    // The reference behavior includes only inline script bodies.  External
-    // scripts are never copied into a stored snapshot, even when code capture
-    // is requested, because their fetched response is not page content.
-    if (node.tagName === 'SCRIPT') return !(includeInlineScripts && !node.hasAttribute('src'));
+    // When code capture is disabled, scripts and script-preload links are
+    // excluded. When it is enabled, inline scripts are added automatically,
+    // while an external script remains visible if it belongs to a broader
+    // user-selected subtree (the page's own markup is still meaningful data).
+    if (node.tagName === 'SCRIPT') return !includeInlineScripts;
+    if (node.tagName === 'LINK' && String(node.getAttribute('as') || '').toLowerCase() === 'script') return !includeInlineScripts;
     if (node.tagName === 'STYLE') return !includeStyles;
     if (node.tagName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(node.getAttribute('rel') || '')) return !includeStyles;
     return false;
@@ -1055,6 +1093,7 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const expr = String(raw.expr ?? raw.selector ?? raw.value ?? '').trim();
     const op = String(raw.op ?? raw.operation ?? 'include').trim().toLowerCase();
     if (!['css', 'xcss', 'xpath'].includes(type) || !expr || !['include', 'exclude'].includes(op)) return null;
+    const hasExplicitFields = Object.hasOwn(raw, 'fields') && raw.fields != null;
     const values = Array.isArray(raw.fields) ? raw.fields : raw.fields == null ? [] : [raw.fields];
     const fields = [];
     const seen = new Set();
@@ -1066,11 +1105,18 @@ async function captureReferenceRenderedDocumentCollection(...args) {
         fields.push(field);
       }
     }
-    return { type, expr, op, fields: fields.length ? fields : [{ type: 'text' }], legacy: typeof value === 'string' };
+    return {
+      type,
+      expr,
+      op,
+      fields: fields.length || hasExplicitFields ? fields : [{ type: 'text' }],
+      legacy: typeof value === 'string'
+    };
   };
 
   const locators = (Array.isArray(rawLocators) ? rawLocators : []).map(locatorOf).filter(Boolean);
   const includeLocators = locators.filter((locator) => locator.op === 'include');
+  const usesExtendedCss = locators.some((locator) => locator.type === 'xcss');
   const unique = (items) => [...new Set(items)];
   const shadowFor = (element) => {
     if (element?.nodeType !== Node.ELEMENT_NODE) return null;
@@ -1098,10 +1144,28 @@ async function captureReferenceRenderedDocumentCollection(...args) {
 
   const splitSteps = (source) => {
     const parts = [];
-    let value = '', quote = '', escaped = false, square = 0, round = 0;
+    let value = '', quote = '', escaped = false, escapedHexDigits = 0, square = 0, round = 0;
     const flush = () => { if (value.trim()) parts.push(value.trim()); value = ''; };
     for (const character of String(source || '').trim()) {
-      if (escaped) { value += character; escaped = false; continue; }
+      if (escaped) {
+        value += character;
+        escaped = false;
+        escapedHexDigits = /[0-9a-f]/i.test(character) ? 1 : 0;
+        continue;
+      }
+      if (escapedHexDigits) {
+        if (/[0-9a-f]/i.test(character) && escapedHexDigits < 6) {
+          value += character;
+          escapedHexDigits += 1;
+          continue;
+        }
+        if (/\s/.test(character)) {
+          value += character;
+          escapedHexDigits = 0;
+          continue;
+        }
+        escapedHexDigits = 0;
+      }
       if (character === '\\') { value += character; escaped = true; continue; }
       if (quote) { value += character; if (character === quote) quote = ''; continue; }
       if (character === "'" || character === '"') { value += character; quote = character; continue; }
@@ -1158,7 +1222,13 @@ async function captureReferenceRenderedDocumentCollection(...args) {
   const select = (locator) => {
     if (locator.type === 'css') return [...document.querySelectorAll(locator.expr)].map((element) => ({ element }));
     if (locator.type === 'xcss') return queryXcss(locator.expr).map((element) => ({ element }));
-    const iterator = document.evaluate(locator.expr, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+    const iterator = document.evaluate(
+      locator.expr,
+      document,
+      (prefix) => prefix === 'xhtml' ? 'http://www.w3.org/1999/xhtml' : null,
+      XPathResult.ORDERED_NODE_ITERATOR_TYPE,
+      null
+    );
     const matches = [];
     for (let node = iterator.iterateNext(); node; node = iterator.iterateNext()) {
       if (node.nodeType === Node.ATTRIBUTE_NODE && node.ownerElement) {
@@ -1214,10 +1284,21 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       if (!node || visitedNodes.has(node)) return;
       visitedNodes.add(node);
       if (node.nodeType === Node.TEXT_NODE) { if (enabled && textEnabled) out.push(node.nodeValue || ''); return; }
-      if (node.nodeType !== Node.ELEMENT_NODE || isIgnoredElement(node)) return;
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (['NOSCRIPT', 'FRAME', 'IFRAME'].includes(node.tagName)) return;
+      // Script and style selection controls structural/data capture. Their
+      // source is not text-monitor content unless the user explicitly chose a
+      // text field on that node; otherwise enabling the option would create a
+      // surprising text-only change for a stylesheet or inline script.
+      if (['SCRIPT', 'STYLE'].includes(node.tagName) && !fields.has(node)) return;
+      if (isIgnoredElement(node) && !included.has(node)) return;
       let active = enabled;
-      if (excluded.has(node)) active = false;
-      else if (included.has(node)) active = true;
+      // Includes are applied before exclusions in the selection model, and a
+      // direct include deliberately reopens an excluded branch. This also
+      // defines the deterministic outcome when two locators match the same
+      // node: include wins instead of silently erasing the tracked root.
+      if (included.has(node)) active = true;
+      else if (excluded.has(node)) active = false;
       else if (automaticallyIncluded.has(node)) active = true;
       let descendantsUseText = textEnabled;
       const inheritedSelectedText = [...included].some((ancestor) => (
@@ -1233,7 +1314,7 @@ async function captureReferenceRenderedDocumentCollection(...args) {
         try { block ||= getComputedStyle(node).display === 'block'; } catch { /* keep semantic block */ }
         out.push(block ? '\n' : spacedTags.has(node.tagName) ? ' ' : '');
       }
-      const shadow = shadowFor(node);
+      const shadow = usesExtendedCss ? shadowFor(node) : null;
       if (node.localName === 'slot') {
         const assigned = node.assignedNodes?.({ flatten: true }) || [];
         (assigned.length ? assigned : [...node.childNodes]).forEach((child) => visit(child, active, descendantsUseText));
@@ -1270,6 +1351,18 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const rootCopy = copy(document.documentElement);
     if (!rootCopy) return '';
     targetDocument.replaceChild(rootCopy, targetDocument.documentElement);
+    // Reference captures always expose an absolute base. Create one when the
+    // page did not provide it, then mark it as retained before the pruning
+    // pass; otherwise a fragment-only capture would lose the only URL context.
+    let base = rootCopy.querySelector('base');
+    if (!base) {
+      base = targetDocument.createElement('base');
+      const head = rootCopy.querySelector('head');
+      if (head) head.prepend(base);
+      else rootCopy.prepend(base);
+      base.setAttribute(automaticIncludeMark, '1');
+    }
+    try { base.setAttribute('href', document.baseURI); } catch { /* preserve a malformed source value */ }
     included.forEach((node) => clones.get(node)?.setAttribute(includeMark, '1'));
     excluded.forEach((node) => clones.get(node)?.setAttribute(excludeMark, '1'));
     automaticallyIncluded.forEach((node) => clones.get(node)?.setAttribute(automaticIncludeMark, '1'));
@@ -1283,10 +1376,13 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       if (node.nodeType === Node.TEXT_NODE) { if (!active) node.remove(); return active; }
       if (node.nodeType === Node.COMMENT_NODE) { if (!keepComments || !active) node.remove(); return keepComments && active; }
       if (node.nodeType !== Node.ELEMENT_NODE) { node.remove(); return false; }
-      if (isIgnoredElement(node)) { node.remove(); return false; }
+      // A user-selected node wins over an automatic script/style exclusion,
+      // matching the include-over-exclude contract of the filtered DOM. The
+      // dashboard later renders this preserved markup inertly.
+      if (isIgnoredElement(node) && !node.hasAttribute(includeMark)) { node.remove(); return false; }
       let enabled = active;
-      if (node.hasAttribute(excludeMark)) enabled = false;
-      else if (node.hasAttribute(includeMark)) enabled = true;
+      if (node.hasAttribute(includeMark)) enabled = true;
+      else if (node.hasAttribute(excludeMark)) enabled = false;
       else if (node.hasAttribute(automaticIncludeMark)) enabled = true;
       const retained = children(node).map((child) => prune(child, enabled)).some(Boolean);
       if (!enabled && !retained) { node.remove(); return false; }
@@ -1298,18 +1394,12 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       for (const attribute of [...node.attributes]) {
         const internalMarker = [includeMark, excludeMark, automaticIncludeMark].includes(attribute.name);
-        if (/^on/i.test(attribute.name) || attribute.name === 'integrity' || internalMarker || (attribute.name === 'style' && !includeStyles)) {
+        if ((/^on/i.test(attribute.name) && !includeInlineScripts) || internalMarker || (attribute.name === 'style' && !includeStyles)) {
           node.removeAttribute(attribute.name);
         }
       }
       if (node.matches('a[href]')) node.setAttribute('href', absolute(node.getAttribute('href')));
-      if (node.matches('img[src],audio[src],video[src],source[src],track[src]')) node.setAttribute('src', absolute(node.getAttribute('src')));
-      if (node.hasAttribute('srcset')) {
-        node.setAttribute('srcset', node.getAttribute('srcset').split(',').map((candidate) => {
-          const pieces = candidate.trim().split(/\s+/);
-          return [absolute(pieces.shift() || ''), ...pieces].join(' ');
-        }).join(', '));
-      }
+      if (node.matches('img[src],audio[src],video[src]')) node.setAttribute('src', absolute(node.getAttribute('src')));
       children(node).forEach(sanitize);
     };
     sanitize(rootCopy);
@@ -1356,16 +1446,10 @@ async function captureReferenceRenderedDocumentCollection(...args) {
         }
         (locator.op === 'include' ? included : excluded).add(element);
         if (locator.op === 'include') {
-          const current = fields.get(element) || [];
-          const seen = new Set(current.map((field) => field.type + ':' + (field.name || '')));
-          for (const field of locator.fields) {
-            const key = field.type + ':' + (field.name || '');
-            if (!seen.has(key)) {
-              seen.add(key);
-              current.push(field);
-            }
-          }
-          fields.set(element, current);
+          // Locator processing is ordered. A later rule for the same element
+          // intentionally replaces its extraction-field mode instead of
+          // merging unrelated text/attribute values into one result.
+          fields.set(element, locator.fields.map((field) => ({ ...field })));
         }
       });
     }
@@ -1379,6 +1463,9 @@ async function captureReferenceRenderedDocumentCollection(...args) {
         }
       });
     }
+    // A captured fragment still needs its document base to keep relative
+    // resources and links meaningful when it is rendered later.
+    document.querySelectorAll('base').forEach((element) => automaticallyIncluded.add(element));
     const rootCandidates = [...included, ...automaticallyIncluded];
     const roots = rootCandidates
       .filter((element) => !rootCandidates.some((candidate) => candidate !== element && containsAcrossShadow(candidate, element)))

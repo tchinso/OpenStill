@@ -144,7 +144,9 @@
     while (current && SKIPPED_SIBLING_TAGS.has(current.tagName)) {
       current = current.previousElementSibling;
     }
-    return current;
+    return current
+      ? { element: current, immediate: current === element.previousElementSibling }
+      : null;
   }
 
   function callbackAllows(options, type, name, value, depth, offset) {
@@ -258,6 +260,7 @@
       this.options = options;
       this.steps = [];
       this.evidence = [];
+      this.siblingAdjacency = new Map();
 
       let current = target;
       while (isElement(current)) {
@@ -387,9 +390,13 @@
         if (this.options.siblingNodes) {
           const first = previousMeaningfulSibling(step.element);
           if (first) {
-            this._extractNode(first, step, -1);
-            const second = previousMeaningfulSibling(first);
-            if (second) this._extractNode(second, step, -2);
+            this._extractNode(first.element, step, -1);
+            this.siblingAdjacency.set(`${step.localLevel}:-1`, first.immediate);
+            const second = previousMeaningfulSibling(first.element);
+            if (second) {
+              this._extractNode(second.element, step, -2);
+              this.siblingAdjacency.set(`${step.localLevel}:-2`, second.immediate);
+            }
           }
         }
       }
@@ -400,6 +407,12 @@
           this._add('immediate', '', '', '', step, 0, { node: step.element });
         }
       }
+    }
+
+    isImmediateSiblingStep(localLevel, precedingOffset, followingOffset) {
+      if (followingOffset !== precedingOffset + 1) return false;
+      return this.options.immediate !== false
+        && this.siblingAdjacency.get(`${localLevel}:${precedingOffset}`) === true;
     }
   }
 
@@ -425,14 +438,6 @@
       }
       if (item.bridge) {
         return this.hasStemAt(item.localLevel) && this.hasStemAt(item.localLevel + 1);
-      }
-      if (item.offset < 0) {
-        return !this.evidence.some((current) => (
-          !current.bridge
-          && current.localLevel === item.localLevel
-          && current.offset < 0
-          && current.offset !== item.offset
-        ));
       }
       return true;
     }
@@ -471,18 +476,19 @@
       let priorLevel = null;
       for (const localLevel of levels) {
         const items = rows.get(localLevel);
-        const stem = this._compound(items.filter((item) => item.offset === 0)) || '*';
-        const siblingOffsets = [...new Set(items.filter((item) => item.offset < 0).map((item) => item.offset))]
-          // The nearest predecessor gives CSS a stricter relationship than a
-          // general-sibling hop. Keep the second predecessor as a fallback
-          // when it is the only available contextual evidence.
-          .sort((left, right) => right - left);
-        let row = stem;
-        if (siblingOffsets.length) {
-          const offset = siblingOffsets[0];
-          const sibling = this._compound(items.filter((item) => item.offset === offset));
-          if (sibling) row = sibling + (offset === -1 ? ' + ' : ' ~ ') + stem;
+        const laneOffsets = [...new Set(items.map((item) => item.offset))].sort((left, right) => left - right);
+        let row = '';
+        let priorOffset = null;
+        for (const offset of laneOffsets) {
+          const lane = this._compound(items.filter((item) => item.offset === offset));
+          if (!lane) continue;
+          if (row) {
+            row += this.route.isImmediateSiblingStep(localLevel, priorOffset, offset) ? ' + ' : ' ~ ';
+          }
+          row += lane;
+          priorOffset = offset;
         }
+        if (!row) row = '*';
 
         if (parts.length) {
           const bridge = this.evidence.some((item) => item.bridge && item.localLevel === localLevel);
@@ -965,17 +971,23 @@
     }).join(' , ');
   }
 
+  // SelectorX is an asynchronous contract even when no plugin needs to await.
+  // Keeping that boundary stable prevents callers from racing a future token
+  // sorter or a yielding DOM implementation. The synchronous variants remain
+  // available for the pointer-hover picker path, where a Promise cannot be
+  // rendered directly into an input or a tooltip.
   function getCSS(elements, rawOptions) {
     if (typeof rawOptions?.tokenSorter === 'function') {
       return getCSSAsync(elements, rawOptions).then((selector) => scopeCssForConfiguredRoot(selector, rawOptions));
     }
-    return scopeCssForConfiguredRoot(getCSSSync(elements, rawOptions), rawOptions);
+    return Promise.resolve(scopeCssForConfiguredRoot(getCSSSync(elements, rawOptions), rawOptions));
   }
 
   function getExtendedCSS(elements, rawOptions) {
-    return typeof rawOptions?.tokenSorter === 'function'
-      ? getExtendedCSSAsync(elements, rawOptions)
-      : getExtendedCSSSync(elements, rawOptions);
+    if (typeof rawOptions?.tokenSorter === 'function') {
+      return getExtendedCSSAsync(elements, rawOptions);
+    }
+    return Promise.resolve(getExtendedCSSSync(elements, rawOptions));
   }
 
   // Extended CSS is a small, explicit traversal language used by the picker
@@ -1046,6 +1058,7 @@
     let buffer = '';
     let quote = '';
     let escaped = false;
+    let escapedHexDigits = 0;
     let brackets = 0;
     let parentheses = 0;
     const flush = () => {
@@ -1057,7 +1070,23 @@
       if (escaped) {
         buffer += character;
         escaped = false;
+        escapedHexDigits = /[0-9a-f]/i.test(character) ? 1 : 0;
         continue;
+      }
+      if (escapedHexDigits) {
+        if (/[0-9a-f]/i.test(character) && escapedHexDigits < 6) {
+          buffer += character;
+          escapedHexDigits += 1;
+          continue;
+        }
+        // A single whitespace terminates a CSS hexadecimal escape and is part
+        // of the selector token, not an XCSS shadow-piercing step boundary.
+        if (/\s/.test(character)) {
+          buffer += character;
+          escapedHexDigits = 0;
+          continue;
+        }
+        escapedHexDigits = 0;
       }
       if (character === '\\') {
         buffer += character;
@@ -1182,7 +1211,13 @@
     const iteratorType = globalThis.XPathResult?.ORDERED_NODE_ITERATOR_TYPE ?? 5;
     let result;
     try {
-      result = documentNode.evaluate(String(value || ''), scope, null, iteratorType, null);
+      result = documentNode.evaluate(
+        String(value || ''),
+        scope,
+        (prefix) => prefix === 'xhtml' ? 'http://www.w3.org/1999/xhtml' : null,
+        iteratorType,
+        null
+      );
     } catch (error) {
       throw new Error('Invalid XPath selector: ' + error.message);
     }
@@ -1264,7 +1299,7 @@
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
 
-  function getXPATH(elements, rawOptions) {
+  function getXPATHSync(elements, rawOptions) {
     const selected = documentOrder(asElements(elements));
     if (!selected.length) return '';
     const options = normalizeOptions(rawOptions);
@@ -1282,6 +1317,10 @@
     return selector.split(/\s+\|\s+/).map((path) => (
       path.startsWith('.') ? path : '.' + path
     )).join(' | ');
+  }
+
+  function getXPATH(elements, rawOptions) {
+    return Promise.resolve(getXPATHSync(elements, rawOptions));
   }
 
   class SelectorExpression {
@@ -1353,7 +1392,7 @@
 
     select(root = globalThis.document) {
       try {
-        return Promise.resolve(evaluateXPath(this.value, root).filter(isElement));
+        return Promise.resolve(evaluateXPath(this.value, root));
       } catch (error) {
         return Promise.reject(error);
       }
@@ -1559,8 +1598,11 @@
 
   globalThis.__openStillSelectorX = Object.freeze({
     getCSS,
+    getCSSSync,
     getExtendedCSS,
+    getExtendedCSSSync,
     getXPATH,
+    getXPATHSync,
     getXpath: getXPATH,
     getXCSS: getExtendedCSS,
     querySelectorAll: queryExtendedCSS,

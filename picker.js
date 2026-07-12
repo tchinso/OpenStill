@@ -84,12 +84,62 @@
     return 0;
   }
 
-  function queryTrackedElements(selector, root = document) {
-    const runtime = globalThis.__openStillSelectorX?.querySelectorAll;
-    if (typeof runtime === 'function') {
-      return Array.from(runtime(selector, root));
+  function normalizedSelectorType(value) {
+    const type = String(value || 'css').trim().toLowerCase();
+    if (type === 'extended-css' || type === 'extendedcss') return 'xcss';
+    return ['css', 'xcss', 'xpath'].includes(type) ? type : 'css';
+  }
+
+  // CSS and XCSS intentionally have different reach.  A normal CSS locator
+  // must stay in its native tree; only XCSS is allowed to cross a shadow-root
+  // boundary.  Treating every preview as XCSS made a CSS rule look valid in
+  // the picker even though the capture worker would later find nothing.
+  function queryTrackedElements(selector, root = document, selectorType = 'css') {
+    const type = normalizedSelectorType(selectorType);
+    const runtime = globalThis.__openStillSelectorX;
+    if (type === 'xpath') {
+      if (typeof runtime?.evaluateXPath === 'function') {
+        return Array.from(runtime.evaluateXPath(selector, root)).filter((node) => node instanceof Element);
+      }
+      const doc = root?.nodeType === Node.DOCUMENT_NODE ? root : root?.ownerDocument;
+      if (!doc?.evaluate) return [];
+      const result = doc.evaluate(selector, root, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+      const matches = [];
+      for (let node = result.iterateNext(); node; node = result.iterateNext()) {
+        if (node instanceof Element) matches.push(node);
+      }
+      return matches;
+    }
+    if (type === 'xcss') {
+      const runtimeQuery = runtime?.querySelectorAll ?? runtime?.queryExtendedCSS;
+      if (typeof runtimeQuery === 'function') return Array.from(runtimeQuery(selector, root));
     }
     return Array.from(root.querySelectorAll(selector));
+  }
+
+  function shadowRootFor(element) {
+    if (!(element instanceof Element)) return null;
+    try {
+      return element.shadowRoot
+        || globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element)
+        || null;
+    } catch {
+      return element.shadowRoot || null;
+    }
+  }
+
+  function deepestShadowElementAtPoint(element, clientX, clientY) {
+    let current = element;
+    const visitedRoots = new Set();
+    while (current instanceof Element) {
+      const shadow = shadowRootFor(current);
+      if (!shadow || visitedRoots.has(shadow) || typeof shadow.elementFromPoint !== 'function') break;
+      visitedRoots.add(shadow);
+      const nested = shadow.elementFromPoint(clientX, clientY);
+      if (!(nested instanceof Element) || nested === current) break;
+      current = nested;
+    }
+    return current;
   }
 
   function selectorTypeFor(element) {
@@ -138,9 +188,9 @@
       && !/[A-F0-9]{8,}/i.test(className);
   }
 
-  function hasSingleMatch(selector, element) {
+  function hasSingleMatch(selector, element, selectorType = selectorTypeFor(element)) {
     try {
-      const matches = queryTrackedElements(selector);
+      const matches = queryTrackedElements(selector, document, selectorType);
       return matches.length === 1 && matches[0] === element;
     } catch {
       return false;
@@ -303,20 +353,21 @@
       .sort((left, right) => left.cost - right.cost || left.css.length - right.css.length || left.css.localeCompare(right.css));
   }
 
-  function inspectCandidate(selector, target, cache, budget) {
-    if (cache.has(selector)) return cache.get(selector);
+  function inspectCandidate(selector, target, cache, budget, selectorType = selectorTypeFor(target)) {
+    const cacheKey = normalizedSelectorType(selectorType) + '\u0000' + selector;
+    if (cache.has(cacheKey)) return cache.get(cacheKey);
     if (budget.used >= budget.limit || selector.length > 340) {
       return { containsTarget: false, count: 0 };
     }
     budget.used += 1;
     try {
-      const matches = queryTrackedElements(selector);
+      const matches = queryTrackedElements(selector, document, selectorType);
       const result = { containsTarget: matches.includes(target), count: matches.length };
-      cache.set(selector, result);
+      cache.set(cacheKey, result);
       return result;
     } catch {
       const result = { containsTarget: false, count: 0 };
-      cache.set(selector, result);
+      cache.set(cacheKey, result);
       return result;
     }
   }
@@ -359,7 +410,7 @@
     return [...semantic, ...positions.slice(0, 2), ...neutral];
   }
 
-  function semanticDescendantFallback(element) {
+  function semanticDescendantFallback(element, selectorType = selectorTypeFor(element)) {
     const path = [];
     for (let current = element; current && path.length < 12; current = current.parentElement) {
       path.push(current);
@@ -375,7 +426,7 @@
 
     for (const feature of leafFeatures) {
       visited.add(`0\u0000${feature.css}`);
-      const inspection = inspectCandidate(feature.css, element, queryCache, budget);
+      const inspection = inspectCandidate(feature.css, element, queryCache, budget, selectorType);
       if (!inspection.containsTarget) continue;
       const state = {
         css: feature.css,
@@ -407,7 +458,7 @@
             const key = `${pathIndex}\u0000${css}`;
             if (visited.has(key)) continue;
             visited.add(key);
-            const inspection = inspectCandidate(css, element, queryCache, budget);
+            const inspection = inspectCandidate(css, element, queryCache, budget, selectorType);
             if (!inspection.containsTarget) continue;
             const nextState = {
               css,
@@ -437,9 +488,9 @@
     return best?.css || '';
   }
 
-  function strictSelectorFallback(element, { preferSemantic = true } = {}) {
+  function strictSelectorFallback(element, { preferSemantic = true, selectorType = selectorTypeFor(element) } = {}) {
     if (preferSemantic) {
-      const semanticSelector = semanticDescendantFallback(element);
+      const semanticSelector = semanticDescendantFallback(element, selectorType);
       if (semanticSelector) return semanticSelector;
     }
 
@@ -472,10 +523,11 @@
       return '';
     }
 
+    const selectorType = selectorTypeFor(element);
     const cached = selectorCache.get(element) ?? {};
-    if (!quick && cached.full && hasSingleMatch(cached.full, element)) return cached.full;
-    if (quick && cached.quick && hasSingleMatch(cached.quick, element)) return cached.quick;
-    if (quick && cached.full && hasSingleMatch(cached.full, element)) return cached.full;
+    if (!quick && cached.full && hasSingleMatch(cached.full, element, selectorType)) return cached.full;
+    if (quick && cached.quick && hasSingleMatch(cached.quick, element, selectorType)) return cached.quick;
+    if (quick && cached.full && hasSingleMatch(cached.full, element, selectorType)) return cached.full;
 
     // The selector engine evaluates candidates against the DOM and removes
     // constraints that do not contribute to uniqueness. In particular, do not
@@ -483,7 +535,8 @@
     // heavy list needs partial class attributes.
     if (!quick) {
       try {
-        const selectorGenerator = globalThis.__openStillSelectorX?.getExtendedCSS;
+        const selectorGenerator = globalThis.__openStillSelectorX?.getExtendedCSSSync
+          ?? globalThis.__openStillSelectorX?.getExtendedCSS;
         const selector = typeof selectorGenerator === 'function'
           ? selectorGenerator([element], {
             timeout: 500,
@@ -492,7 +545,7 @@
             ].includes(name) && !(value?.length > 30)
           })
           : '';
-        if (typeof selector === 'string' && selector && hasSingleMatch(selector, element)) {
+        if (typeof selector === 'string' && selector && hasSingleMatch(selector, element, selectorType)) {
           cached.full = selector;
           selectorCache.set(element, cached);
           return selector;
@@ -505,8 +558,8 @@
       // mutating page.  Do not discard a demonstrably unique semantic path in
       // that case; unlike the old parent > nth-child fallback, this helper
       // requires at least one stable-looking ID, attribute, or class.
-      const semanticSelector = semanticDescendantFallback(element);
-      if (semanticSelector && hasSingleMatch(semanticSelector, element)) {
+      const semanticSelector = semanticDescendantFallback(element, selectorType);
+      if (semanticSelector && hasSingleMatch(semanticSelector, element, selectorType)) {
         cached.full = semanticSelector;
         selectorCache.set(element, cached);
         return semanticSelector;
@@ -528,7 +581,7 @@
     let frontier = [];
 
     for (const feature of selectorFeatures(element, maxFeatures)) {
-      const inspection = inspectCandidate(feature.css, element, queryCache, budget);
+      const inspection = inspectCandidate(feature.css, element, queryCache, budget, selectorType);
       if (!inspection.containsTarget) continue;
       const state = {
         css: feature.css,
@@ -565,7 +618,7 @@
               const css = feature.css + connector + state.css;
               if (visited.has(css)) continue;
               visited.add(css);
-              const inspection = inspectCandidate(css, element, queryCache, budget);
+          const inspection = inspectCandidate(css, element, queryCache, budget, selectorType);
               if (!inspection.containsTarget) continue;
               const nextState = {
                 css,
@@ -600,7 +653,7 @@
     // valid direct-child chain on utility-class-heavy list pages.  Prefer it
     // only when it meaningfully removes structural constraints.
     if (!quick) {
-      const semanticSelector = semanticDescendantFallback(element);
+      const semanticSelector = semanticDescendantFallback(element, selectorType);
       if (semanticSelector && selectorStructuralPenalty(semanticSelector) + 0.5 < selectorStructuralPenalty(selector)) {
         selector = semanticSelector;
       }
@@ -609,7 +662,7 @@
     // unique today but is exactly the form that breaks when a list gains a
     // card or a wrapper. If the selector engine cannot produce a valid
     // selector, let the picker ask the user to choose again instead.
-    if (!selector && quick) selector = strictSelectorFallback(element, { preferSemantic: true });
+    if (!selector && quick) selector = strictSelectorFallback(element, { preferSemantic: true, selectorType });
     cached[quick ? 'quick' : 'full'] = selector;
     selectorCache.set(element, cached);
     return selector;
@@ -668,6 +721,7 @@
           input[name="name"], input[name="labels"] { font-family: inherit; }
           .selector-row { display: flex; gap: 8px; }
           .selector-row input { flex: 1; }
+          .selector-row select { width: 108px; flex: 0 0 108px; }
           .field-controls { display: grid; grid-template-columns: 1fr 1.35fr; gap: 8px; }
           .field-controls label { color: #aebed2; }
           .field-controls [hidden] { display: none; }
@@ -716,7 +770,7 @@
               <p class="selection-summary" id="selectionSummary">선택한 요소 0개</p>
               <div class="selection-list" id="selectionList"></div>
               <label>CSS 선택자
-                <div class="selector-row"><input id="selector" autocomplete="off" spellcheck="false" /></div>
+                <div class="selector-row"><select id="selectorType" aria-label="Selector type"><option value="css">CSS</option><option value="xcss">XCSS (Shadow DOM)</option><option value="xpath">XPath</option></select><input id="selector" autocomplete="off" spellcheck="false" /></div>
               </label>
               <div class="field-controls" aria-label="추출할 값">
                 <label>추출 값<select id="fieldType" aria-label="추출 값"><option value="text">텍스트</option><option value="attribute">속성</option><option value="property">프로퍼티</option></select></label>
@@ -751,6 +805,7 @@
       this.pickHint = this.shadow.querySelector('#pickHint');
       this.subtitle = this.shadow.querySelector('#subtitle');
       this.selectorInput = this.shadow.querySelector('#selector');
+      this.selectorTypeInput = this.shadow.querySelector('#selectorType');
       this.fieldTypeInput = this.shadow.querySelector('#fieldType');
       this.fieldNameInput = this.shadow.querySelector('#fieldName');
       this.fieldNameLabel = this.shadow.querySelector('#fieldNameLabel');
@@ -790,6 +845,9 @@
       this.cancelButton.addEventListener('click', () => this.destroy());
       this.selectAgainButton.addEventListener('click', () => this.beginPicking());
       this.selectorInput.addEventListener('input', () => this.validateSelector());
+      this.selectorTypeInput.addEventListener('change', () => {
+        void this.changeActiveSelectorType(this.selectorTypeInput.value);
+      });
       this.fieldTypeInput.addEventListener('change', () => {
         this.updateFieldEditorVisibility();
         this.validateSelector();
@@ -853,7 +911,8 @@
       if (path.includes(this.host)) {
         return null;
       }
-      return path.find((node) => node instanceof Element && node !== this.host && !this.host.contains(node)) ?? null;
+      const exposed = path.find((node) => node instanceof Element && node !== this.host && !this.host.contains(node)) ?? null;
+      return exposed ? deepestShadowElementAtPoint(exposed, event.clientX, event.clientY) : null;
     }
 
     onPointerMove(event) {
@@ -879,7 +938,7 @@
       }
       event.preventDefault();
       event.stopImmediatePropagation();
-      this.selectElement(element);
+      void this.selectElement(element);
     }
 
     onKeyDown(event) {
@@ -924,6 +983,67 @@
       this.fieldTypeInput.value = textOnly ? 'text' : nonText?.type ?? 'text';
       this.fieldNameInput.value = textOnly ? '' : nonText?.name ?? '';
       this.updateFieldEditorVisibility();
+    }
+
+    selectedSelectorType() {
+      return normalizedSelectorType(this.selectorTypeInput?.value);
+    }
+
+    syncSelectorEditor(selection) {
+      this.selectorInput.value = selection?.selector ?? '';
+      if (this.selectorTypeInput) {
+        this.selectorTypeInput.value = normalizedSelectorType(selection?.selectorType);
+      }
+    }
+
+    async changeActiveSelectorType(value) {
+      const selection = this.currentSelection();
+      if (!selection || this.saving) return;
+      const nextType = normalizedSelectorType(value);
+      const previousType = normalizedSelectorType(selection.selectorType);
+      if (nextType === previousType) {
+        this.validateSelector();
+        return;
+      }
+
+      const target = selection.element ?? selection.matchedElements?.[0];
+      const runtime = globalThis.__openStillSelectorX;
+      let selector = '';
+      try {
+        if (nextType === 'xpath') {
+          selector = await Promise.resolve(runtime?.getXPATH?.([target], { timeout: 500 }));
+        } else if (nextType === 'xcss') {
+          selector = await Promise.resolve(runtime?.getExtendedCSS?.([target], { timeout: 500 }));
+        } else if (selectorTypeFor(target) !== 'xcss') {
+          selector = await Promise.resolve(runtime?.getCSS?.([target], { timeout: 500 }));
+          if (!selector) selector = selectorFor(target);
+        }
+      } catch {
+        selector = '';
+      }
+
+      if (!selector) {
+        this.selectorTypeInput.value = previousType;
+        this.message.textContent = '현재 요소에는 선택한 타입으로 안정적인 선택자를 만들 수 없습니다.';
+        return;
+      }
+      let matches = [];
+      try {
+        matches = queryTrackedElements(selector, document, nextType);
+      } catch {
+        // Keep the existing type and locator when the generated expression is
+        // rejected by the browser's native selector/XPath evaluator.
+      }
+      if (!matches.length || (target && !matches.includes(target))) {
+        this.selectorTypeInput.value = previousType;
+        this.message.textContent = '변환한 선택자가 현재 요소와 일치하지 않습니다.';
+        return;
+      }
+      selection.selectorType = nextType;
+      selection.selector = selector;
+      this.setSelectionMatchInfo(selection, matches);
+      this.syncSelectorEditor(selection);
+      this.validateSelector();
     }
 
     setSelectionMatchInfo(selection, matches, includedElements = matches) {
@@ -975,7 +1095,7 @@
       this.activeSelectionIndex = index;
       const selection = this.selections[index];
       this.selectedElement = selection.element;
-      this.selectorInput.value = selection.selector;
+      this.syncSelectorEditor(selection);
       this.syncFieldEditor(selection);
       this.matchElements = selection.matchedElements?.length
         ? selection.matchedElements
@@ -1009,7 +1129,7 @@
         return;
       }
       this.selectedElement = selection.element;
-      this.selectorInput.value = selection.selector;
+      this.syncSelectorEditor(selection);
       this.syncFieldEditor(selection);
       if (!this.nameInput.value) {
         this.nameInput.value = cleanText(document.title, 100)
@@ -1032,15 +1152,32 @@
       return selectionsContaining('include') ? 'exclude' : 'include';
     }
 
-    selectElement(element) {
-      const selector = selectorFor(element);
+    async selectElement(element) {
+      let selectorType = selectorTypeFor(element);
+      let selector = selectorFor(element);
+      // The reference picker degrades to an XPath locator when a semantic CSS
+      // expression cannot be derived.  This preserves a selectable element
+      // without silently falling back to a brittle full DOM path. XPath cannot
+      // represent a shadow boundary, so retain XCSS for shadow-tree targets.
+      if (!selector && selectorType !== 'xcss') {
+        try {
+          const xpath = await Promise.resolve(globalThis.__openStillSelectorX?.getXPATH?.([element], { timeout: 500 }));
+          if (typeof xpath === 'string' && xpath && hasSingleMatch(xpath, element, 'xpath')) {
+            selector = xpath;
+            selectorType = 'xpath';
+          }
+        } catch {
+          // Leave the regular selection error below when XPath generation
+          // cannot establish a safe, unique expression either.
+        }
+      }
       if (!selector) {
         this.message.textContent = '이 요소는 표준 CSS 선택자로 안전하게 저장할 수 없습니다.';
         return;
       }
       let matches;
       try {
-        matches = queryTrackedElements(selector);
+        matches = queryTrackedElements(selector, document, selectorType);
       } catch {
         this.message.textContent = '생성한 CSS 선택자를 검증하지 못했습니다.';
         return;
@@ -1066,7 +1203,7 @@
           this.message.textContent = '한 번에 선택할 수 있는 요소는 최대 ' + MAX_SELECTIONS + '개입니다.';
           return;
         }
-        const selection = { selector, selectorType: selectorTypeFor(element), op: operation, fields: [{ type: 'text' }] };
+        const selection = { selector, selectorType, op: operation, fields: [{ type: 'text' }] };
         this.setSelectionMatchInfo(selection, matches);
         this.selections.push(selection);
         this.activeSelectionIndex = this.selections.length - 1;
@@ -1167,6 +1304,7 @@
         return false;
       }
       const selector = this.selectorInput.value.trim();
+      const selectorType = this.selectedSelectorType();
       const totalHours = this.selectedIntervalHours();
       const scheduleMode = this.selectedScheduleMode();
       const active = this.currentSelection();
@@ -1196,7 +1334,7 @@
       }
 
       try {
-        const matches = queryTrackedElements(selector);
+        const matches = queryTrackedElements(selector, document, selectorType);
         this.matchElements = matches;
         this.renderHighlights();
         if (!matches.length) {
@@ -1207,6 +1345,7 @@
         }
 
         active.selector = selector;
+        active.selectorType = selectorType;
         active.fields = fields;
         this.setSelectionMatchInfo(active, matches);
         this.selectedElement = active.element;
@@ -1248,7 +1387,11 @@
           return false;
         }
         try {
-          const matches = uniqueElementsInDocumentOrder(queryTrackedElements(selector));
+          const matches = uniqueElementsInDocumentOrder(queryTrackedElements(
+            selector,
+            document,
+            normalizedSelectorType(selection.selectorType)
+          ));
           if (!matches.length) {
             this.activeSelectionIndex = index;
             this.selectorInput.value = selector;
@@ -1305,7 +1448,7 @@
       this.activeSelectionIndex = activeIndex;
       const active = this.selections[activeIndex];
       this.selectedElement = active.element;
-      this.selectorInput.value = active.selector;
+      this.syncSelectorEditor(active);
       this.syncFieldEditor(active);
       this.matchElements = active.matchedElements?.length ? active.matchedElements : active.elements;
       this.renderHighlights();

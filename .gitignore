@@ -4,3 +4,5 @@
 *.sqlite3
 *-wal
 *-shm
+.audit_ref_tracking_all.txt
+.audit_ref_hits.txt
