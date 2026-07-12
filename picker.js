@@ -36,23 +36,76 @@
     return cleanSnapshotText(element?.innerText || element?.textContent);
   }
 
+  function isPageElement(element) {
+    if (!(element instanceof Element) || !element.isConnected) return false;
+    let root = element.getRootNode();
+    while (root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host) {
+      root = root.host.getRootNode();
+    }
+    return root === document;
+  }
+
+  function composedContains(ancestor, descendant) {
+    for (let current = descendant; current;) {
+      if (current === ancestor) return true;
+      if (current.parentElement) {
+        current = current.parentElement;
+      } else {
+        const root = current.getRootNode?.();
+        current = root?.host || null;
+      }
+    }
+    return false;
+  }
+
+  function composedOrder(left, right) {
+    if (left === right) return 0;
+    if (composedContains(left, right)) return -1;
+    if (composedContains(right, left)) return 1;
+    const outerHost = (element) => {
+      let current = element;
+      let root = current.getRootNode();
+      while (root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host) {
+        current = root.host;
+        root = current.getRootNode();
+      }
+      return current;
+    };
+    const outerLeft = outerHost(left);
+    const outerRight = outerHost(right);
+    if (outerLeft !== outerRight) {
+      const position = outerLeft.compareDocumentPosition(outerRight);
+      if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    }
+    const position = left.compareDocumentPosition(right);
+    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  }
+
+  function queryTrackedElements(selector, root = document) {
+    const runtime = globalThis.__openStillSelectorX?.querySelectorAll;
+    if (typeof runtime === 'function') {
+      return Array.from(runtime(selector, root));
+    }
+    return Array.from(root.querySelectorAll(selector));
+  }
+
+  function selectorTypeFor(element) {
+    return element?.getRootNode?.()?.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? 'xcss' : 'css';
+  }
+
   function uniqueElementsInDocumentOrder(elements) {
-    const unique = [...new Set(Array.from(elements ?? []).filter((element) => (
-      element instanceof Element
-      && element.isConnected
-      && document.documentElement.contains(element)
-    )))];
-    return unique.sort((left, right) => {
-      if (left === right) return 0;
-      return left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
-    });
+    const unique = [...new Set(Array.from(elements ?? []).filter(isPageElement))];
+    return unique.sort(composedOrder);
   }
 
   function removeNestedElements(elements) {
     const ordered = uniqueElementsInDocumentOrder(elements);
     return ordered.filter((element, index) => !ordered
       .slice(0, index)
-      .some((ancestor) => ancestor.contains(element)));
+      .some((ancestor) => composedContains(ancestor, element)));
   }
 
   function snapshotTextForElements(elements) {
@@ -87,7 +140,7 @@
 
   function hasSingleMatch(selector, element) {
     try {
-      const matches = document.querySelectorAll(selector);
+      const matches = queryTrackedElements(selector);
       return matches.length === 1 && matches[0] === element;
     } catch {
       return false;
@@ -257,8 +310,8 @@
     }
     budget.used += 1;
     try {
-      const matches = document.querySelectorAll(selector);
-      const result = { containsTarget: target.matches(selector), count: matches.length };
+      const matches = queryTrackedElements(selector);
+      const result = { containsTarget: matches.includes(target), count: matches.length };
       cache.set(selector, result);
       return result;
     } catch {
@@ -415,7 +468,7 @@
   }
 
   function selectorFor(element, { quick = false } = {}) {
-    if (!(element instanceof Element) || element.getRootNode() !== document || !document.documentElement.contains(element)) {
+    if (!isPageElement(element)) {
       return '';
     }
 
@@ -424,16 +477,15 @@
     if (quick && cached.quick && hasSingleMatch(cached.quick, element)) return cached.quick;
     if (quick && cached.full && hasSingleMatch(cached.full, element)) return cached.full;
 
-    // The saved selector must come from the same token-tree engine as the
-    // reference implementation. It creates a complete valid seed, verifies
-    // every candidate against the DOM, then removes every needless token.
-    // In particular, do not fall through to a full parent > nth-child chain
-    // when a utility-class-heavy list needs partial class attributes.
+    // The selector engine evaluates candidates against the DOM and removes
+    // constraints that do not contribute to uniqueness. In particular, do not
+    // fall through to a full parent > nth-child chain when a utility-class
+    // heavy list needs partial class attributes.
     if (!quick) {
       try {
-        const referenceSelector = globalThis.__openStillReferenceSelector?.getExtendedCSS;
-        const selector = typeof referenceSelector === 'function'
-          ? referenceSelector([element], {
+        const selectorGenerator = globalThis.__openStillSelectorX?.getExtendedCSS;
+        const selector = typeof selectorGenerator === 'function'
+          ? selectorGenerator([element], {
             timeout: 500,
             filterCallback: (_tokenType, name, value) => ![
               'href', 'src', 'srcset', 'hasinclude__', 'include__', 'title', 'aria-label', 'alt'
@@ -446,7 +498,7 @@
           return selector;
         }
       } catch (error) {
-        console.warn('OpenStill reference selector generation failed.', error);
+        console.warn('OpenStill selector generation failed.', error);
       }
 
       // The token-tree generator can time out on a very large or frequently
@@ -555,7 +607,7 @@
     }
     // Never save the old direct-child structural fallback. It is technically
     // unique today but is exactly the form that breaks when a list gains a
-    // card or a wrapper. If the reference engine could not produce a valid
+    // card or a wrapper. If the selector engine cannot produce a valid
     // selector, let the picker ask the user to choose again instead.
     if (!selector && quick) selector = strictSelectorFallback(element, { preferSemantic: true });
     cached[quick ? 'quick' : 'full'] = selector;
@@ -616,6 +668,9 @@
           input[name="name"], input[name="labels"] { font-family: inherit; }
           .selector-row { display: flex; gap: 8px; }
           .selector-row input { flex: 1; }
+          .field-controls { display: grid; grid-template-columns: 1fr 1.35fr; gap: 8px; }
+          .field-controls label { color: #aebed2; }
+          .field-controls [hidden] { display: none; }
           .validity { padding: 8px 10px; border-radius: 8px; background: #0f1825; color: #aebed2; font-size: 12px; line-height: 1.45; }
           .validity.ok { color: #77edbd; }
           .validity.error { color: #ff9c90; }
@@ -629,6 +684,7 @@
           .selection-item .selection-text { display: block; overflow: hidden; margin-top: 2px; color: #8498b0; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
           .remove-selection { width: 26px; height: 26px; color: #ffb5ad !important; border-radius: 6px; font-size: 16px; text-align: center !important; }
           .match.selected { border-color: #42dda3; background: rgb(66 221 163 / 10%); }
+          .match.selected.excluded { border-color: #ff8b7b; background: rgb(255 92 92 / 12%); border-style: dashed; }
           .schedule { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
           .schedule[hidden] { display: none; }
           .interval-fields { display: grid; gap: 6px; color: #c8d5e6; font-size: 12px; font-weight: 650; }
@@ -662,6 +718,10 @@
               <label>CSS 선택자
                 <div class="selector-row"><input id="selector" autocomplete="off" spellcheck="false" /></div>
               </label>
+              <div class="field-controls" aria-label="추출할 값">
+                <label>추출 값<select id="fieldType" aria-label="추출 값"><option value="text">텍스트</option><option value="attribute">속성</option><option value="property">프로퍼티</option></select></label>
+                <label id="fieldNameLabel">이름<input id="fieldName" autocomplete="off" spellcheck="false" maxlength="80" placeholder="예: href, value"></label>
+              </div>
               <div class="validity" id="validity">선택자를 확인하는 중입니다.</div>
               <label>표시 이름 <span style="font-weight:500;color:#7e91aa">여러 개면 번호를 붙여 저장</span><input id="name" name="name" maxlength="120" /></label>
               <label>라벨 <span style="font-weight:500;color:#7e91aa">쉼표로 여러 개를 구분</span><input id="labels" name="labels" maxlength="500" placeholder="예: 채용, 가격" /></label>
@@ -691,6 +751,9 @@
       this.pickHint = this.shadow.querySelector('#pickHint');
       this.subtitle = this.shadow.querySelector('#subtitle');
       this.selectorInput = this.shadow.querySelector('#selector');
+      this.fieldTypeInput = this.shadow.querySelector('#fieldType');
+      this.fieldNameInput = this.shadow.querySelector('#fieldName');
+      this.fieldNameLabel = this.shadow.querySelector('#fieldNameLabel');
       this.nameInput = this.shadow.querySelector('#name');
       this.labelsInput = this.shadow.querySelector('#labels');
       this.scheduleModeInput = this.shadow.querySelector('#scheduleMode');
@@ -718,6 +781,7 @@
       }
       this.hoursInput.value = '1';
       this.scheduleModeInput.value = 'manual';
+      this.updateFieldEditorVisibility();
 
       this.closeButton = this.shadow.querySelector('#close');
       this.cancelButton = this.shadow.querySelector('#cancel');
@@ -726,6 +790,11 @@
       this.cancelButton.addEventListener('click', () => this.destroy());
       this.selectAgainButton.addEventListener('click', () => this.beginPicking());
       this.selectorInput.addEventListener('input', () => this.validateSelector());
+      this.fieldTypeInput.addEventListener('change', () => {
+        this.updateFieldEditorVisibility();
+        this.validateSelector();
+      });
+      this.fieldNameInput.addEventListener('input', () => this.validateSelector());
       this.selectionList.addEventListener('click', (event) => {
         const removeButton = event.target.closest('[data-remove-selection]');
         if (removeButton) {
@@ -762,7 +831,7 @@
       this.pickHint.hidden = false;
       this.subtitle.textContent = this.selections.length ? '추가할 요소를 가리킨 뒤 클릭하세요' : '추적할 요소를 가리킨 뒤 클릭하세요';
       this.pickHint.textContent = this.selections.length
-        ? '추가 선택 모드 · 원하는 요소를 클릭하면 목록에 더해집니다. Esc를 누르면 닫습니다.'
+        ? '추가 선택 모드 · 포함한 영역 안을 다시 고르면 제외 규칙이 되고, 제외 안을 고르면 다시 포함합니다. Esc를 누르면 닫습니다.'
         : '선택 모드 · 마우스를 올리면 선택자가 보입니다. Esc를 누르면 닫습니다.';
       this.message.textContent = '';
       this.clearHighlights();
@@ -831,6 +900,32 @@
       return this.selections[this.activeSelectionIndex] ?? null;
     }
 
+    updateFieldEditorVisibility() {
+      const needsName = this.fieldTypeInput?.value !== 'text';
+      this.fieldNameLabel.hidden = !needsName;
+      this.fieldNameInput.disabled = !needsName;
+    }
+
+    fieldsFromEditor() {
+      const type = this.fieldTypeInput?.value === 'attribute'
+        ? 'attribute'
+        : this.fieldTypeInput?.value === 'property' ? 'property' : 'text';
+      if (type === 'text') return [{ type: 'text' }];
+      const name = this.fieldNameInput.value.trim();
+      return /^[A-Za-z_$][\w$-]{0,80}$/.test(name) ? [{ type, name }] : null;
+    }
+
+    syncFieldEditor(selection) {
+      const fields = Array.isArray(selection?.fields) && selection.fields.length
+        ? selection.fields
+        : [{ type: 'text' }];
+      const nonText = fields.find((field) => field?.type === 'attribute' || field?.type === 'property');
+      const textOnly = fields.every((field) => field?.type === 'text');
+      this.fieldTypeInput.value = textOnly ? 'text' : nonText?.type ?? 'text';
+      this.fieldNameInput.value = textOnly ? '' : nonText?.name ?? '';
+      this.updateFieldEditorVisibility();
+    }
+
     setSelectionMatchInfo(selection, matches, includedElements = matches) {
       const matchedElements = uniqueElementsInDocumentOrder(matches);
       const elements = uniqueElementsInDocumentOrder(includedElements);
@@ -843,8 +938,10 @@
     }
 
     renderSelectionList() {
-      this.selectionSummary.textContent = '선택한 요소 ' + this.selections.length + '개';
-      this.saveButton.textContent = this.selections.length > 1 ? this.selections.length + '개 추적 저장' : '추적 저장';
+      const includeCount = this.selections.filter((selection) => selection.op !== 'exclude').length;
+      const excludeCount = this.selections.length - includeCount;
+      this.selectionSummary.textContent = '선택한 요소 ' + includeCount + '개' + (excludeCount ? ' · 제외 ' + excludeCount + '개' : '');
+      this.saveButton.textContent = includeCount > 1 ? includeCount + '개 추적 저장' : '추적 저장';
       this.selectionList.replaceChildren();
 
       this.selections.forEach((selection, index) => {
@@ -855,7 +952,7 @@
         selectButton.dataset.selectionIndex = String(index);
         const css = document.createElement('span');
         css.className = 'selection-css';
-        css.textContent = selection.selector;
+        css.textContent = (selection.op === 'exclude' ? '[제외] ' : '') + selection.selector;
         const preview = document.createElement('span');
         preview.className = 'selection-text';
         preview.textContent = cleanText(selection.text, 130) || '(텍스트 없음)';
@@ -879,6 +976,7 @@
       const selection = this.selections[index];
       this.selectedElement = selection.element;
       this.selectorInput.value = selection.selector;
+      this.syncFieldEditor(selection);
       this.matchElements = selection.matchedElements?.length
         ? selection.matchedElements
         : selection.elements ?? (selection.element ? [selection.element] : []);
@@ -912,6 +1010,7 @@
       }
       this.selectedElement = selection.element;
       this.selectorInput.value = selection.selector;
+      this.syncFieldEditor(selection);
       if (!this.nameInput.value) {
         this.nameInput.value = cleanText(document.title, 100)
           || selection.element?.localName?.toLowerCase() + ' 요소';
@@ -919,6 +1018,18 @@
       this.tooltip.hidden = true;
       this.renderSelectionList();
       this.updateInterval();
+    }
+
+    operationForElement(element) {
+      const selectionsContaining = (op) => this.selections.some((selection) => (
+        (selection.op === 'exclude' ? 'exclude' : 'include') === op
+        && (selection.matchedElements ?? selection.elements ?? []).some((candidate) => composedContains(candidate, element))
+      ));
+      // Selecting inside an inclusion narrows it. Selecting inside that
+      // exclusion explicitly opens a smaller inclusion again, so the user can
+      // express include → exclude → include without losing the parent route.
+      if (selectionsContaining('exclude')) return 'include';
+      return selectionsContaining('include') ? 'exclude' : 'include';
     }
 
     selectElement(element) {
@@ -929,7 +1040,7 @@
       }
       let matches;
       try {
-        matches = [...document.querySelectorAll(selector)];
+        matches = queryTrackedElements(selector);
       } catch {
         this.message.textContent = '생성한 CSS 선택자를 검증하지 못했습니다.';
         return;
@@ -939,10 +1050,12 @@
         return;
       }
 
+      const operation = this.operationForElement(element);
       const existingIndex = this.selections.findIndex((selection) => (
-        selection.selector === selector
-        || selection.element === element
-        || selection.matchedElements?.includes(element)
+        selection.op === operation
+        && (selection.selector === selector
+          || selection.element === element
+          || selection.matchedElements?.includes(element))
       ));
       if (existingIndex >= 0) {
         this.activeSelectionIndex = existingIndex;
@@ -953,7 +1066,7 @@
           this.message.textContent = '한 번에 선택할 수 있는 요소는 최대 ' + MAX_SELECTIONS + '개입니다.';
           return;
         }
-        const selection = { selector };
+        const selection = { selector, selectorType: selectorTypeFor(element), op: operation, fields: [{ type: 'text' }] };
         this.setSelectionMatchInfo(selection, matches);
         this.selections.push(selection);
         this.activeSelectionIndex = this.selections.length - 1;
@@ -992,7 +1105,7 @@
           : selection.matchedElements ?? (selection.element ? [selection.element] : []);
         elements.forEach((element, elementIndex) => {
           if (drawn.size < MAX_HIGHLIGHTS) {
-            draw(element, 'match selected' + (
+            draw(element, 'match selected' + (selection.op === 'exclude' ? ' excluded' : '') + (
               selectionIndex === this.activeSelectionIndex && elementIndex === 0 ? ' primary' : ''
             ));
           }
@@ -1074,8 +1187,16 @@
         return false;
       }
 
+      const fields = this.fieldsFromEditor();
+      if (!fields) {
+        this.validity.textContent = '속성 또는 프로퍼티를 추출하려면 유효한 이름을 입력해 주세요.';
+        this.validity.classList.add('error');
+        this.saveButton.disabled = true;
+        return false;
+      }
+
       try {
-        const matches = [...document.querySelectorAll(selector)];
+        const matches = queryTrackedElements(selector);
         this.matchElements = matches;
         this.renderHighlights();
         if (!matches.length) {
@@ -1086,6 +1207,7 @@
         }
 
         active.selector = selector;
+        active.fields = fields;
         this.setSelectionMatchInfo(active, matches);
         this.selectedElement = active.element;
         const preview = document.createElement('div');
@@ -1126,7 +1248,7 @@
           return false;
         }
         try {
-          const matches = uniqueElementsInDocumentOrder(document.querySelectorAll(selector));
+          const matches = uniqueElementsInDocumentOrder(queryTrackedElements(selector));
           if (!matches.length) {
             this.activeSelectionIndex = index;
             this.selectorInput.value = selector;
@@ -1152,25 +1274,22 @@
       // Reference-style grouped capture keeps a DOM node only once.  Resolve
       // the complete union first so an ancestor wins over its selected child,
       // then assign each remaining root to the first selector that contains it.
-      const roots = removeNestedElements(resolved.flatMap(({ matches }) => matches));
-      const ownedBySelection = new Map(resolved.map(({ selection }) => [selection, []]));
-      for (const root of roots) {
-        const owner = resolved.find(({ matches }) => matches.includes(root));
-        if (owner) {
-          ownedBySelection.get(owner.selection).push(root);
-        }
+      const includes = resolved.filter(({ selection }) => selection.op !== 'exclude');
+      if (!includes.length) {
+        this.message.textContent = '최소 하나의 포함 선택이 필요합니다.';
+        this.saveButton.disabled = true;
+        return false;
       }
-
-      const retained = [];
+      // Preserve nested locators: an include inside an excluded branch is a
+      // deliberate re-inclusion, not redundant selection noise.
+      const previewRoots = removeNestedElements(includes.flatMap(({ matches }) => matches));
       for (const { selection, matches } of resolved) {
-        const ownedElements = ownedBySelection.get(selection) ?? [];
-        if (!ownedElements.length) continue;
-        this.setSelectionMatchInfo(selection, matches, ownedElements);
-        retained.push(selection);
+        const visibleMatches = selection.op === 'exclude'
+          ? matches
+          : matches.filter((element) => previewRoots.includes(element));
+        this.setSelectionMatchInfo(selection, matches, visibleMatches.length ? visibleMatches : matches);
       }
-
-      const removedCount = this.selections.length - retained.length;
-      this.selections = retained;
+      this.selections = resolved.map(({ selection }) => selection);
       if (!this.selections.length) {
         this.activeSelectionIndex = -1;
         this.message.textContent = '선택한 요소가 모두 다른 선택자에 포함됩니다. CSS 선택자를 다시 확인해 주세요.';
@@ -1187,12 +1306,10 @@
       const active = this.selections[activeIndex];
       this.selectedElement = active.element;
       this.selectorInput.value = active.selector;
+      this.syncFieldEditor(active);
       this.matchElements = active.matchedElements?.length ? active.matchedElements : active.elements;
       this.renderHighlights();
       this.renderSelectionList();
-      if (removedCount) {
-        this.message.textContent = `중복되거나 상위 선택에 포함된 ${removedCount}개 선택을 합쳐 저장합니다.`;
-      }
       return true;
     }
 
@@ -1228,7 +1345,12 @@
           scheduleMode,
           intervalHours: totalHours,
           items: this.selections.map((selection) => ({
-            selector: selection.selector
+            type: selection.selectorType || 'css',
+            expr: selection.selector,
+            op: selection.op === 'exclude' ? 'exclude' : 'include',
+            fields: Array.isArray(selection.fields) && selection.fields.length
+              ? selection.fields
+              : [{ type: 'text' }]
           }))
         });
         if (!response?.ok) {

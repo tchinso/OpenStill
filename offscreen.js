@@ -38,7 +38,7 @@
     return root;
   }
 
-  function inspectHtml(html, selector) {
+  function inspectHtml(html, selector, selectorType = 'css') {
     if (typeof html !== 'string' || typeof selector !== 'string' || !selector.trim()) {
       return { ok: false, error: '검사할 HTML 또는 CSS 선택자가 올바르지 않습니다.' };
     }
@@ -47,8 +47,26 @@
       // This detached tree is never attached to a browsing context. Therefore
       // image/iframe URLs in a monitored document cannot issue follow-up requests.
       const root = makeInertDocumentTree(html);
-      const fragmentSelector = selector.trim().replace(/^:root(?=\s|>|$)/, 'html');
-      const matches = root.querySelectorAll(fragmentSelector);
+      let matches;
+      if (selectorType === 'xpath') {
+        const result = document.evaluate(
+          selector.trim(),
+          root,
+          null,
+          XPathResult.ORDERED_NODE_ITERATOR_TYPE,
+          null
+        );
+        matches = [];
+        for (let node = result.iterateNext(); node; node = result.iterateNext()) {
+          matches.push(node.nodeType === Node.ATTRIBUTE_NODE ? node.ownerElement : node);
+        }
+      } else {
+        // xcss is CSS syntax with shadow-boundary whitespace. The detached
+        // validator only needs to reject malformed CSS; live shadow traversal
+        // is performed in the rendered-page capture context.
+        const fragmentSelector = selector.trim().replace(/^:root(?=\s|>|$)/, 'html');
+        matches = [...root.querySelectorAll(fragmentSelector)];
+      }
       const firstMatch = matches[0];
 
       return {
@@ -101,7 +119,7 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'parse-monitor-html') {
-      sendResponse(inspectHtml(message.html, message.selector));
+      sendResponse(inspectHtml(message.html, message.selector, message.selectorType));
       return;
     }
 

@@ -8,6 +8,8 @@
   const selectedMonitorIds = new Set();
   let toastTimer;
   let batchCheckRunning = false;
+  let activeHistoryEntries = [];
+  let activeHistoryUrl = '';
 
   const elements = {
     soundEnabled: document.querySelector('#soundEnabled'),
@@ -38,6 +40,18 @@
     editName: document.querySelector('#editName'),
     editUrl: document.querySelector('#editUrl'),
     editSelectors: document.querySelector('#editSelectors'),
+    editCompareMode: document.querySelector('#editCompareMode'),
+    editDelaySeconds: document.querySelector('#editDelaySeconds'),
+    editTimeoutSeconds: document.querySelector('#editTimeoutSeconds'),
+    editRegexp: document.querySelector('#editRegexp'),
+    editRegexpFlags: document.querySelector('#editRegexpFlags'),
+    editIgnoreWhitespace: document.querySelector('#editIgnoreWhitespace'),
+    editAllowEmpty: document.querySelector('#editAllowEmpty'),
+    editIncludeStyle: document.querySelector('#editIncludeStyle'),
+    editIncludeScript: document.querySelector('#editIncludeScript'),
+    editKeepComments: document.querySelector('#editKeepComments'),
+    editLive: document.querySelector('#editLive'),
+    editLiveDebounce: document.querySelector('#editLiveDebounce'),
     editLabels: document.querySelector('#editLabels'),
     editScheduleMode: document.querySelector('#editScheduleMode'),
     editIntervalInputs: document.querySelector('#editIntervalInputs'),
@@ -68,6 +82,14 @@
     currentSnapshot: document.querySelector('#currentSnapshot'),
     changeOpenPage: document.querySelector('#changeOpenPage'),
     acknowledgeButton: document.querySelector('#acknowledgeButton'),
+    historyDialog: document.querySelector('#historyDialog'),
+    historyTitle: document.querySelector('#historyTitle'),
+    historyDescription: document.querySelector('#historyDescription'),
+    historyEntries: document.querySelector('#historyEntries'),
+    historyRuns: document.querySelector('#historyRuns'),
+    historyWhen: document.querySelector('#historyWhen'),
+    historyPreviousSnapshot: document.querySelector('#historyPreviousSnapshot'),
+    historyCurrentSnapshot: document.querySelector('#historyCurrentSnapshot'),
     toast: document.querySelector('#toast')
   };
 
@@ -82,12 +104,57 @@
     return node;
   }
 
-  function selectorsOf(monitor) {
+  function locatorsOf(monitor) {
+    if (Array.isArray(monitor?.locators)) {
+      return monitor.locators
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => ({
+          type: ['css', 'xcss', 'xpath'].includes(item.type) ? item.type : 'css',
+          expr: String(item.expr ?? item.selector ?? item.value ?? '').trim(),
+          op: item.op === 'exclude' ? 'exclude' : 'include',
+          frameId: Number.isInteger(item.frameId) ? item.frameId : 0,
+          framePath: Array.isArray(item.framePath) ? item.framePath : [],
+          fields: Array.isArray(item.fields) ? item.fields : [{ type: 'text' }]
+        }))
+        .filter((item) => item.expr);
+    }
     const selectors = Array.isArray(monitor?.selectors) ? monitor.selectors : [];
     return selectors
       .map((item) => typeof item === 'string' ? item : item?.selector ?? item?.css)
-      .map((selector) => String(selector ?? '').trim())
-      .filter(Boolean);
+      .map((expr) => String(expr ?? '').trim())
+      .filter(Boolean)
+      .map((expr) => ({ type: 'css', expr, op: 'include', frameId: 0, framePath: [], fields: [{ type: 'text' }] }));
+  }
+
+  function selectorsOf(monitor) {
+    return locatorsOf(monitor).map((locator) => locator.expr);
+  }
+
+  function locatorLine(locator) {
+    const basic = locator.type === 'css'
+      && locator.op === 'include'
+      && locator.frameId === 0
+      && !locator.framePath?.length
+      && (!locator.fields?.length || locator.fields.every((field) => field?.type === 'text'));
+    return basic ? locator.expr : JSON.stringify(locator);
+  }
+
+  function parseLocatorLine(line) {
+    const source = String(line ?? '').trim();
+    if (!source) return null;
+    if (source.startsWith('{')) {
+      try {
+        const value = JSON.parse(source);
+        return value && typeof value === 'object' ? value : null;
+      } catch {
+        return null;
+      }
+    }
+    const prefixed = source.match(/^(?:(exclude)\s+)?(css|xcss|xpath)\s*:\s*(.+)$/i);
+    if (prefixed) {
+      return { type: prefixed[2].toLowerCase(), expr: prefixed[3].trim(), op: prefixed[1] ? 'exclude' : 'include' };
+    }
+    return { type: 'css', expr: source, op: 'include' };
   }
 
   function selectorPreview(monitor) {
@@ -439,6 +506,9 @@
 
     const actions = element('div', 'card-actions');
     if (monitor.unread) actions.append(makeAction('변경 내용', 'change', monitor.id, 'attention-action'));
+    if (monitor.lastErrorSnapshot?.evidenceHtml) actions.append(makeAction('선택 실패 화면', 'evidence', monitor.id, 'attention-action'));
+    if (monitor.history?.length || monitor.runs?.length) actions.append(makeAction('기록', 'history', monitor.id));
+    if (monitor.tracking?.live) actions.append(makeAction('실시간 연결', 'live', monitor.id));
     if (monitor.status === 'permission-needed') actions.append(makeAction('추적 시작', 'grant', monitor.id, 'attention-action'));
     actions.append(
       makeAction('지금 확인', 'check', monitor.id),
@@ -616,7 +686,19 @@
     elements.editId.value = monitor.id;
     elements.editName.value = monitor.name;
     elements.editUrl.value = monitor.url;
-    elements.editSelectors.value = selectorsOf(monitor).join('\n');
+    elements.editSelectors.value = locatorsOf(monitor).map(locatorLine).join('\n');
+    elements.editCompareMode.value = monitor.tracking?.dataAttr === 'data' ? 'data' : 'text';
+    elements.editDelaySeconds.value = String(Math.round((Number(monitor.tracking?.delayMilliseconds) || 0) / 1_000));
+    elements.editTimeoutSeconds.value = String(Math.round((Number(monitor.tracking?.timeoutMilliseconds) || 60_000) / 1_000));
+    elements.editRegexp.value = monitor.tracking?.regexp?.expr ?? '';
+    elements.editRegexpFlags.value = monitor.tracking?.regexp?.flags ?? '';
+    elements.editIgnoreWhitespace.checked = monitor.tracking?.ignoreWhitespace !== false;
+    elements.editAllowEmpty.checked = monitor.tracking?.allowEmpty === true;
+    elements.editIncludeStyle.checked = monitor.tracking?.includeStyle === true;
+    elements.editIncludeScript.checked = monitor.tracking?.includeScript === true;
+    elements.editKeepComments.checked = monitor.tracking?.keepComments === true;
+    elements.editLive.checked = monitor.tracking?.live === true;
+    elements.editLiveDebounce.value = String(Number(monitor.tracking?.liveDebounceMilliseconds) || 1_200);
     elements.editLabels.value = (monitor.labels ?? []).join(', ');
     elements.editScheduleMode.value = scheduleModeOf(monitor);
     elements.editDays.value = String(Math.floor(monitor.intervalHours / 24));
@@ -632,12 +714,29 @@
     const totalHours = updateEditorInterval();
     const scheduleMode = elements.editScheduleMode.value === 'interval' ? 'interval' : 'manual';
     const url = elements.editUrl.value.trim();
-    const selectors = [...new Set(elements.editSelectors.value
+    const locators = elements.editSelectors.value
       .split(/\r?\n/)
-      .map((selector) => selector.trim())
-      .filter(Boolean))];
-    if (!id || !url || !selectors.length || (scheduleMode === 'interval' && (totalHours < MIN_HOURS || totalHours > MAX_HOURS))) {
+      .map(parseLocatorLine)
+      .filter(Boolean);
+    const delaySeconds = Number(elements.editDelaySeconds.value || 0);
+    const timeoutSeconds = Number(elements.editTimeoutSeconds.value || 60);
+    const liveDebounce = Number(elements.editLiveDebounce.value || 1_200);
+    const regexp = elements.editRegexp.value.trim();
+    const regexpFlags = elements.editRegexpFlags.value.trim();
+    if (!id || !url || !locators.some((locator) => locator.op !== 'exclude') || (scheduleMode === 'interval' && (totalHours < MIN_HOURS || totalHours > MAX_HOURS))) {
       elements.editorMessage.textContent = '필수 정보와 확인 간격을 확인해 주세요.';
+      return;
+    }
+    if (!Number.isFinite(delaySeconds) || delaySeconds < 0 || delaySeconds > 60 || !Number.isInteger(delaySeconds)) {
+      elements.editorMessage.textContent = '렌더링 대기는 0초에서 60초 사이의 정수여야 합니다.';
+      return;
+    }
+    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 10 || timeoutSeconds > 300 || !Number.isInteger(timeoutSeconds)) {
+      elements.editorMessage.textContent = '최대 캡처 시간은 10초에서 300초 사이의 정수여야 합니다.';
+      return;
+    }
+    if (!Number.isFinite(liveDebounce) || liveDebounce < 250 || liveDebounce > 30_000 || !Number.isInteger(liveDebounce)) {
+      elements.editorMessage.textContent = '실시간 묶음 대기는 250ms에서 30초 사이의 정수여야 합니다.';
       return;
     }
 
@@ -653,7 +752,20 @@
       id,
       name: elements.editName.value,
       url,
-      selectors,
+      locators,
+      tracking: {
+        dataAttr: elements.editCompareMode.value === 'data' ? 'data' : 'text',
+        ignoreWhitespace: elements.editIgnoreWhitespace.checked,
+        allowEmpty: elements.editAllowEmpty.checked,
+        delayMilliseconds: delaySeconds * 1_000,
+        timeoutMilliseconds: timeoutSeconds * 1_000,
+        regexp: regexp ? { expr: regexp, flags: regexpFlags } : null,
+        includeStyle: elements.editIncludeStyle.checked,
+        includeScript: elements.editIncludeScript.checked,
+        keepComments: elements.editKeepComments.checked,
+        live: elements.editLive.checked,
+        liveDebounceMilliseconds: liveDebounce
+      },
       labels: elements.editLabels.value.split(','),
       scheduleMode,
       intervalHours: totalHours,
@@ -789,10 +901,370 @@
     if (text) target.append(document.createTextNode(text));
   }
 
-  function pushMarkedText(target, text, className) {
-    if (!text) return;
-    const mark = element(className === 'diff-added' ? 'ins' : 'del', className, text);
-    target.append(mark);
+  // Snapshot markup is data from a remote page.  Do not inject that markup into
+  // the dashboard: parse it into a deliberately small, inert tree and build the
+  // view with DOM APIs.  In addition to preventing active content from running,
+  // this preserves a link's position in the original tree instead of trying to
+  // rediscover it by matching visible text (which fails for duplicate labels).
+  const SNAPSHOT_ALLOWED_TAGS = new Set([
+    'a', 'abbr', 'address', 'article', 'aside', 'b', 'blockquote', 'br', 'caption',
+    'cite', 'code', 'dd', 'del', 'details', 'div', 'dl', 'dt', 'em', 'figcaption',
+    'figure', 'footer', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'i',
+    'kbd', 'li', 'main', 'mark', 'ol', 'p', 'pre', 'q', 's', 'samp', 'section',
+    'small', 'span', 'strong', 'sub', 'summary', 'sup', 'table', 'tbody', 'td',
+    'tfoot', 'th', 'thead', 'time', 'tr', 'u', 'ul', 'var', 'wbr', 'img'
+  ]);
+  const SNAPSHOT_DROPPED_TAGS = new Set([
+    'base', 'embed', 'frame', 'frameset', 'iframe', 'link', 'meta', 'noscript',
+    'object', 'script', 'style', 'svg', 'math', 'canvas', 'source', 'track'
+  ]);
+  const SNAPSHOT_VOID_TAGS = new Set(['br', 'hr', 'img', 'wbr']);
+  const SNAPSHOT_MAX_NODES = 5_000;
+  const SNAPSHOT_MAX_TEXT = 180_000;
+  const SNAPSHOT_ALIGNMENT_CELLS = 12_000;
+
+  function safeSnapshotLink(value, baseUrl = '') {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '';
+    try {
+      const url = baseUrl ? new URL(raw, baseUrl) : new URL(raw);
+      return ['https:', 'http:'].includes(url.protocol) ? url.href : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function snapshotBaseUrl(snapshot, fallback = '') {
+    const candidates = [snapshot?.baseUrl, snapshot?.url, fallback];
+    for (const candidate of candidates) {
+      const safe = safeSnapshotLink(candidate);
+      if (safe) return safe;
+    }
+    return '';
+  }
+
+  function clippedSnapshotText(value, maximum = 1_200) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maximum);
+  }
+
+  function appendSnapshotTreeChild(children, node) {
+    if (!node) return;
+    if (node.type === 'fragment') {
+      node.children.forEach((child) => appendSnapshotTreeChild(children, child));
+      return;
+    }
+    const previous = children[children.length - 1];
+    if (node.type === 'text' && previous?.type === 'text') {
+      previous.text += node.text;
+      return;
+    }
+    children.push(node);
+  }
+
+  function snapshotAttributesFromNode(node, tagName, baseUrl) {
+    const attributes = {};
+    const title = clippedSnapshotText(node.getAttribute('title'), 500);
+    const label = clippedSnapshotText(node.getAttribute('aria-label'), 500);
+    if (title) attributes.title = title;
+    if (label) attributes.ariaLabel = label;
+    // This is displayed only as a changed-attribute badge; it is never copied
+    // back onto the dashboard element, so opted-in inline-style comparison
+    // cannot affect the dashboard's own rendering.
+    const inlineStyle = clippedSnapshotText(node.getAttribute('style'), 2_000);
+    if (inlineStyle) attributes.style = inlineStyle;
+    for (const attribute of [...node.attributes].slice(0, 24)) {
+      const name = attribute.name.toLowerCase();
+      if (name === 'id' || name === 'class' || name.startsWith('data-')) {
+        const value = clippedSnapshotText(attribute.value, 500);
+        if (value) attributes[name] = value;
+      }
+    }
+
+    if (tagName === 'a') {
+      const href = safeSnapshotLink(node.getAttribute('href'), baseUrl);
+      if (href) attributes.href = href;
+    }
+    if (tagName === 'img') {
+      const alt = clippedSnapshotText(node.getAttribute('alt'), 500);
+      if (alt) attributes.alt = alt;
+      const src = safeSnapshotLink(node.getAttribute('src'), baseUrl);
+      if (src) attributes.src = src;
+    }
+    if (tagName === 'time') {
+      const dateTime = clippedSnapshotText(node.getAttribute('datetime'), 200);
+      if (dateTime) attributes.dateTime = dateTime;
+    }
+    if (['td', 'th'].includes(tagName)) {
+      for (const name of ['colspan', 'rowspan']) {
+        const value = Number.parseInt(node.getAttribute(name), 10);
+        if (Number.isInteger(value) && value > 0 && value <= 1_000) attributes[name] = String(value);
+      }
+    }
+    if (tagName === 'ol') {
+      const start = Number.parseInt(node.getAttribute('start'), 10);
+      if (Number.isInteger(start) && Math.abs(start) <= 1_000_000) attributes.start = String(start);
+    }
+    if (tagName === 'li') {
+      const value = Number.parseInt(node.getAttribute('value'), 10);
+      if (Number.isInteger(value) && Math.abs(value) <= 1_000_000) attributes.value = String(value);
+    }
+    if (tagName === 'details' && node.hasAttribute('open')) attributes.open = true;
+    return attributes;
+  }
+
+  function snapshotTreeFromDomNode(node, context) {
+    if (context.nodes >= SNAPSHOT_MAX_NODES || context.text >= SNAPSHOT_MAX_TEXT) return null;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = String(node.nodeValue ?? '').replace(/\s+/g, ' ');
+      if (!text) return null;
+      const remaining = SNAPSHOT_MAX_TEXT - context.text;
+      if (remaining <= 0) return null;
+      context.nodes += 1;
+      context.text += Math.min(text.length, remaining);
+      return { type: 'text', text: text.slice(0, remaining) };
+    }
+    if (node.nodeType === Node.COMMENT_NODE) {
+      const text = String(node.nodeValue ?? '');
+      const remaining = SNAPSHOT_MAX_TEXT - context.text;
+      if (remaining <= 0) return null;
+      context.nodes += 1;
+      context.text += Math.min(text.length, remaining);
+      return { type: 'comment', text: text.slice(0, remaining) };
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return null;
+
+    const tagName = node.tagName.toLowerCase();
+    // Script/style capture is opt-in in the tracker. Render it only as inert
+    // text here, never by inserting the original element into the dashboard.
+    if (tagName === 'script' || tagName === 'style') {
+      const text = String(node.textContent ?? '');
+      const remaining = SNAPSHOT_MAX_TEXT - context.text;
+      if (remaining <= 0) return null;
+      context.nodes += 1;
+      context.text += Math.min(text.length, remaining);
+      return { type: 'code', language: tagName, text: text.slice(0, remaining) };
+    }
+    if (tagName === 'link' && /(^|\s)stylesheet(\s|$)/i.test(node.getAttribute('rel') || '')) {
+      const href = safeSnapshotLink(node.getAttribute('href'), context.baseUrl);
+      if (!href) return null;
+      context.nodes += 1;
+      return { type: 'resource', resource: 'stylesheet', attributes: { href } };
+    }
+    if (SNAPSHOT_DROPPED_TAGS.has(tagName)) return null;
+    if (tagName === 'openstill-frame') {
+      const frameTemplate = [...node.children].find((child) => child.tagName?.toLowerCase() === 'template');
+      const children = [];
+      for (const child of frameTemplate ? frameTemplate.content.childNodes : node.childNodes) {
+        appendSnapshotTreeChild(children, snapshotTreeFromDomNode(child, context));
+      }
+      context.nodes += 1;
+      return {
+        type: 'template',
+        frame: true,
+        label: `Frame ${node.getAttribute('data-frame-id') ?? '?'}`,
+        children
+      };
+    }
+    const sourceChildren = tagName === 'template' ? node.content.childNodes : node.childNodes;
+    const children = [];
+    for (const child of sourceChildren) {
+      appendSnapshotTreeChild(children, snapshotTreeFromDomNode(child, context));
+    }
+
+    if (tagName === 'template') {
+      context.nodes += 1;
+      return {
+        type: 'template',
+        shadow: node.hasAttribute('shadowrootmode') || node.hasAttribute('shadowroot')
+          || node.hasAttribute('data-openstill-shadow-root') || node.hasAttribute('data-shadow-root'),
+        children
+      };
+    }
+    if (!SNAPSHOT_ALLOWED_TAGS.has(tagName)) return { type: 'fragment', children };
+    context.nodes += 1;
+    return {
+      type: 'element',
+      tagName,
+      attributes: snapshotAttributesFromNode(node, tagName, context.baseUrl),
+      children
+    };
+  }
+
+  function snapshotTextTree(snapshot) {
+    const lines = snapshotItems(snapshot);
+    return {
+      type: 'root',
+      children: lines.map((line) => ({
+        type: 'element',
+        tagName: 'p',
+        attributes: {},
+        children: [{ type: 'text', text: line }]
+      }))
+    };
+  }
+
+  function snapshotTree(snapshot, fallbackBaseUrl = '') {
+    const html = typeof snapshot?.html === 'string' ? snapshot.html.trim() : '';
+    if (!html || typeof DOMParser !== 'function') return snapshotTextTree(snapshot);
+    try {
+      const parsed = new DOMParser().parseFromString(html, 'text/html');
+      const context = { baseUrl: snapshotBaseUrl(snapshot, fallbackBaseUrl), nodes: 0, text: 0 };
+      const children = [];
+      for (const node of parsed.body.childNodes) {
+        appendSnapshotTreeChild(children, snapshotTreeFromDomNode(node, context));
+      }
+      return children.length ? { type: 'root', children } : snapshotTextTree(snapshot);
+    } catch {
+      return snapshotTextTree(snapshot);
+    }
+  }
+
+  function visibleSnapshotText(node, maximum = 800) {
+    if (!node) return '';
+    if (node.visibleText !== undefined) return node.visibleText;
+    let text = '';
+    if (node.type === 'text') text = node.text;
+    else if (node.type === 'code') text = node.text;
+    else if (node.type === 'comment') text = node.text;
+    else if (node.type === 'resource') text = node.attributes?.href || node.resource || '';
+    else if (node.type === 'element' && node.tagName === 'img') text = node.attributes.alt || 'image';
+    else text = (node.children ?? []).map((child) => visibleSnapshotText(child, maximum)).join(' ');
+    node.visibleText = clippedSnapshotText(text, maximum);
+    return node.visibleText;
+  }
+
+  function snapshotFingerprint(node, maximum = 260) {
+    if (!node) return '';
+    if (node.fingerprint !== undefined) return node.fingerprint;
+    if (node.type === 'text') {
+      node.fingerprint = `text:${clippedSnapshotText(node.text, maximum)}`;
+      return node.fingerprint;
+    }
+    if (node.type === 'code') {
+      node.fingerprint = `code:${node.language}:${clippedSnapshotText(node.text, maximum)}`;
+      return node.fingerprint;
+    }
+    if (node.type === 'comment') {
+      node.fingerprint = `comment:${clippedSnapshotText(node.text, maximum)}`;
+      return node.fingerprint;
+    }
+    const attributeText = Object.entries(node.attributes ?? {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join('&');
+    const childText = (node.children ?? [])
+      .map((child) => snapshotFingerprint(child, Math.max(32, Math.floor(maximum / 2))))
+      .join('|')
+      .slice(0, maximum);
+    node.fingerprint = `${node.type}:${node.tagName ?? ''}:${attributeText}:${childText}`.slice(0, maximum);
+    return node.fingerprint;
+  }
+
+  function wordOverlap(left, right) {
+    const leftWords = new Set(String(left).toLocaleLowerCase('ko-KR').match(/[\p{L}\p{N}_]+/gu) ?? []);
+    const rightWords = new Set(String(right).toLocaleLowerCase('ko-KR').match(/[\p{L}\p{N}_]+/gu) ?? []);
+    if (!leftWords.size || !rightWords.size) return 0;
+    let common = 0;
+    leftWords.forEach((word) => { if (rightWords.has(word)) common += 1; });
+    return common / Math.max(leftWords.size, rightWords.size);
+  }
+
+  function snapshotNodeSimilarity(before, after) {
+    if (!before || !after || before.type !== after.type) return 0;
+    if (snapshotFingerprint(before) === snapshotFingerprint(after)) return 12;
+    if (before.type === 'text') return 0.25 + wordOverlap(before.text, after.text) * 3;
+    if (before.type === 'code') return 0.5 + wordOverlap(before.text, after.text) * 3;
+    if (before.type === 'comment') return 0.5 + wordOverlap(before.text, after.text) * 3;
+    if (before.type === 'resource') return before.resource === after.resource ? 1 : 0;
+    if (before.type === 'root' || before.type === 'template') {
+      return 1.5 + wordOverlap(visibleSnapshotText(before), visibleSnapshotText(after)) * 2;
+    }
+    if (before.tagName !== after.tagName) return 0;
+    let score = 1.5 + wordOverlap(visibleSnapshotText(before), visibleSnapshotText(after)) * 2;
+    if (before.attributes.href && before.attributes.href === after.attributes.href) score += 1;
+    return score;
+  }
+
+  function greedySnapshotAlignment(beforeChildren, afterChildren) {
+    const operations = [];
+    let beforeIndex = 0;
+    let afterIndex = 0;
+    const lookAhead = 12;
+
+    while (beforeIndex < beforeChildren.length && afterIndex < afterChildren.length) {
+      const before = beforeChildren[beforeIndex];
+      const after = afterChildren[afterIndex];
+      if (snapshotFingerprint(before) === snapshotFingerprint(after) || snapshotNodeSimilarity(before, after) >= 1) {
+        operations.push({ type: 'pair', before, after });
+        beforeIndex += 1;
+        afterIndex += 1;
+        continue;
+      }
+      const matchingAfter = afterChildren.slice(afterIndex + 1, afterIndex + 1 + lookAhead)
+        .findIndex((candidate) => snapshotFingerprint(candidate) === snapshotFingerprint(before));
+      const matchingBefore = beforeChildren.slice(beforeIndex + 1, beforeIndex + 1 + lookAhead)
+        .findIndex((candidate) => snapshotFingerprint(candidate) === snapshotFingerprint(after));
+      if (matchingAfter >= 0 && (matchingBefore < 0 || matchingAfter <= matchingBefore)) {
+        operations.push({ type: 'added', after });
+        afterIndex += 1;
+      } else if (matchingBefore >= 0) {
+        operations.push({ type: 'removed', before });
+        beforeIndex += 1;
+      } else {
+        operations.push({ type: 'removed', before }, { type: 'added', after });
+        beforeIndex += 1;
+        afterIndex += 1;
+      }
+    }
+    while (beforeIndex < beforeChildren.length) operations.push({ type: 'removed', before: beforeChildren[beforeIndex++] });
+    while (afterIndex < afterChildren.length) operations.push({ type: 'added', after: afterChildren[afterIndex++] });
+    return operations;
+  }
+
+  function alignSnapshotChildren(beforeChildren, afterChildren) {
+    const beforeLength = beforeChildren.length;
+    const afterLength = afterChildren.length;
+    if (!beforeLength || !afterLength) {
+      return [
+        ...beforeChildren.map((before) => ({ type: 'removed', before })),
+        ...afterChildren.map((after) => ({ type: 'added', after }))
+      ];
+    }
+    if (beforeLength * afterLength > SNAPSHOT_ALIGNMENT_CELLS) {
+      return greedySnapshotAlignment(beforeChildren, afterChildren);
+    }
+
+    const matrix = Array.from({ length: beforeLength + 1 }, () => new Float32Array(afterLength + 1));
+    for (let beforeIndex = beforeLength - 1; beforeIndex >= 0; beforeIndex -= 1) {
+      for (let afterIndex = afterLength - 1; afterIndex >= 0; afterIndex -= 1) {
+        const paired = snapshotNodeSimilarity(beforeChildren[beforeIndex], afterChildren[afterIndex]);
+        matrix[beforeIndex][afterIndex] = Math.max(
+          matrix[beforeIndex + 1][afterIndex],
+          matrix[beforeIndex][afterIndex + 1],
+          paired ? paired + matrix[beforeIndex + 1][afterIndex + 1] : 0
+        );
+      }
+    }
+
+    const operations = [];
+    let beforeIndex = 0;
+    let afterIndex = 0;
+    while (beforeIndex < beforeLength && afterIndex < afterLength) {
+      const paired = snapshotNodeSimilarity(beforeChildren[beforeIndex], afterChildren[afterIndex]);
+      const diagonal = paired ? paired + matrix[beforeIndex + 1][afterIndex + 1] : -1;
+      const removed = matrix[beforeIndex + 1][afterIndex];
+      const added = matrix[beforeIndex][afterIndex + 1];
+      if (paired && diagonal >= removed && diagonal >= added) {
+        operations.push({ type: 'pair', before: beforeChildren[beforeIndex++], after: afterChildren[afterIndex++] });
+      } else if (removed >= added) {
+        operations.push({ type: 'removed', before: beforeChildren[beforeIndex++] });
+      } else {
+        operations.push({ type: 'added', after: afterChildren[afterIndex++] });
+      }
+    }
+    while (beforeIndex < beforeLength) operations.push({ type: 'removed', before: beforeChildren[beforeIndex++] });
+    while (afterIndex < afterLength) operations.push({ type: 'added', after: afterChildren[afterIndex++] });
+    return operations;
   }
 
   function buildDiffOperations(before, after, maxCells = 60_000) {
@@ -868,73 +1340,281 @@
     return text.match(/\s+|[\p{L}\p{N}_]+|[^\s]/gu) ?? [];
   }
 
-  function renderWordDiff(previousTarget, currentTarget, previousText, currentText) {
-    const operations = buildDiffOperations(tokenize(previousText), tokenize(currentText), 40_000);
-    for (const operation of operations) {
-      if (operation.type === 'same') {
-        pushText(previousTarget, operation.value);
-        pushText(currentTarget, operation.value);
-      } else if (operation.type === 'removed') {
-        pushMarkedText(previousTarget, operation.value, 'diff-removed');
-      } else {
-        pushMarkedText(currentTarget, operation.value, 'diff-added');
-      }
+  function stateForSnapshotNode(states, node) {
+    let state = states.get(node);
+    if (!state) {
+      state = {};
+      states.set(node, state);
     }
+    return state;
   }
 
-  function appendLineBreak(target) {
-    target.append(document.createTextNode('\n'));
+  function markSnapshotSubtree(states, node, mode) {
+    if (node) stateForSnapshotNode(states, node).mode = mode;
   }
 
-  function appendWholeLine(target, text, className) {
-    if (className) pushMarkedText(target, text, className);
-    else pushText(target, text);
-    appendLineBreak(target);
+  function changedSnapshotAttributes(before, after) {
+    const beforeAttributes = before.attributes ?? {};
+    const afterAttributes = after.attributes ?? {};
+    const names = new Set([...Object.keys(beforeAttributes), ...Object.keys(afterAttributes)]);
+    return [...names].filter((name) => beforeAttributes[name] !== afterAttributes[name]);
   }
 
-  function renderSnapshotDiff(previousSnapshot, currentSnapshot) {
-    const previousTarget = elements.previousSnapshot;
-    const currentTarget = elements.currentSnapshot;
-    previousTarget.replaceChildren();
-    currentTarget.replaceChildren();
+  function canCompareSnapshotContainers(before, after) {
+    if (before.type !== after.type) return false;
+    if (before.type === 'root' || before.type === 'template') return true;
+    if (before.type === 'code') return before.language === after.language;
+    if (before.type === 'comment') return true;
+    if (before.type === 'resource') return before.resource === after.resource;
+    return before.type === 'element' && before.tagName === after.tagName;
+  }
 
-    const beforeLines = snapshotItems(previousSnapshot);
-    const afterLines = snapshotItems(currentSnapshot);
-    if (!beforeLines.length && !afterLines.length) {
-      pushText(previousTarget, '(텍스트 없음)');
-      pushText(currentTarget, '(텍스트 없음)');
+  function compareSnapshotNodes(before, after, beforeStates, afterStates) {
+    if (!before) {
+      markSnapshotSubtree(afterStates, after, 'added');
+      return;
+    }
+    if (!after) {
+      markSnapshotSubtree(beforeStates, before, 'removed');
+      return;
+    }
+    if (before.type === 'text' && after.type === 'text') {
+      if (before.text === after.text) return;
+      const operations = buildDiffOperations(tokenize(before.text), tokenize(after.text), 40_000);
+      stateForSnapshotNode(beforeStates, before).textOperations = operations.filter((operation) => operation.type !== 'added');
+      stateForSnapshotNode(afterStates, after).textOperations = operations.filter((operation) => operation.type !== 'removed');
+      return;
+    }
+    if (before.type === 'code' && after.type === 'code') {
+      if (before.text === after.text) return;
+      const operations = buildDiffOperations(tokenize(before.text), tokenize(after.text), 40_000);
+      stateForSnapshotNode(beforeStates, before).textOperations = operations.filter((operation) => operation.type !== 'added');
+      stateForSnapshotNode(afterStates, after).textOperations = operations.filter((operation) => operation.type !== 'removed');
+      return;
+    }
+    if (before.type === 'comment' && after.type === 'comment') {
+      if (before.text === after.text) return;
+      const operations = buildDiffOperations(tokenize(before.text), tokenize(after.text), 40_000);
+      stateForSnapshotNode(beforeStates, before).textOperations = operations.filter((operation) => operation.type !== 'added');
+      stateForSnapshotNode(afterStates, after).textOperations = operations.filter((operation) => operation.type !== 'removed');
+      return;
+    }
+    if (!canCompareSnapshotContainers(before, after)) {
+      markSnapshotSubtree(beforeStates, before, 'removed');
+      markSnapshotSubtree(afterStates, after, 'added');
       return;
     }
 
-    const operations = buildDiffOperations(beforeLines, afterLines);
-    let removedLines = [];
-    let addedLines = [];
-
-    const flushChangedLines = () => {
-      const paired = Math.min(removedLines.length, addedLines.length);
-      for (let index = 0; index < paired; index += 1) {
-        renderWordDiff(previousTarget, currentTarget, removedLines[index], addedLines[index]);
-        appendLineBreak(previousTarget);
-        appendLineBreak(currentTarget);
-      }
-      removedLines.slice(paired).forEach((line) => appendWholeLine(previousTarget, line, 'diff-removed'));
-      addedLines.slice(paired).forEach((line) => appendWholeLine(currentTarget, line, 'diff-added'));
-      removedLines = [];
-      addedLines = [];
-    };
-
-    for (const operation of operations) {
-      if (operation.type === 'removed') {
-        removedLines.push(operation.value);
-      } else if (operation.type === 'added') {
-        addedLines.push(operation.value);
-      } else {
-        flushChangedLines();
-        appendWholeLine(previousTarget, operation.value);
-        appendWholeLine(currentTarget, operation.value);
+    if (before.type === 'element') {
+      const changed = changedSnapshotAttributes(before, after);
+      if (changed.length) {
+        stateForSnapshotNode(beforeStates, before).changedAttributes = changed;
+        stateForSnapshotNode(afterStates, after).changedAttributes = changed;
       }
     }
-    flushChangedLines();
+    if (before.type === 'resource') {
+      const changed = changedSnapshotAttributes(before, after);
+      if (changed.length) {
+        stateForSnapshotNode(beforeStates, before).changedAttributes = changed;
+        stateForSnapshotNode(afterStates, after).changedAttributes = changed;
+      }
+      return;
+    }
+    for (const operation of alignSnapshotChildren(before.children ?? [], after.children ?? [])) {
+      if (operation.type === 'pair') {
+        compareSnapshotNodes(operation.before, operation.after, beforeStates, afterStates);
+      } else if (operation.type === 'removed') {
+        markSnapshotSubtree(beforeStates, operation.before, 'removed');
+      } else {
+        markSnapshotSubtree(afterStates, operation.after, 'added');
+      }
+    }
+  }
+
+  function configureSnapshotAnchor(anchor, href, title = '') {
+    anchor.href = href;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    anchor.referrerPolicy = 'no-referrer';
+    anchor.title = title || href;
+  }
+
+  function appendLinkifiedSnapshotText(target, text) {
+    let cursor = 0;
+    for (const match of String(text).matchAll(/https?:\/\/[^\s<>"']+/g)) {
+      const start = match.index ?? 0;
+      const raw = match[0];
+      const href = safeSnapshotLink(raw);
+      if (!href) continue;
+      pushText(target, text.slice(cursor, start));
+      const anchor = element('a', 'snapshot-link', raw);
+      configureSnapshotAnchor(anchor, href);
+      target.append(anchor);
+      cursor = start + raw.length;
+    }
+    pushText(target, text.slice(cursor));
+  }
+
+  function appendSnapshotTextRun(target, text, mode = '', insideLink = false) {
+    if (!text) return;
+    const wrapper = mode === 'added'
+      ? element('ins', 'diff-added')
+      : mode === 'removed'
+        ? element('del', 'diff-removed')
+        : target;
+    if (insideLink) pushText(wrapper, text);
+    else appendLinkifiedSnapshotText(wrapper, text);
+    if (wrapper !== target) target.append(wrapper);
+  }
+
+  function appendSnapshotTextNode(target, node, nodeState, inheritedMode, insideLink) {
+    if (inheritedMode) {
+      appendSnapshotTextRun(target, node.text, inheritedMode, insideLink);
+      return;
+    }
+    const operations = nodeState?.textOperations ?? [{ type: 'same', value: node.text }];
+    for (const operation of operations) {
+      appendSnapshotTextRun(target, operation.value, operation.type === 'same' ? '' : operation.type, insideLink);
+    }
+  }
+
+  function applySnapshotAttributes(target, node) {
+    const attributes = node.attributes ?? {};
+    if (attributes.title) target.title = attributes.title;
+    if (attributes.ariaLabel) target.setAttribute('aria-label', attributes.ariaLabel);
+    if (attributes.dateTime) target.setAttribute('datetime', attributes.dateTime);
+    for (const name of ['colspan', 'rowspan', 'start', 'value']) {
+      if (attributes[name]) target.setAttribute(name, attributes[name]);
+    }
+    if (attributes.open) target.setAttribute('open', '');
+    if (node.tagName === 'a' && attributes.href) configureSnapshotAnchor(target, attributes.href, attributes.title);
+  }
+
+  function decorateSnapshotNode(target, node, nodeState, side, inheritedMode) {
+    const mode = nodeState?.mode ?? inheritedMode;
+    target.classList.add('snapshot-node');
+    if (mode) {
+      target.classList.add(`snapshot-${mode}`);
+      target.dataset.snapshotChange = mode;
+    }
+    if (nodeState?.changedAttributes?.length) {
+      target.classList.add('snapshot-attribute-changed');
+      target.dataset.snapshotAttributes = nodeState.changedAttributes.join(',');
+      if (node.tagName === 'a' && nodeState.changedAttributes.includes('href')) {
+        target.classList.add('snapshot-link-changed', `snapshot-link-${side}`);
+      }
+    }
+    return mode;
+  }
+
+  function appendSnapshotAttributeBadge(target, node, nodeState) {
+    const changed = nodeState?.changedAttributes;
+    if (!changed?.length) return;
+    const hrefChanged = node.tagName === 'a' && changed.includes('href');
+    const badge = element('span', `snapshot-attribute-badge${hrefChanged ? ' snapshot-link-badge' : ''}`, hrefChanged ? '↗' : '속성 변경');
+    badge.title = hrefChanged ? '링크 주소가 변경되었습니다.' : `변경된 속성: ${changed.join(', ')}`;
+    badge.setAttribute('aria-label', badge.title);
+    target.append(badge);
+  }
+
+  function appendSnapshotNode(target, node, states, side, inheritedMode = '', insideLink = false) {
+    const nodeState = states.get(node);
+    const mode = nodeState?.mode ?? inheritedMode;
+    if (node.type === 'root') {
+      node.children.forEach((child) => appendSnapshotNode(target, child, states, side, mode, false));
+      return;
+    }
+    if (node.type === 'text') {
+      appendSnapshotTextNode(target, node, nodeState, mode, insideLink);
+      return;
+    }
+    if (node.type === 'code') {
+      const shell = element('section', 'snapshot-code');
+      decorateSnapshotNode(shell, node, nodeState, side, inheritedMode);
+      shell.append(element('span', 'snapshot-code-label', node.language === 'style' ? 'Style' : 'Inline script'));
+      const code = document.createElement('pre');
+      appendSnapshotTextNode(code, node, nodeState, mode, false);
+      shell.append(code);
+      target.append(shell);
+      return;
+    }
+    if (node.type === 'comment') {
+      const shell = element('section', 'snapshot-comment');
+      decorateSnapshotNode(shell, node, nodeState, side, inheritedMode);
+      shell.append(element('span', 'snapshot-code-label', 'HTML comment'));
+      const content = document.createElement('pre');
+      appendSnapshotTextNode(content, node, nodeState, mode, false);
+      shell.append(content);
+      target.append(shell);
+      return;
+    }
+    if (node.type === 'resource') {
+      const shell = element('section', 'snapshot-resource');
+      decorateSnapshotNode(shell, node, nodeState, side, inheritedMode);
+      shell.append(element('span', 'snapshot-resource-label', 'Stylesheet'));
+      const href = node.attributes?.href;
+      if (href) {
+        const anchor = element('a', 'snapshot-link', href);
+        configureSnapshotAnchor(anchor, href);
+        shell.append(anchor);
+      }
+      appendSnapshotAttributeBadge(shell, node, nodeState);
+      target.append(shell);
+      return;
+    }
+    if (node.type === 'template') {
+      const shell = element('section', `snapshot-template${node.shadow ? ' snapshot-shadow-template' : ''}`);
+      decorateSnapshotNode(shell, node, nodeState, side, inheritedMode);
+      const label = element('span', 'snapshot-template-label', node.shadow ? 'Shadow DOM' : node.frame ? node.label : '템플릿 콘텐츠');
+      const content = element('div', 'snapshot-template-content');
+      node.children.forEach((child) => appendSnapshotNode(content, child, states, side, mode, insideLink));
+      shell.append(label, content);
+      target.append(shell);
+      return;
+    }
+    if (node.tagName === 'img') {
+      const image = element('span', 'snapshot-image', node.attributes.alt ? `이미지: ${node.attributes.alt}` : '이미지');
+      image.setAttribute('role', 'img');
+      if (node.attributes.alt) image.setAttribute('aria-label', node.attributes.alt);
+      decorateSnapshotNode(image, node, nodeState, side, inheritedMode);
+      target.append(image);
+      return;
+    }
+
+    // An untrusted or unsupported href remains visible as text, never as an
+    // inert-looking clickable anchor with an unsafe destination.
+    const rendered = document.createElement(node.tagName === 'a' && !node.attributes.href ? 'span' : node.tagName);
+    applySnapshotAttributes(rendered, node);
+    decorateSnapshotNode(rendered, node, nodeState, side, inheritedMode);
+    const childInsideLink = insideLink || (node.tagName === 'a' && Boolean(node.attributes.href));
+    if (!SNAPSHOT_VOID_TAGS.has(node.tagName)) {
+      node.children.forEach((child) => appendSnapshotNode(rendered, child, states, side, mode, childInsideLink));
+    }
+    appendSnapshotAttributeBadge(rendered, node, nodeState);
+    target.append(rendered);
+  }
+
+  function renderSnapshotTree(target, tree, states, side) {
+    target.replaceChildren();
+    target.classList.add('snapshot-render');
+    target.dataset.snapshotSide = side;
+    if (!tree.children.length) {
+      target.append(element('span', 'snapshot-empty', '(텍스트 없음)'));
+      return;
+    }
+    const documentView = element('div', 'snapshot-document');
+    tree.children.forEach((node) => appendSnapshotNode(documentView, node, states, side));
+    target.append(documentView);
+  }
+
+  function renderSnapshotDiff(previousSnapshot, currentSnapshot, fallbackBaseUrl = '', targets = elements) {
+    const beforeTree = snapshotTree(previousSnapshot, fallbackBaseUrl);
+    const afterTree = snapshotTree(currentSnapshot, fallbackBaseUrl);
+    const beforeStates = new WeakMap();
+    const afterStates = new WeakMap();
+    compareSnapshotNodes(beforeTree, afterTree, beforeStates, afterStates);
+    renderSnapshotTree(targets.previousSnapshot, beforeTree, beforeStates, 'before');
+    renderSnapshotTree(targets.currentSnapshot, afterTree, afterStates, 'after');
   }
 
   function openChange(monitor) {
@@ -945,9 +1625,132 @@
     elements.changeWhen.textContent = `감지 시각: ${formatDate(monitor.lastChangedAt ?? lastChange?.detectedAt)}`;
     renderSnapshotDiff(
       lastChange?.previous?.exists ? lastChange.previous : null,
-      current?.exists ? current : null
+      current?.exists ? current : null,
+      monitor.url
     );
     elements.changeDialog.showModal();
+  }
+
+  function evidenceSnapshot(snapshot) {
+    const html = String(snapshot?.evidenceHtml ?? '').trim();
+    const text = String(snapshot?.text ?? '').trim() || '선택 결과가 비어 있습니다.';
+    return {
+      exists: true,
+      matchCount: 1,
+      text,
+      html,
+      data: html,
+      items: [{ text }]
+    };
+  }
+
+  function renderHistoryRuns(runs) {
+    elements.historyRuns.replaceChildren();
+    const values = Array.isArray(runs) ? runs : [];
+    if (!values.length) return;
+    values.slice(0, 40).forEach((run) => {
+      const status = String(run?.status ?? 'error');
+      const line = element('div', `history-run ${status}`);
+      const summary = `${formatDate(run?.at)} · ${status}${run?.matchCount == null ? '' : ` · ${run.matchCount}개 일치`}`;
+      line.append(element('strong', '', summary));
+      if (run?.message) line.append(element('span', '', run.message));
+      elements.historyRuns.append(line);
+    });
+  }
+
+  function renderHistoryEntries(activeIndex = 0) {
+    elements.historyEntries.replaceChildren();
+    activeHistoryEntries.forEach((entry, index) => {
+      const button = element('button', `history-entry${index === activeIndex ? ' active' : ''}`);
+      button.type = 'button';
+      button.dataset.historyIndex = String(index);
+      const kind = entry.kind === 'baseline' ? '기준값' : entry.kind === 'evidence' ? '선택 실패 화면' : '변경 기록';
+      button.append(
+        element('strong', '', kind),
+        element('span', '', `${formatDate(entry.capturedAt ?? entry.snapshot?.capturedAt)} · ${entry.snapshot?.matchCount ?? 0}개 일치`)
+      );
+      elements.historyEntries.append(button);
+    });
+  }
+
+  function renderHistoryEntry(index) {
+    const selectedIndex = Math.min(Math.max(Number(index) || 0, 0), Math.max(activeHistoryEntries.length - 1, 0));
+    const current = activeHistoryEntries[selectedIndex];
+    if (!current) {
+      elements.historyWhen.textContent = '저장된 스냅샷이 없습니다.';
+      renderSnapshotDiff(null, null, activeHistoryUrl, {
+        previousSnapshot: elements.historyPreviousSnapshot,
+        currentSnapshot: elements.historyCurrentSnapshot
+      });
+      return;
+    }
+    const previous = activeHistoryEntries[selectedIndex + 1] ?? null;
+    elements.historyWhen.textContent = `${current.kind === 'baseline' ? '기준값' : current.kind === 'evidence' ? '선택 실패' : '변경'} · ${formatDate(current.capturedAt ?? current.snapshot?.capturedAt)}`;
+    renderHistoryEntries(selectedIndex);
+    renderSnapshotDiff(previous?.snapshot ?? null, current.snapshot ?? null, activeHistoryUrl, {
+      previousSnapshot: elements.historyPreviousSnapshot,
+      currentSnapshot: elements.historyCurrentSnapshot
+    });
+  }
+
+  function openHistory(monitor) {
+    const stored = Array.isArray(monitor.history) ? monitor.history.filter((entry) => entry?.snapshot) : [];
+    activeHistoryEntries = stored.length
+      ? stored
+      : monitor.snapshot ? [{ kind: 'baseline', capturedAt: monitor.snapshot.capturedAt, snapshot: monitor.snapshot }] : [];
+    activeHistoryUrl = monitor.url;
+    elements.historyTitle.textContent = `${monitor.name} 기록`;
+    elements.historyDescription.textContent = activeHistoryEntries.length
+      ? `저장된 기준값과 변경 결과 ${activeHistoryEntries.length}개를 최신순으로 표시합니다.`
+      : '저장된 스냅샷이 없습니다. 먼저 확인을 실행해 기준값을 만드세요.';
+    renderHistoryRuns(monitor.runs);
+    renderHistoryEntry(0);
+    elements.historyDialog.showModal();
+  }
+
+  function openEvidence(monitor) {
+    if (!monitor.lastErrorSnapshot?.evidenceHtml) {
+      showToast('선택 실패 당시의 화면 증거가 없습니다. 다시 확인한 뒤 시도해 주세요.');
+      return;
+    }
+    activeHistoryEntries = [{
+      kind: 'evidence',
+      capturedAt: monitor.lastErrorSnapshot.capturedAt ?? monitor.lastCheckedAt,
+      snapshot: evidenceSnapshot(monitor.lastErrorSnapshot)
+    }];
+    activeHistoryUrl = monitor.url;
+    elements.historyTitle.textContent = `${monitor.name} · 선택 실패 화면`;
+    elements.historyDescription.textContent = '선택 결과가 비었을 때 저장한 정제된 페이지 증거입니다. 마지막 정상 기준값은 변경하지 않았습니다.';
+    renderHistoryRuns(monitor.runs);
+    renderHistoryEntry(0);
+    elements.historyDialog.showModal();
+  }
+
+  function closeDialog(dialog) {
+    if (!dialog?.open) return;
+    try {
+      dialog.close();
+    } catch {
+      // A dialog can be removed while a storage refresh is pending.
+    }
+  }
+
+  function closeChangeDialog() {
+    closeDialog(elements.changeDialog);
+  }
+
+  async function acknowledgeChange() {
+    const id = elements.changeDialog.dataset.id;
+    closeChangeDialog();
+    try {
+      const response = await send({ type: 'acknowledge-monitor', id });
+      if (!response?.ok) {
+        throw new Error(response?.error || 'Could not mark the change as reviewed.');
+      }
+      await refresh();
+    } catch (error) {
+      showToast(error.message || 'Could not mark the change as reviewed.');
+    }
   }
 
   async function actionCheck(monitor, button) {
@@ -1075,6 +1878,28 @@
       case 'change':
         openChange(monitor);
         break;
+      case 'history':
+        openHistory(monitor);
+        break;
+      case 'evidence':
+        openEvidence(monitor);
+        break;
+      case 'live': {
+        button.disabled = true;
+        try {
+          const response = await send({ type: 'start-live-monitor', id: monitor.id });
+          if (!response?.ok) throw new Error(response?.error || '실시간 감시를 시작하지 못했습니다.');
+          showToast(response.initial?.needsReview
+            ? '실시간 감시는 연결했지만 현재 선택 결과가 비어 있습니다.'
+            : '열려 있는 페이지에 실시간 감시를 연결했습니다.');
+          await refresh();
+        } catch (error) {
+          showToast(error.message || '실시간 감시를 시작하지 못했습니다.');
+        } finally {
+          button.disabled = false;
+        }
+        break;
+      }
       case 'check':
         await actionCheck(monitor, button);
         break;
@@ -1120,7 +1945,7 @@
   function exportMonitors() {
     const payload = {
       format: 'openstill-export',
-      schemaVersion: 2,
+      schemaVersion: 3,
       exportedAt: new Date().toISOString(),
       monitors: state.monitors
     };
@@ -1138,7 +1963,7 @@
     try {
       if (file.size > MAX_IMPORT_BYTES) throw new Error('32 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
       const parsed = JSON.parse(await file.text());
-      if (parsed?.format !== 'openstill-export' || parsed?.schemaVersion !== 2 || !Array.isArray(parsed?.monitors)) {
+      if (parsed?.format !== 'openstill-export' || ![2, 3].includes(parsed?.schemaVersion) || !Array.isArray(parsed?.monitors)) {
         throw new Error('OpenStill 내보내기 파일 형식이 아닙니다.');
       }
       const response = await send({ type: 'import-monitors', monitors: parsed.monitors, mode: 'merge' });
@@ -1192,15 +2017,19 @@
   elements.batchUrlSource.addEventListener('input', updateBatchUrlPreview);
   elements.batchUrlTarget.addEventListener('input', updateBatchUrlPreview);
   elements.batchUrlForm.addEventListener('submit', (event) => { event.preventDefault(); void saveBatchUrl(); });
-  document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => document.querySelector(`#${button.dataset.closeDialog}`).close()));
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-close-dialog]');
+    if (!button) return;
+    closeDialog(document.getElementById(button.dataset.closeDialog));
+  });
   elements.changeOpenPage.addEventListener('click', async () => {
     const response = await send({ type: 'open-monitor-window', id: elements.changeDialog.dataset.id });
     if (!response?.ok) showToast(response?.error || '작은 창을 열지 못했습니다.');
   });
-  elements.acknowledgeButton.addEventListener('click', async () => {
-    await send({ type: 'acknowledge-monitor', id: elements.changeDialog.dataset.id });
-    elements.changeDialog.close();
-    await refresh();
+  elements.acknowledgeButton.addEventListener('click', () => void acknowledgeChange());
+  elements.historyEntries.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-history-index]');
+    if (button) renderHistoryEntry(Number(button.dataset.historyIndex));
   });
 
   let refreshQueued = false;

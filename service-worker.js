@@ -14,8 +14,15 @@ const SCHEDULE_MODES = new Set([SCHEDULE_MODE_MANUAL, SCHEDULE_MODE_INTERVAL]);
 // import of hundreds of user-configured trackers.
 const MAX_MONITORS = 1_000;
 const MAX_SELECTORS_PER_MONITOR = 20;
-const MAX_COLLECTION_ITEMS = 200;
-const MAX_SNAPSHOT_CHARS = 10_000;
+const MAX_COLLECTION_ITEMS = 10_000;
+// Storage is explicitly unlimited. Keep the canonical comparison payload much
+// larger than the dashboard preview so a change after the first few cards is
+// not silently invisible. Presentation code is responsible for clipping what
+// it renders, never the comparison engine.
+const MAX_SNAPSHOT_CHARS = 1_000_000;
+const MAX_CHANGE_HISTORY = 20;
+const MAX_RUN_HISTORY = 40;
+const ERROR_RETRY_MS = 120_000;
 const PARSE_TIMEOUT_MS = 12_000;
 const SOUND_DEBOUNCE_MS = 3_000;
 const MAX_CHECKS_PER_SWEEP = 6;
@@ -29,10 +36,16 @@ const RENDER_MINIMUM_WAIT_MS = 2_500;
 const PICKER_READY_DELAY_MS = 2_500;
 const RENDER_QUIET_MS = 650;
 const RENDER_SETTLE_TIMEOUT_MS = 5_000;
+const CHECK_EXECUTION_TIMEOUT_MS = 60_000;
+const MIN_CHECK_EXECUTION_TIMEOUT_MS = 10_000;
+const MAX_CHECK_EXECUTION_TIMEOUT_MS = 300_000;
 // Match the reference runner's empty-selection behavior: after the initial
 // rendered capture it retries every five seconds through retryCount 5.
 const RENDER_EMPTY_RETRY_COUNT = 4;
 const RENDER_EMPTY_RETRY_DELAY_MS = 5_000;
+const DEFAULT_LIVE_DEBOUNCE_MS = 1_200;
+const MIN_LIVE_DEBOUNCE_MS = 250;
+const MAX_LIVE_DEBOUNCE_MS = 30_000;
 
 const DEFAULT_SETTINGS = Object.freeze({ soundEnabled: true });
 const VALID_STATUSES = new Set([
@@ -43,6 +56,9 @@ const VALID_STATUSES = new Set([
   'permission-needed',
   'needs-baseline'
 ]);
+const LOCATOR_TYPES = new Set(['css', 'xcss', 'xpath']);
+const LOCATOR_OPERATIONS = new Set(['include', 'exclude']);
+const LOCATOR_FIELD_TYPES = new Set(['text', 'attribute', 'property']);
 
 const ELEMENT_NOT_FOUND_MESSAGE = '선택한 요소를 찾지 못했습니다. 로그인 상태나 페이지 구성, CSS 선택자를 확인해 주세요.';
 
@@ -76,6 +92,21 @@ function cleanSnapshotHtml(value, maxLength = MAX_SNAPSHOT_CHARS) {
     .replace(/\u0000/g, '')
     .trim()
     .slice(0, maxLength);
+}
+
+// A compact deterministic fingerprint lets the monitor detect a change beyond
+// the stored dashboard preview cap without silently treating two truncated
+// payloads as equal. It is not used as a security primitive.
+function snapshotFingerprint(value) {
+  const text = String(value ?? '');
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ (code + index), 0x85ebca6b) >>> 0;
+  }
+  return `${text.length.toString(36)}:${first.toString(36)}:${second.toString(36)}`;
 }
 
 function cleanShortText(value, maxLength = 180) {
@@ -250,6 +281,276 @@ function cleanSelectors(value) {
   return selectors.length ? selectors : null;
 }
 
+function cleanLocatorField(value) {
+  const raw = typeof value === 'string'
+    ? { type: value === 'text' ? 'text' : 'attribute', name: value }
+    : value && typeof value === 'object'
+      ? value
+      : null;
+  if (!raw) return null;
+  let type = String(raw.type ?? raw.kind ?? '').trim().toLowerCase();
+  let name = String(raw.name ?? raw.value ?? '').trim();
+  if (typeof value === 'string') {
+    if (value.startsWith('attr:')) {
+      type = 'attribute';
+      name = value.slice('attr:'.length).trim();
+    } else if (value.startsWith('property:')) {
+      type = 'property';
+      name = value.slice('property:'.length).trim();
+    }
+  }
+  if (type === 'builtin') type = name === 'text' ? 'text' : '';
+  if (!LOCATOR_FIELD_TYPES.has(type)) return null;
+  if (type === 'text') return { type: 'text' };
+  if (!/^[A-Za-z_$][\w$-]{0,80}$/.test(name)) return null;
+  return { type, name };
+}
+
+function cleanLocatorFields(value) {
+  const source = Array.isArray(value) ? value : value === undefined || value === null ? [] : [value];
+  const fields = [];
+  const seen = new Set();
+  for (const item of source.slice(0, 12)) {
+    const field = cleanLocatorField(item);
+    if (!field) continue;
+    const key = `${field.type}\u0000${field.name ?? ''}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      fields.push(field);
+    }
+  }
+  return fields.length ? fields : [{ type: 'text' }];
+}
+
+function cleanFramePath(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 16) return null;
+  const path = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') return null;
+    const url = normalizeUrl(entry.url);
+    const indexValue = entry.index ?? entry.siblingIndex;
+    const index = Number.isInteger(indexValue)
+      ? indexValue
+      : typeof indexValue === 'string' && /^\d+$/.test(indexValue.trim())
+        ? Number(indexValue)
+        : Number.NaN;
+    if (!url || !Number.isInteger(index) || index < 0 || index > 10_000) return null;
+    path.push({ url, index });
+  }
+  return path;
+}
+
+function cleanLocator(value, defaults = {}) {
+  const raw = typeof value === 'string' ? { expr: value } : value;
+  if (!raw || typeof raw !== 'object') return null;
+  const typeAlias = String(raw.type ?? defaults.type ?? 'css').trim().toLowerCase();
+  const type = typeAlias === 'extended-css' || typeAlias === 'extendedcss' ? 'xcss' : typeAlias;
+  if (!LOCATOR_TYPES.has(type)) return null;
+  const expr = cleanSelector(raw.expr ?? raw.selector ?? raw.value);
+  if (!expr) return null;
+  const operationAlias = String(raw.op ?? raw.operation ?? defaults.op ?? 'include').trim().toLowerCase();
+  const op = operationAlias === 'exclude' ? 'exclude' : operationAlias === 'include' ? 'include' : '';
+  if (!LOCATOR_OPERATIONS.has(op)) return null;
+  const frameValue = raw.frameId ?? raw.frame ?? defaults.frameId ?? 0;
+  const frameId = Number.isInteger(frameValue)
+    ? frameValue
+    : typeof frameValue === 'string' && /^\d+$/.test(frameValue.trim())
+      ? Number(frameValue)
+      : Number.NaN;
+  if (!Number.isInteger(frameId) || frameId < 0 || frameId > 1_000_000) return null;
+  const framePath = cleanFramePath(raw.framePath ?? raw.frameDescriptor);
+  if (framePath === null) return null;
+  return {
+    type,
+    expr,
+    op,
+    frameId,
+    framePath,
+    fields: cleanLocatorFields(raw.fields)
+  };
+}
+
+function locatorKey(locator) {
+  return [
+    locator.type,
+    locator.op,
+    locator.frameId,
+    JSON.stringify(locator.framePath ?? []),
+    locator.expr,
+    ...locator.fields.map((field) => `${field.type}:${field.name ?? ''}`)
+  ].join('\u0001');
+}
+
+function cleanLocators(value) {
+  const source = Array.isArray(value) ? value : [value];
+  if (!source.length || source.length > MAX_SELECTORS_PER_MONITOR) return null;
+  const locators = [];
+  const seen = new Set();
+  for (const item of source) {
+    const locator = cleanLocator(item);
+    if (!locator) return null;
+    const key = locatorKey(locator);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    locators.push(locator);
+  }
+  return locators.some((locator) => locator.op === 'include') ? locators : null;
+}
+
+function displaySelectorsForLocators(locators) {
+  return locators
+    .filter((locator) => locator.op === 'include')
+    .map((locator) => locator.expr);
+}
+
+function framePathForFrame(frameId, frames) {
+  if (frameId === 0) return [];
+  const byId = new Map(frames.map((frame) => [frame.frameId, frame]));
+  const path = [];
+  let current = byId.get(frameId);
+  while (current && current.parentFrameId >= 0) {
+    const url = normalizeUrl(current.url);
+    if (!url) return null;
+    // Frame ids are assigned afresh on every load.  Counting every sibling
+    // makes a saved route drift merely because an unrelated ad or widget was
+    // inserted before it, so disambiguate only among siblings with the same
+    // normalized document URL.
+    const siblings = frames
+      .filter((frame) => frame.parentFrameId === current.parentFrameId && normalizeUrl(frame.url) === url)
+      .sort((left, right) => left.frameId - right.frameId);
+    const index = siblings.findIndex((frame) => frame.frameId === current.frameId);
+    if (index < 0) return null;
+    path.unshift({ url, index });
+    current = byId.get(current.parentFrameId);
+  }
+  return current ? path : null;
+}
+
+function stableFrameLocation(value) {
+  const normalized = normalizeUrl(value);
+  if (!normalized) return null;
+  try {
+    const url = new URL(normalized);
+    // Session/query tokens on embed URLs commonly change on every reload.
+    // They are useful for an exact match first, but origin+path is the safe
+    // secondary identity when it identifies one and only one frame route.
+    url.search = '';
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function sameFramePath(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((part, index) => part.url === right[index]?.url && part.index === right[index]?.index);
+}
+
+function sameRelaxedFramePath(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((part, index) => (
+      part.index === right[index]?.index
+      && stableFrameLocation(part.url) === stableFrameLocation(right[index]?.url)
+    ));
+}
+
+function resolveLocatorFrame(locator, frames) {
+  if (locator.framePath?.length) {
+    const exact = frames.filter((frame) => sameFramePath(locator.framePath, framePathForFrame(frame.frameId, frames)));
+    if (exact.length === 1) return exact[0].frameId;
+    const relaxed = frames.filter((frame) => sameRelaxedFramePath(locator.framePath, framePathForFrame(frame.frameId, frames)));
+    if (relaxed.length === 1) return relaxed[0].frameId;
+    // A saved path is stronger evidence than Chrome's transient frame id.  Do
+    // not silently run a selector in a possibly unrelated frame after a
+    // reload: callers turn this sentinel into a clear configuration error.
+    return -1;
+  }
+  return Number.isInteger(locator.frameId) ? locator.frameId : 0;
+}
+
+function cleanRegularExpression(value) {
+  const source = typeof value === 'string'
+    ? { expr: value }
+    : value && typeof value === 'object' ? value : null;
+  if (!source) return null;
+  const expr = String(source.expr ?? source.pattern ?? source.value ?? '').trim();
+  const flags = String(source.flags ?? '').trim();
+  if (!expr) return null;
+  if (expr.length > 1_000 || flags.length > 12 || !/^[dgimsuvy]*$/.test(flags) || new Set(flags).size !== flags.length) {
+    return null;
+  }
+  try {
+    // Validate in the same JavaScript regexp engine used for a later capture.
+    // `u` and `v` are mutually exclusive even in engines that support both.
+    if (flags.includes('u') && flags.includes('v')) return null;
+    new RegExp(expr, flags);
+    return { expr, flags };
+  } catch {
+    return null;
+  }
+}
+
+function hasInvalidConfiguredRegularExpression(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const candidate = source.regexp ?? source.regex ?? source.textFilter;
+  if (candidate === undefined || candidate === null || candidate === '') return false;
+  if (typeof candidate === 'object' && !String(candidate.expr ?? candidate.pattern ?? candidate.value ?? '').trim()) return false;
+  return !cleanRegularExpression(candidate);
+}
+
+function normalizeTracking(value) {
+  const input = value && typeof value === 'object' ? value : {};
+  const requestedDataAttr = String(input.dataAttr ?? input.compare ?? input.comparison ?? 'text').toLowerCase();
+  const dataAttr = requestedDataAttr === 'data' || requestedDataAttr === 'html' ? 'data' : 'text';
+  const delayMilliseconds = Object.hasOwn(input, 'delayMilliseconds')
+    ? Number(input.delayMilliseconds)
+    : Number(input.delay ?? 0) * 1_000;
+  const timeoutMilliseconds = Object.hasOwn(input, 'timeoutMilliseconds')
+    ? Number(input.timeoutMilliseconds)
+    : Object.hasOwn(input, 'timeout')
+      ? Number(input.timeout) * 1_000
+      : CHECK_EXECUTION_TIMEOUT_MS;
+  const liveDebounce = Number(input.liveDebounceMilliseconds ?? input.liveDebounce ?? DEFAULT_LIVE_DEBOUNCE_MS);
+  return {
+    dataAttr,
+    ignoreWhitespace: input.ignoreWhitespace !== false,
+    allowEmpty: input.allowEmpty === true || input.ignoreEmptyText === false,
+    regexp: cleanRegularExpression(input.regexp ?? input.regex ?? input.textFilter),
+    includeScript: input.includeScript === true || input.includeScripts === true,
+    includeStyle: input.includeStyle === true || input.includeStyles === true,
+    keepComments: input.keepComments === true,
+    live: input.live === true || input.liveMonitoring === true,
+    liveDebounceMilliseconds: Number.isFinite(liveDebounce)
+      ? Math.max(MIN_LIVE_DEBOUNCE_MS, Math.min(MAX_LIVE_DEBOUNCE_MS, Math.round(liveDebounce)))
+      : DEFAULT_LIVE_DEBOUNCE_MS,
+    delayMilliseconds: Number.isFinite(delayMilliseconds)
+      ? Math.max(0, Math.min(60_000, Math.round(delayMilliseconds)))
+      : 0,
+    timeoutMilliseconds: Number.isFinite(timeoutMilliseconds)
+      ? Math.max(MIN_CHECK_EXECUTION_TIMEOUT_MS, Math.min(MAX_CHECK_EXECUTION_TIMEOUT_MS, Math.round(timeoutMilliseconds)))
+      : CHECK_EXECUTION_TIMEOUT_MS
+  };
+}
+
+function filterCapturedText(text, tracking) {
+  const regexp = normalizeTracking(tracking).regexp;
+  const source = String(text ?? '');
+  if (!regexp) return source;
+  try {
+    const matches = source.match(new RegExp(regexp.expr, regexp.flags));
+    return matches?.length ? matches.join(' ') : '';
+  } catch {
+    // Stored monitors are normalized before use, but preserve a deterministic
+    // empty result if a browser later rejects a previously valid regexp flag.
+    return '';
+  }
+}
+
 function snapshotTextFromItems(items) {
   return items.map((item) => item.text).join('\n\n');
 }
@@ -269,6 +570,10 @@ function normalizeSnapshot(value) {
       ? Number(value.matchCount)
       : Number.NaN;
   const rawItems = Array.isArray(value.items) ? value.items : [];
+  const fullItemTexts = rawItems.map((item) => cleanSnapshotText(item?.text, Number.MAX_SAFE_INTEGER));
+  const fullText = rawItems.length
+    ? fullItemTexts.join('\n\n')
+    : cleanSnapshotText(value.text, Number.MAX_SAFE_INTEGER);
   const itemCount = Math.min(rawItems.length, MAX_COLLECTION_ITEMS);
   const separatorLength = Math.max(0, itemCount - 1) * 2;
   const perItemLimit = itemCount
@@ -277,10 +582,18 @@ function normalizeSnapshot(value) {
   const items = rawItems.slice(0, MAX_COLLECTION_ITEMS).map((item) => ({
     text: cleanSnapshotText(item?.text, perItemLimit)
   }));
-  const html = cleanSnapshotHtml(
+  if (!items.length && fullText) items.push({ text: fullText.slice(0, MAX_SNAPSHOT_CHARS) });
+  const fullHtml = cleanSnapshotHtml(
     typeof value.html === 'string' ? value.html : snapshotHtmlFromItems(rawItems),
-    MAX_SNAPSHOT_CHARS
+    Number.MAX_SAFE_INTEGER
   );
+  const fullData = cleanSnapshotHtml(
+    typeof value.data === 'string' ? value.data : fullHtml,
+    Number.MAX_SAFE_INTEGER
+  );
+  const html = fullHtml.slice(0, MAX_SNAPSHOT_CHARS);
+  const data = fullData.slice(0, MAX_SNAPSHOT_CHARS);
+  const evidenceHtml = cleanSnapshotHtml(value.evidenceHtml, MAX_SNAPSHOT_CHARS);
   const safeMatchCount = Number.isInteger(matchCount) && matchCount >= 0
     ? matchCount
     : items.length;
@@ -291,20 +604,40 @@ function normalizeSnapshot(value) {
     matchCount: exists ? safeMatchCount : 0,
     text: exists ? snapshotTextFromItems(items) : '',
     html: exists ? html : '',
+    data: exists ? data : '',
+    evidenceHtml,
     items: exists ? items : [],
+    textFingerprint: snapshotFingerprint(fullText),
+    compactTextFingerprint: snapshotFingerprint(fullText.replace(/\s/g, '')),
+    dataFingerprint: snapshotFingerprint(fullData),
+    compactDataFingerprint: snapshotFingerprint(fullData.replace(/\s/g, '')),
+    textTruncated: fullText.length > MAX_SNAPSHOT_CHARS || rawItems.length > MAX_COLLECTION_ITEMS,
+    dataTruncated: fullData.length > MAX_SNAPSHOT_CHARS,
     capturedAt: asIso(value.capturedAt, null)
   };
 }
 
-function snapshotsEqual(left, right) {
-  // The reference monitor compares its filtered text with whitespace ignored.
+function snapshotsEqual(left, right, tracking = null) {
   // Match count and individual-root boundaries are presentation metadata, not
-  // a change by themselves (a wrapper or a re-render must not manufacture an
-  // alert when the monitored text is unchanged).
-  const comparableText = (snapshot) => cleanSnapshotText(snapshot?.text).replace(/\s/g, '');
+  // a change by themselves. The selected representation is explicit, though:
+  // `text` preserves the familiar whitespace-insensitive monitor behaviour,
+  // while `data` compares the filtered HTML so a changed href/src is visible.
+  const options = normalizeTracking(tracking);
+  const normalizeComparable = (value) => options.ignoreWhitespace
+    ? String(value ?? '').replace(/\s/g, '')
+    : String(value ?? '');
+  const field = options.dataAttr === 'data' ? 'data' : 'text';
+  const fingerprintField = field === 'data'
+    ? options.ignoreWhitespace ? 'compactDataFingerprint' : 'dataFingerprint'
+    : options.ignoreWhitespace ? 'compactTextFingerprint' : 'textFingerprint';
+  const truncatedField = field === 'data' ? 'dataTruncated' : 'textTruncated';
+  const fingerprintComparable = left?.[fingerprintField] && right?.[fingerprintField]
+    && (left?.[truncatedField] || right?.[truncatedField])
+    ? left[fingerprintField] === right[fingerprintField]
+    : null;
   return Boolean(left && right)
     && left.exists === right.exists
-    && comparableText(left) === comparableText(right);
+    && (fingerprintComparable ?? (normalizeComparable(left[field]) === normalizeComparable(right[field])));
 }
 
 function normalizeMonitor(value) {
@@ -313,22 +646,28 @@ function normalizeMonitor(value) {
   }
 
   const url = normalizeUrl(value.url);
-  const selectors = cleanSelectors(value.selectors);
+  const locators = cleanLocators(value.locators ?? value.selectors);
+  const selectors = locators ? displaySelectorsForLocators(locators) : null;
   // Pre-manual-mode monitors always used interval scheduling. Preserve that
   // behavior during migration; newly created monitors explicitly store manual.
   const scheduleMode = normalizeScheduleMode(value.scheduleMode, SCHEDULE_MODE_INTERVAL);
   const intervalHours = clampInterval(value.intervalHours)
     ?? (scheduleMode === SCHEDULE_MODE_MANUAL ? MIN_INTERVAL_HOURS : null);
-  if (!url || !selectors || !scheduleMode || !intervalHours) {
+  if (!url || !locators || !selectors || !scheduleMode || !intervalHours) {
     return null;
   }
   const createdAt = asIso(value.createdAt, nowIso());
   const lastCheckedAt = asIso(value.lastCheckedAt, null);
+  const lastChangedAt = asIso(value.lastChangedAt, null);
+  const lastViewedAt = asIso(value.lastViewedAt ?? value.lastReadAt, null);
   const status = VALID_STATUSES.has(value.status) ? value.status : 'ok';
+  const tracking = normalizeTracking(value.tracking ?? value);
   const normalizedSnapshot = normalizeSnapshot(value.snapshot);
   // A no-match result is never a baseline. Keeping it here would make the
   // next successful render look like an element deletion/reappearance change.
-  const snapshot = normalizedSnapshot?.exists ? normalizedSnapshot : null;
+  const snapshot = normalizedSnapshot && (normalizedSnapshot.exists || tracking.allowEmpty)
+    ? normalizedSnapshot
+    : null;
   const lastChange = value.lastChange && typeof value.lastChange === 'object'
     ? {
         previous: normalizeSnapshot(value.lastChange.previous),
@@ -336,6 +675,29 @@ function normalizeMonitor(value) {
         detectedAt: asIso(value.lastChange.detectedAt, null)
       }
     : null;
+  const lastErrorSnapshot = normalizeSnapshot(value.lastErrorSnapshot);
+  const history = Array.isArray(value.history)
+    ? value.history.slice(0, MAX_CHANGE_HISTORY).map((entry) => {
+        const snapshot = normalizeSnapshot(entry?.snapshot ?? entry);
+        return snapshot?.exists
+          ? {
+              snapshot,
+              capturedAt: asIso(entry?.capturedAt ?? snapshot.capturedAt, null),
+              kind: entry?.kind === 'baseline' ? 'baseline' : 'change'
+            }
+          : null;
+      }).filter(Boolean)
+    : [];
+  const runs = Array.isArray(value.runs)
+    ? value.runs.slice(0, MAX_RUN_HISTORY).map((entry) => ({
+        at: asIso(entry?.at ?? entry?.checkedAt, null),
+        status: VALID_STATUSES.has(entry?.status) ? entry.status : 'error',
+        code: cleanShortText(entry?.code, 80) || null,
+        message: cleanShortText(entry?.message ?? entry?.error, 300) || null,
+        changed: Boolean(entry?.changed),
+        matchCount: Number.isInteger(entry?.matchCount) && entry.matchCount >= 0 ? entry.matchCount : null
+      })).filter((entry) => entry.at)
+    : [];
 
   const id = typeof value.id === 'string' && value.id ? value.id.slice(0, 100) : createId();
   const revision = typeof value.revision === 'string' && value.revision.length <= 100
@@ -349,6 +711,8 @@ function normalizeMonitor(value) {
     url,
     pageTitle: cleanText(value.pageTitle, 180),
     selectors,
+    locators,
+    tracking,
     labels: cleanLabels(value.labels),
     scheduleMode,
     intervalHours,
@@ -356,14 +720,20 @@ function normalizeMonitor(value) {
     createdAt,
     updatedAt: asIso(value.updatedAt, createdAt),
     lastCheckedAt,
-    lastChangedAt: asIso(value.lastChangedAt, null),
+    lastChangedAt,
     nextCheckAt: nextCheckForSchedule(scheduleMode, lastCheckedAt, intervalHours, value.nextCheckAt),
     snapshot,
     lastChange,
+    lastErrorSnapshot,
+    history,
+    runs,
     lastReviewAt: asIso(value.lastReviewAt, null),
+    lastViewedAt,
     lastError: cleanText(value.lastError, 300) || null,
     status,
-    unread: Boolean(value.unread)
+    unread: lastChangedAt && (!lastViewedAt || Date.parse(lastViewedAt) < Date.parse(lastChangedAt))
+      ? true
+      : Boolean(value.unread)
   };
 }
 
@@ -545,10 +915,10 @@ async function ensureOffscreenDocument() {
   await offscreenCreation;
 }
 
-async function parseMonitoredHtml(html, selector) {
+async function parseMonitoredHtml(html, selector, selectorType = 'css') {
   await ensureOffscreenDocument();
   const result = await timeout(
-    chrome.runtime.sendMessage({ type: 'parse-monitor-html', html, selector }),
+    chrome.runtime.sendMessage({ type: 'parse-monitor-html', html, selector, selectorType }),
     PARSE_TIMEOUT_MS,
     '페이지 HTML을 분석하는 데 시간이 너무 오래 걸렸습니다.'
   );
@@ -565,8 +935,8 @@ async function parseMonitoredHtml(html, selector) {
   };
 }
 
-async function validateSelectorSyntax(selector) {
-  await parseMonitoredHtml('', selector);
+async function validateSelectorSyntax(selector, selectorType = 'css') {
+  await parseMonitoredHtml('', selector, selectorType);
 }
 
 function waitForRenderedTab(tabId) {
@@ -625,9 +995,445 @@ async function waitForPageLoadAndPickerDelay(tabId) {
   }
 }
 
+// Typed capture entry point. Its implementation is kept separate from the
+// legacy collector below so existing stored CSS-only monitors can migrate
+// without a behavior gap while richer locators are introduced.
+async function captureReferenceRenderedDocumentCollection(...args) {
+  const [rawLocators, minimumWaitMilliseconds, quietMilliseconds, settleTimeoutMilliseconds,
+    emptyRetryCount = 4, emptyRetryDelayMilliseconds = 5_000, captureOptions = {}] = args;
+  const includeMark = 'data-openstill-capture-include';
+  const excludeMark = 'data-openstill-capture-exclude';
+  const automaticIncludeMark = 'data-openstill-capture-automatic';
+  const includeInlineScripts = captureOptions?.includeScript === true || captureOptions?.includeScripts === true;
+  const includeStyles = captureOptions?.includeStyle === true || captureOptions?.includeStyles === true;
+  const keepComments = captureOptions?.keepComments === true;
+  const isIgnoredElement = (node) => {
+    if (node?.nodeType !== Node.ELEMENT_NODE) return true;
+    if (['NOSCRIPT', 'FRAME', 'IFRAME'].includes(node.tagName)) return true;
+    // The reference behavior includes only inline script bodies.  External
+    // scripts are never copied into a stored snapshot, even when code capture
+    // is requested, because their fetched response is not page content.
+    if (node.tagName === 'SCRIPT') return !(includeInlineScripts && !node.hasAttribute('src'));
+    if (node.tagName === 'STYLE') return !includeStyles;
+    if (node.tagName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(node.getAttribute('rel') || '')) return !includeStyles;
+    return false;
+  };
+  const blockTags = new Set([
+    'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'CAPTION', 'CODE', 'DD', 'DIV', 'FIELDSET', 'FIGCAPTION',
+    'FOOTER', 'FORM', 'HEADER', 'HR', 'LI', 'MAIN', 'OL', 'P', 'SECTION', 'SUMMARY', 'TABLE',
+    'TBODY', 'TFOOT', 'THEAD', 'TR', 'UL', 'IMG', 'BR'
+  ]);
+  const spacedTags = new Set(['A', 'ABBR', 'ACRONYM', 'ADDRESS', 'BUTTON', 'INPUT', 'LABEL', 'TD']);
+
+  const fieldOf = (value) => {
+    const raw = typeof value === 'string'
+      ? { type: value === 'text' ? 'text' : 'attribute', name: value }
+      : value && typeof value === 'object' ? value : null;
+    if (!raw) return null;
+    let type = String(raw.type ?? raw.kind ?? '').toLowerCase();
+    let name = String(raw.name ?? raw.value ?? '').trim();
+    if (typeof value === 'string' && value.startsWith('attr:')) {
+      type = 'attribute';
+      name = value.slice(5).trim();
+    }
+    if (typeof value === 'string' && value.startsWith('property:')) {
+      type = 'property';
+      name = value.slice(9).trim();
+    }
+    if (type === 'builtin') type = name === 'text' ? 'text' : '';
+    if (type === 'text') return { type: 'text' };
+    return ['attribute', 'property'].includes(type) && /^[A-Za-z_$][\w$-]{0,80}$/.test(name)
+      ? { type, name }
+      : null;
+  };
+
+  const locatorOf = (value) => {
+    const raw = typeof value === 'string' ? { expr: value } : value;
+    if (!raw || typeof raw !== 'object') return null;
+    const inputType = String(raw.type ?? 'css').trim().toLowerCase();
+    const type = inputType === 'extendedcss' || inputType === 'extended-css' ? 'xcss' : inputType;
+    const expr = String(raw.expr ?? raw.selector ?? raw.value ?? '').trim();
+    const op = String(raw.op ?? raw.operation ?? 'include').trim().toLowerCase();
+    if (!['css', 'xcss', 'xpath'].includes(type) || !expr || !['include', 'exclude'].includes(op)) return null;
+    const values = Array.isArray(raw.fields) ? raw.fields : raw.fields == null ? [] : [raw.fields];
+    const fields = [];
+    const seen = new Set();
+    for (const value of values) {
+      const field = fieldOf(value);
+      const key = field && field.type + ':' + (field.name || '');
+      if (field && !seen.has(key)) {
+        seen.add(key);
+        fields.push(field);
+      }
+    }
+    return { type, expr, op, fields: fields.length ? fields : [{ type: 'text' }], legacy: typeof value === 'string' };
+  };
+
+  const locators = (Array.isArray(rawLocators) ? rawLocators : []).map(locatorOf).filter(Boolean);
+  const includeLocators = locators.filter((locator) => locator.op === 'include');
+  const unique = (items) => [...new Set(items)];
+  const shadowFor = (element) => {
+    if (element?.nodeType !== Node.ELEMENT_NODE) return null;
+    try { return element.shadowRoot || globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element) || null; } catch { return element.shadowRoot || null; }
+  };
+
+  const splitUnion = (source) => {
+    const parts = [];
+    let value = '', quote = '', escaped = false, square = 0, round = 0;
+    for (const character of String(source || '')) {
+      if (escaped) { value += character; escaped = false; continue; }
+      if (character === '\\') { value += character; escaped = true; continue; }
+      if (quote) { value += character; if (character === quote) quote = ''; continue; }
+      if (character === "'" || character === '"') { value += character; quote = character; continue; }
+      if (character === '[') square += 1;
+      if (character === ']') square = Math.max(0, square - 1);
+      if (character === '(') round += 1;
+      if (character === ')') round = Math.max(0, round - 1);
+      if (character === ',' && !square && !round) { if (value.trim()) parts.push(value.trim()); value = ''; }
+      else value += character;
+    }
+    if (value.trim()) parts.push(value.trim());
+    return parts;
+  };
+
+  const splitSteps = (source) => {
+    const parts = [];
+    let value = '', quote = '', escaped = false, square = 0, round = 0;
+    const flush = () => { if (value.trim()) parts.push(value.trim()); value = ''; };
+    for (const character of String(source || '').trim()) {
+      if (escaped) { value += character; escaped = false; continue; }
+      if (character === '\\') { value += character; escaped = true; continue; }
+      if (quote) { value += character; if (character === quote) quote = ''; continue; }
+      if (character === "'" || character === '"') { value += character; quote = character; continue; }
+      if (character === '[') square += 1;
+      if (character === ']') square = Math.max(0, square - 1);
+      if (character === '(') round += 1;
+      if (character === ')') round = Math.max(0, round - 1);
+      if (/\s/.test(character) && !square && !round) flush(); else value += character;
+    }
+    flush();
+    for (let index = 0; index < parts.length; index += 1) {
+      if (/^[>+~]$/.test(parts[index]) && index > 0 && index < parts.length - 1) {
+        parts[index - 1] += parts[index] + parts[index + 1];
+        parts.splice(index, 2); index -= 1;
+      } else if (/[>+~]$/.test(parts[index]) && index < parts.length - 1) {
+        parts[index] += parts[index + 1]; parts.splice(index + 1, 1); index -= 1;
+      } else if (/^[>+~]/.test(parts[index]) && index > 0) {
+        parts[index - 1] += parts[index]; parts.splice(index, 1); index -= 1;
+      }
+    }
+    return parts.filter(Boolean);
+  };
+
+  const queryShadowAware = (selector, root) => {
+    const matches = [], visited = new Set();
+    const visit = (scope) => {
+      if (!scope || visited.has(scope) || typeof scope.querySelectorAll !== 'function') return;
+      visited.add(scope);
+      matches.push(...scope.querySelectorAll(selector));
+      const descendants = [...scope.querySelectorAll('*')];
+      const candidates = scope.nodeType === Node.ELEMENT_NODE ? [scope, ...descendants] : descendants;
+      for (const element of candidates) {
+        const shadow = shadowFor(element);
+        if (shadow) visit(shadow);
+      }
+    };
+    visit(root);
+    return unique(matches);
+  };
+
+  const queryXcss = (selector) => {
+    const result = [];
+    for (const branch of splitUnion(selector)) {
+      let roots = [document];
+      for (const step of splitSteps(branch)) {
+        roots = unique(roots.flatMap((root) => queryShadowAware(step, root)));
+        if (!roots.length) break;
+      }
+      result.push(...roots);
+    }
+    return unique(result);
+  };
+
+  const select = (locator) => {
+    if (locator.type === 'css') return [...document.querySelectorAll(locator.expr)].map((element) => ({ element }));
+    if (locator.type === 'xcss') return queryXcss(locator.expr).map((element) => ({ element }));
+    const iterator = document.evaluate(locator.expr, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+    const matches = [];
+    for (let node = iterator.iterateNext(); node; node = iterator.iterateNext()) {
+      if (node.nodeType === Node.ATTRIBUTE_NODE && node.ownerElement) {
+        matches.push({ element: node.ownerElement, attributeName: node.name });
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        matches.push({ element: node });
+      }
+    }
+    const seen = new Map();
+    return matches.filter((match) => {
+      const names = seen.get(match.element) || new Set();
+      const key = match.attributeName || '';
+      if (names.has(key)) return false;
+      names.add(key);
+      seen.set(match.element, names);
+      return true;
+    });
+  };
+
+  const parentAcrossShadow = (element) => element.parentElement || element.getRootNode?.().host || null;
+  const containsAcrossShadow = (ancestor, element) => {
+    for (let current = element; current; current = parentAcrossShadow(current)) if (current === ancestor) return true;
+    return false;
+  };
+  const outerHost = (element) => {
+    let current = element;
+    for (let root = current.getRootNode?.(); root?.host; root = current.getRootNode?.()) current = root.host;
+    return current;
+  };
+  const compare = (left, right) => {
+    if (left === right) return 0;
+    if (containsAcrossShadow(left, right)) return -1;
+    if (containsAcrossShadow(right, left)) return 1;
+    const position = outerHost(left).compareDocumentPosition(outerHost(right));
+    return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : position & Node.DOCUMENT_POSITION_PRECEDING ? 1 : 0;
+  };
+
+  const fieldValues = (element, fields) => fields.filter((field) => field.type !== 'text').map((field) => {
+    try {
+      return field.type === 'attribute'
+        ? element.hasAttribute(field.name) ? element.getAttribute(field.name) || '' : 'undefined'
+        : element[field.name] ?? '';
+    } catch { return ''; }
+  }).map(String).filter(Boolean);
+
+  const writeText = (root, included, excluded, automaticallyIncluded, fields) => {
+    const out = [];
+    // A slotted light-DOM node is reached through its slot and again through
+    // the host's child list. Treat the composed text tree as a tree, not a
+    // graph, so a component does not manufacture a duplicate change.
+    const visitedNodes = new Set();
+    const visit = (node, enabled, textEnabled) => {
+      if (!node || visitedNodes.has(node)) return;
+      visitedNodes.add(node);
+      if (node.nodeType === Node.TEXT_NODE) { if (enabled && textEnabled) out.push(node.nodeValue || ''); return; }
+      if (node.nodeType !== Node.ELEMENT_NODE || isIgnoredElement(node)) return;
+      let active = enabled;
+      if (excluded.has(node)) active = false;
+      else if (included.has(node)) active = true;
+      else if (automaticallyIncluded.has(node)) active = true;
+      let descendantsUseText = textEnabled;
+      const inheritedSelectedText = [...included].some((ancestor) => (
+        ancestor !== node
+        && containsAcrossShadow(ancestor, node)
+        && fields.get(ancestor)?.some((field) => field.type === 'text')
+      ));
+      if (included.has(node) && fields.has(node) && !inheritedSelectedText) {
+        descendantsUseText = fields.get(node).some((field) => field.type === 'text');
+      }
+      if (active && descendantsUseText) {
+        let block = blockTags.has(node.tagName);
+        try { block ||= getComputedStyle(node).display === 'block'; } catch { /* keep semantic block */ }
+        out.push(block ? '\n' : spacedTags.has(node.tagName) ? ' ' : '');
+      }
+      const shadow = shadowFor(node);
+      if (node.localName === 'slot') {
+        const assigned = node.assignedNodes?.({ flatten: true }) || [];
+        (assigned.length ? assigned : [...node.childNodes]).forEach((child) => visit(child, active, descendantsUseText));
+      } else {
+        if (shadow) [...shadow.childNodes].forEach((child) => visit(child, active, descendantsUseText));
+        [...node.childNodes].forEach((child) => visit(child, active, descendantsUseText));
+      }
+      if (active && fields.has(node)) fieldValues(node, fields.get(node)).forEach((value) => out.push('\n' + value + '\n'));
+    };
+    visit(root, false, true);
+    return out.join('').replace(/\s*\n+(\s*\n+)*/g, '\n').replace(/[\t\f\v ]+/g, ' ').trim();
+  };
+
+  const makeHtml = (included, excluded, automaticallyIncluded, excludedAttributes) => {
+    if (!included.size && !automaticallyIncluded.size) return '';
+    const targetDocument = document.implementation.createHTMLDocument('');
+    const clones = new Map();
+    const copy = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return targetDocument.createTextNode(node.nodeValue || '');
+      if (node.nodeType === Node.COMMENT_NODE) return keepComments ? targetDocument.createComment(node.nodeValue || '') : null;
+      if (node.nodeType !== Node.ELEMENT_NODE) return null;
+      const clone = targetDocument.importNode(node, false);
+      clones.set(node, clone);
+      [...node.childNodes].forEach((child) => { const next = copy(child); if (next) clone.append(next); });
+      const shadow = shadowFor(node);
+      if (shadow) {
+        const template = targetDocument.createElement('template');
+        template.setAttribute('shadowrootmode', 'open');
+        [...shadow.childNodes].forEach((child) => { const next = copy(child); if (next) template.content.append(next); });
+        clone.insertBefore(template, clone.firstChild);
+      }
+      return clone;
+    };
+    const rootCopy = copy(document.documentElement);
+    if (!rootCopy) return '';
+    targetDocument.replaceChild(rootCopy, targetDocument.documentElement);
+    included.forEach((node) => clones.get(node)?.setAttribute(includeMark, '1'));
+    excluded.forEach((node) => clones.get(node)?.setAttribute(excludeMark, '1'));
+    automaticallyIncluded.forEach((node) => clones.get(node)?.setAttribute(automaticIncludeMark, '1'));
+    excludedAttributes.forEach((names, node) => {
+      const clone = clones.get(node);
+      if (!clone) return;
+      names.forEach((name) => clone.removeAttribute(name));
+    });
+    const children = (node) => node.localName === 'template' ? [...node.content.childNodes] : [...node.childNodes];
+    const prune = (node, active = false) => {
+      if (node.nodeType === Node.TEXT_NODE) { if (!active) node.remove(); return active; }
+      if (node.nodeType === Node.COMMENT_NODE) { if (!keepComments || !active) node.remove(); return keepComments && active; }
+      if (node.nodeType !== Node.ELEMENT_NODE) { node.remove(); return false; }
+      if (isIgnoredElement(node)) { node.remove(); return false; }
+      let enabled = active;
+      if (node.hasAttribute(excludeMark)) enabled = false;
+      else if (node.hasAttribute(includeMark)) enabled = true;
+      else if (node.hasAttribute(automaticIncludeMark)) enabled = true;
+      const retained = children(node).map((child) => prune(child, enabled)).some(Boolean);
+      if (!enabled && !retained) { node.remove(); return false; }
+      return true;
+    };
+    prune(rootCopy);
+    const absolute = (value) => { try { return new URL(value, document.baseURI).href; } catch { return value; } };
+    const sanitize = (node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      for (const attribute of [...node.attributes]) {
+        const internalMarker = [includeMark, excludeMark, automaticIncludeMark].includes(attribute.name);
+        if (/^on/i.test(attribute.name) || attribute.name === 'integrity' || internalMarker || (attribute.name === 'style' && !includeStyles)) {
+          node.removeAttribute(attribute.name);
+        }
+      }
+      if (node.matches('a[href]')) node.setAttribute('href', absolute(node.getAttribute('href')));
+      if (node.matches('img[src],audio[src],video[src],source[src],track[src]')) node.setAttribute('src', absolute(node.getAttribute('src')));
+      if (node.hasAttribute('srcset')) {
+        node.setAttribute('srcset', node.getAttribute('srcset').split(',').map((candidate) => {
+          const pieces = candidate.trim().split(/\s+/);
+          return [absolute(pieces.shift() || ''), ...pieces].join(' ');
+        }).join(', '));
+      }
+      children(node).forEach(sanitize);
+    };
+    sanitize(rootCopy);
+    return rootCopy.outerHTML;
+  };
+
+  const waitForStable = async () => {
+    const root = document.documentElement;
+    if (!root) return;
+    const min = Math.max(0, Number(minimumWaitMilliseconds) || 0);
+    const quiet = Math.max(0, Number(quietMilliseconds) || 0);
+    const limit = Math.max(min, Number(settleTimeoutMilliseconds) || min);
+    await new Promise((resolve) => {
+      const started = performance.now(); let changed = started;
+      const observer = new MutationObserver(() => { changed = performance.now(); });
+      observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true });
+      const check = () => {
+        const now = performance.now();
+        if ((now - started >= min && now - changed >= quiet) || now - started >= limit) { observer.disconnect(); resolve(); }
+        else setTimeout(check, Math.max(25, Math.min(100, quiet || 80)));
+      };
+      setTimeout(check, Math.max(25, Math.min(100, quiet || 80)));
+    });
+  };
+
+  const capture = () => {
+    const included = new Set();
+    const excluded = new Set();
+    const automaticallyIncluded = new Set();
+    const excludedAttributes = new Map();
+    const fields = new Map();
+    const selectorMatches = [];
+    for (const locator of locators) {
+      const matches = select(locator);
+      selectorMatches.push(locator.legacy
+        ? { selector: locator.expr, matchCount: matches.length }
+        : { type: locator.type, expr: locator.expr, op: locator.op, matchCount: matches.length });
+      matches.forEach(({ element, attributeName }) => {
+        if (locator.op === 'exclude' && attributeName) {
+          const names = excludedAttributes.get(element) || new Set();
+          names.add(attributeName);
+          excludedAttributes.set(element, names);
+          return;
+        }
+        (locator.op === 'include' ? included : excluded).add(element);
+        if (locator.op === 'include') {
+          const current = fields.get(element) || [];
+          const seen = new Set(current.map((field) => field.type + ':' + (field.name || '')));
+          for (const field of locator.fields) {
+            const key = field.type + ':' + (field.name || '');
+            if (!seen.has(key)) {
+              seen.add(key);
+              current.push(field);
+            }
+          }
+          fields.set(element, current);
+        }
+      });
+    }
+    if (includeInlineScripts) {
+      document.querySelectorAll('script:not([src])').forEach((element) => automaticallyIncluded.add(element));
+    }
+    if (includeStyles) {
+      document.querySelectorAll('style, link').forEach((element) => {
+        if (element.tagName === 'STYLE' || (element.tagName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(element.getAttribute('rel') || ''))) {
+          automaticallyIncluded.add(element);
+        }
+      });
+    }
+    const rootCandidates = [...included, ...automaticallyIncluded];
+    const roots = rootCandidates
+      .filter((element) => !rootCandidates.some((candidate) => candidate !== element && containsAcrossShadow(candidate, element)))
+      .sort(compare);
+    // Empty structural roots (for example an opted-in external stylesheet)
+    // belong in the filtered HTML/data representation, not as blank lines in
+    // text-mode comparison. Match count still records that the root existed.
+    const items = roots
+      .map((root) => ({ text: writeText(root, included, excluded, automaticallyIncluded, fields) }))
+      .filter((item) => item.text);
+    const text = items.map((item) => item.text).filter(Boolean).join('\n\n');
+    const html = makeHtml(included, excluded, automaticallyIncluded, excludedAttributes);
+    return { roots, items, text, html, selectorMatches };
+  };
+
+  try {
+    if (!includeLocators.length) return { ok: true, exists: false, matchCount: 0, items: [], html: '', data: '', selectorMatches: [] };
+    await waitForStable();
+    const configuredDelay = Math.max(0, Math.min(60_000, Number(captureOptions?.delayMilliseconds) || 0));
+    if (configuredDelay) await new Promise((resolve) => setTimeout(resolve, configuredDelay));
+    let result = capture();
+    // HTML/data comparison still needs a nonempty selected text result to
+    // distinguish a real page from a broken selection, but the reference
+    // runner limits that mode to two delayed retries rather than waiting the
+    // full text-monitor retry budget.
+    const retryLimit = captureOptions?.dataAttr === 'data'
+      ? Math.min(1, Math.max(0, Number(emptyRetryCount) || 0))
+      : Math.max(0, Number(emptyRetryCount) || 0);
+    for (let attempt = 0; !captureOptions?.allowEmpty && !result.text && attempt <= retryLimit; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(emptyRetryDelayMilliseconds) || 0)));
+      result = capture();
+    }
+    const exists = captureOptions?.allowEmpty ? result.roots.length > 0 : Boolean(result.text);
+    const errorHtml = exists
+      ? ''
+      : result.html || makeHtml(new Set([document.documentElement]), new Set(), new Set(), new Map());
+    return {
+      ok: true,
+      exists,
+      matchCount: result.roots.length,
+      items: result.items,
+      text: result.text,
+      html: result.html,
+      data: result.html,
+      errorHtml,
+      selectorMatches: result.selectorMatches
+    };
+  } catch (error) {
+    return { ok: false, error: 'Selector capture could not be evaluated: ' + error.message };
+  }
+}
+
 // Reference-compatible CSS monitor capture. All scheduled captures use this
 // clone/filter/text pipeline rather than the old root-innerText collector.
-async function captureReferenceRenderedDocumentCollection(
+async function captureLegacyRenderedDocumentCollection(
   selectors,
   minimumWaitMilliseconds,
   quietMilliseconds,
@@ -901,40 +1707,104 @@ async function inspectLegacyRenderedDocumentCollection(selectors, minimumWaitMil
   }
 }
 
-async function captureRenderedSnapshot(monitor) {
+async function captureRenderedSnapshot(monitor, existingTabId = null) {
   // Pinned tabs are Chrome's favicon-only, leftmost tab UI. They make a
   // scheduled check visible without taking focus or leaving a titled tab in
-  // the strip; the tab is always removed in finally below.
-  const tab = await chrome.tabs.create({
+  // the strip; a live watcher passes an already-open tab, which this function
+  // deliberately leaves untouched after reusing the exact same capture path.
+  const ownsTab = !Number.isInteger(existingTabId);
+  const tab = ownsTab ? await chrome.tabs.create({
     url: monitor.url,
     active: false,
     pinned: true,
     index: 0
-  });
+  }) : { id: existingTabId };
   if (!Number.isInteger(tab?.id)) {
     throw new Error('Could not create a background tab for checking.');
   }
 
   let ready;
   try {
-    ready = waitForRenderedTab(tab.id);
-    await ready.promise;
-    const execution = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: captureReferenceRenderedDocumentCollection,
-      args: [
-        monitor.selectors,
-        RENDER_MINIMUM_WAIT_MS,
-        RENDER_QUIET_MS,
-        RENDER_SETTLE_TIMEOUT_MS,
-        RENDER_EMPTY_RETRY_COUNT,
-        RENDER_EMPTY_RETRY_DELAY_MS
-      ]
-    });
-    const result = execution[0]?.result;
-    if (!result?.ok) {
-      throw new Error(result?.error || '렌더링된 페이지를 확인하지 못했습니다.');
+    if (ownsTab) {
+      ready = waitForRenderedTab(tab.id);
+      await ready.promise;
     }
+    let frames = [{ frameId: 0, parentFrameId: -1 }];
+    if (monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length)) {
+      if (typeof chrome.webNavigation?.getAllFrames !== 'function') throw new Error('Subframe selector capture is unavailable.');
+      frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
+    }
+    const frameById = new Map(frames.map((frame) => [frame.frameId, frame]));
+    const frameGroups = new Map();
+    for (const locator of monitor.locators) {
+      const frameId = resolveLocatorFrame(locator, frames);
+      if (!frameGroups.has(frameId)) frameGroups.set(frameId, []);
+      frameGroups.get(frameId).push(locator);
+    }
+    const requestedFrameIds = [...frameGroups.keys()];
+    for (const frameId of requestedFrameIds) {
+      if (!frameById.has(frameId)) throw new Error(`The configured frame (${frameId}) is not available on this page.`);
+    }
+    const depthFor = (frame) => {
+      let current = frame;
+      let depth = 0;
+      while (current?.parentFrameId >= 0) { depth += 1; current = frameById.get(current.parentFrameId); }
+      return depth;
+    };
+    const captures = [];
+    for (const frame of frames.filter((frame) => frameGroups.has(frame.frameId)).sort((left, right) => depthFor(right) - depthFor(left) || right.frameId - left.frameId)) {
+      let execution;
+      try {
+        execution = await chrome.scripting.executeScript({
+          target: frame.frameId === 0 ? { tabId: tab.id } : { tabId: tab.id, frameIds: [frame.frameId] },
+          func: captureReferenceRenderedDocumentCollection,
+          args: [frameGroups.get(frame.frameId), RENDER_MINIMUM_WAIT_MS, RENDER_QUIET_MS, RENDER_SETTLE_TIMEOUT_MS,
+            RENDER_EMPTY_RETRY_COUNT, RENDER_EMPTY_RETRY_DELAY_MS, {
+              allowEmpty: monitor.tracking?.allowEmpty === true,
+              delayMilliseconds: monitor.tracking?.delayMilliseconds ?? 0,
+              includeScript: monitor.tracking?.includeScript === true,
+              includeStyle: monitor.tracking?.includeStyle === true,
+              keepComments: monitor.tracking?.keepComments === true,
+              dataAttr: monitor.tracking?.dataAttr === 'data' ? 'data' : 'text'
+            }]
+        });
+      } catch (error) {
+        throw new Error(`Could not inspect frame ${frame.frameId}: ${responseError(error)}`);
+      }
+      const frameResult = execution[0]?.result;
+      if (!frameResult?.ok) throw new Error(frameResult?.error || `Could not inspect frame ${frame.frameId}.`);
+      captures.push({ frameId: frame.frameId, result: frameResult });
+    }
+    const result = {
+      ok: true,
+      items: captures.flatMap(({ result }) => Array.isArray(result.items) ? result.items : []),
+      selectorMatches: captures.flatMap(({ frameId, result }) => (result.selectorMatches || []).map((match) => ({ ...match, frameId })))
+    };
+    result.text = result.items.map((item) => item?.text).filter(Boolean).join('\n\n');
+    // Raw <html> documents cannot be safely nested in an element.  A template
+    // keeps each subframe's serialized document intact for the dashboard's
+    // inert structural diff, while a single-frame snapshot remains compact.
+    const frameMarkup = (frameId, html) => `<openstill-frame data-frame-id="${frameId}"><template data-openstill-frame-content="1">${html || ''}</template></openstill-frame>`;
+    result.html = captures.length === 1
+      ? captures[0].result.html || ''
+      : captures.map(({ frameId, result: frameResult }) => frameMarkup(frameId, frameResult.html)).join('\n');
+    result.data = result.html;
+    const errorCaptures = captures.filter(({ result: frameResult }) => frameResult.errorHtml);
+    result.errorHtml = errorCaptures.length === 1
+      ? errorCaptures[0].result.errorHtml
+      : errorCaptures.map(({ frameId, result: frameResult }) => frameMarkup(frameId, frameResult.errorHtml)).join('\n');
+    result.matchCount = captures.reduce((total, { result: frameResult }) => (
+      total + (Number.isInteger(frameResult.matchCount) ? frameResult.matchCount : Array.isArray(frameResult.items) ? frameResult.items.length : 0)
+    ), 0);
+    const filteredText = filterCapturedText(result.text, monitor.tracking);
+    if (normalizeTracking(monitor.tracking).regexp) {
+      // A regular-expression monitor observes the matched aggregate, not each
+      // original DOM root.  Keep one ordered item so snapshot normalization
+      // cannot reconstruct the unfiltered text from the old root list.
+      result.items = [{ text: filteredText }];
+    }
+    result.text = filteredText;
+    result.exists = monitor.tracking?.allowEmpty ? result.matchCount > 0 : Boolean(result.text);
 
     const snapshot = normalizeSnapshot({
       exists: Boolean(result.exists),
@@ -942,6 +1812,8 @@ async function captureRenderedSnapshot(monitor) {
       items: result.items,
       text: Array.isArray(result.items) ? result.items.map((item) => item.text).join('\n\n') : '',
       html: result.html,
+      data: result.data ?? result.html,
+      evidenceHtml: result.errorHtml,
       capturedAt: nowIso()
     });
     if (!snapshot) {
@@ -950,13 +1822,72 @@ async function captureRenderedSnapshot(monitor) {
     return snapshot;
   } finally {
     ready?.cancel();
-    await chrome.tabs.remove(tab.id).catch(async () => {
-      // A browser can occasionally reject removal while a pinned tab is being
-      // animated into the strip. Unpin and make one final best-effort removal.
-      await chrome.tabs.update(tab.id, { pinned: false }).catch(() => undefined);
-      await chrome.tabs.remove(tab.id).catch(() => undefined);
-    });
+    if (ownsTab) {
+      await chrome.tabs.remove(tab.id).catch(async () => {
+        // A browser can occasionally reject removal while a pinned tab is being
+        // animated into the strip. Unpin and make one final best-effort removal.
+        await chrome.tabs.update(tab.id, { pinned: false }).catch(() => undefined);
+        await chrome.tabs.remove(tab.id).catch(() => undefined);
+      });
+    }
   }
+}
+
+// This function is deliberately self-contained because Chrome serializes it
+// into the monitored page.  It observes only; the service worker always makes
+// the actual typed-locator capture, so live and scheduled checks share one
+// filtering, frame, retry, and comparison implementation.
+function installLiveMutationObserver(monitorId, revision, debounceMilliseconds) {
+  const registryKey = '__openStillLiveMutationObservers';
+  const registry = globalThis[registryKey] || (globalThis[registryKey] = new Map());
+  const existing = registry.get(monitorId);
+  if (existing?.revision === revision) {
+    return { ok: true, reused: true };
+  }
+  existing?.observer?.disconnect();
+  if (existing?.timer) clearTimeout(existing.timer);
+
+  const wait = Math.max(250, Math.min(30_000, Number(debounceMilliseconds) || 1_200));
+  let timer = null;
+  const notify = () => {
+    timer = null;
+    try {
+      const sent = chrome.runtime.sendMessage({
+        type: 'live-monitor-mutated',
+        id: monitorId,
+        revision,
+        observedAt: Date.now()
+      });
+      sent?.catch?.(() => undefined);
+    } catch {
+      // A page can be unloading while the isolated world still has an observer.
+    }
+  };
+  const observer = new MutationObserver(() => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(notify, wait);
+  });
+  const root = document.documentElement;
+  if (!root) return { ok: false, error: 'The page has no document root.' };
+  observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true });
+  const record = { revision, observer, get timer() { return timer; } };
+  registry.set(monitorId, record);
+  addEventListener('pagehide', () => {
+    if (registry.get(monitorId) !== record) return;
+    observer.disconnect();
+    if (timer) clearTimeout(timer);
+    registry.delete(monitorId);
+  }, { once: true });
+  return { ok: true, reused: false };
+}
+
+function removeLiveMutationObserver(monitorId) {
+  const registry = globalThis.__openStillLiveMutationObservers;
+  const record = registry?.get(monitorId);
+  record?.observer?.disconnect();
+  if (record?.timer) clearTimeout(record.timer);
+  registry?.delete(monitorId);
+  return { ok: true };
 }
 
 async function refreshBadge(monitors = null) {
@@ -1015,6 +1946,18 @@ async function scheduleNextAlarm() {
   return operation;
 }
 
+function appendRunHistory(monitor, entry) {
+  const prior = Array.isArray(monitor.runs) ? monitor.runs : [];
+  monitor.runs = [{
+    at: asIso(entry?.at, nowIso()),
+    status: VALID_STATUSES.has(entry?.status) ? entry.status : 'error',
+    code: cleanShortText(entry?.code, 80) || null,
+    message: cleanShortText(entry?.message, 300) || null,
+    changed: Boolean(entry?.changed),
+    matchCount: Number.isInteger(entry?.matchCount) && entry.matchCount >= 0 ? entry.matchCount : null
+  }, ...prior].slice(0, MAX_RUN_HISTORY);
+}
+
 async function setCheckFailure(id, expectedRevision, status, errorMessage) {
   const checkedAt = nowIso();
   await mutateMonitors((monitors) => {
@@ -1023,18 +1966,38 @@ async function setCheckFailure(id, expectedRevision, status, errorMessage) {
       return null;
     }
     monitor.lastCheckedAt = checkedAt;
-    monitor.nextCheckAt = nextCheckForSchedule(monitor.scheduleMode, checkedAt, monitor.intervalHours);
+    monitor.nextCheckAt = isAutomaticSchedule(monitor) && monitor.snapshot
+      ? new Date(Date.now() + ERROR_RETRY_MS).toISOString()
+      : nextCheckForSchedule(monitor.scheduleMode, checkedAt, monitor.intervalHours);
     monitor.status = status;
     monitor.lastReviewAt = null;
     monitor.lastError = cleanText(errorMessage, 300);
     monitor.updatedAt = checkedAt;
+    appendRunHistory(monitor, {
+      at: checkedAt,
+      status,
+      code: status,
+      message: monitor.lastError,
+      changed: false
+    });
     return monitor;
   });
 }
 
-function statusForStoredSnapshot(snapshot) {
+function statusForStoredSnapshot(snapshot, tracking = null) {
   if (!snapshot) return 'needs-baseline';
-  return snapshot.exists ? 'ok' : 'needs-review';
+  return snapshot.exists || normalizeTracking(tracking).allowEmpty ? 'ok' : 'needs-review';
+}
+
+function appendSnapshotHistory(monitor, snapshot, kind) {
+  if (!snapshot) return;
+  const entry = {
+    snapshot,
+    capturedAt: snapshot.capturedAt ?? nowIso(),
+    kind: kind === 'baseline' ? 'baseline' : 'change'
+  };
+  const prior = Array.isArray(monitor.history) ? monitor.history : [];
+  monitor.history = [entry, ...prior].slice(0, MAX_CHANGE_HISTORY);
 }
 
 function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
@@ -1042,22 +2005,26 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
   // expired, the page can be behind a login wall, or a temporary error page can
   // be rendered. Keep the last successful snapshot so a later reappearance is
   // compared against real content instead of producing a false change.
-  if (!nextSnapshot.exists) {
+  const tracking = normalizeTracking(monitor.tracking);
+  if (!nextSnapshot.exists && !tracking.allowEmpty) {
     monitor.status = 'needs-review';
     monitor.lastReviewAt = checkedAt;
     monitor.lastError = ELEMENT_NOT_FOUND_MESSAGE;
+    monitor.lastErrorSnapshot = nextSnapshot.evidenceHtml ? nextSnapshot : null;
     return { changed: false, needsReview: true };
   }
 
   const previous = monitor.snapshot;
-  const changed = Boolean(previous) && !snapshotsEqual(previous, nextSnapshot);
+  const changed = Boolean(previous) && !snapshotsEqual(previous, nextSnapshot, tracking);
   // The reference runner only persists a baseline on the first successful
   // capture or a real filtered-text change. An equal re-render must not churn
   // the saved HTML/text history merely because its capture timestamp changed.
   if (!previous || changed) {
     monitor.snapshot = nextSnapshot;
+    appendSnapshotHistory(monitor, nextSnapshot, previous ? 'change' : 'baseline');
   }
   monitor.lastError = null;
+  monitor.lastErrorSnapshot = null;
   monitor.lastReviewAt = null;
 
   if (changed) {
@@ -1070,14 +2037,18 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
     monitor.unread = true;
     monitor.status = 'changed';
   } else {
+    if (!previous) {
+      monitor.lastViewedAt = checkedAt;
+      monitor.unread = false;
+    }
     // An unread change remains actionable after a later successful re-check.
-    monitor.status = monitor.unread ? 'changed' : 'ok';
+    monitor.status = monitor.unread ? 'changed' : statusForStoredSnapshot(monitor.snapshot, tracking);
   }
 
   return { changed, needsReview: false };
 }
 
-async function checkMonitor(id, { reschedule = true } = {}) {
+async function checkMonitorWithCapture(id, capture, { reschedule = true } = {}) {
   if (checksInProgress.has(id)) {
     return { ok: false, reason: 'checking', error: '이미 확인 중입니다.' };
   }
@@ -1098,7 +2069,12 @@ async function checkMonitor(id, { reschedule = true } = {}) {
 
     let nextSnapshot;
     try {
-      nextSnapshot = await captureRenderedSnapshot(monitor);
+      const captureTimeout = monitor.tracking?.timeoutMilliseconds ?? CHECK_EXECUTION_TIMEOUT_MS;
+      nextSnapshot = await timeout(
+        capture(monitor),
+        captureTimeout + (monitor.tracking?.delayMilliseconds ?? 0),
+        'The page capture exceeded its allowed time.'
+      );
     } catch (error) {
       const message = responseError(error);
       await setCheckFailure(id, monitor.revision, 'error', message);
@@ -1116,6 +2092,14 @@ async function checkMonitor(id, { reschedule = true } = {}) {
       current.nextCheckAt = nextCheckForSchedule(current.scheduleMode, checkedAt, current.intervalHours);
       current.updatedAt = checkedAt;
       const applied = applySnapshotOutcome(current, nextSnapshot, checkedAt);
+      appendRunHistory(current, {
+        at: checkedAt,
+        status: applied.needsReview ? 'needs-review' : applied.changed ? 'changed' : 'ok',
+        code: applied.needsReview ? 'selection-empty' : null,
+        message: applied.needsReview ? current.lastError : null,
+        changed: applied.changed,
+        matchCount: nextSnapshot.matchCount
+      });
 
       return { ok: true, ...applied, monitor: { ...current } };
     });
@@ -1133,6 +2117,103 @@ async function checkMonitor(id, { reschedule = true } = {}) {
       await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
     }
   }
+}
+
+async function checkMonitor(id, options = {}) {
+  return checkMonitorWithCapture(id, (monitor) => captureRenderedSnapshot(monitor), options);
+}
+
+async function checkMonitorInOpenTab(id, tabId, options = {}) {
+  return checkMonitorWithCapture(id, (monitor) => captureRenderedSnapshot(monitor, tabId), options);
+}
+
+function tabMatchesMonitor(tab, monitor) {
+  return Number.isInteger(tab?.id) && normalizeUrl(tab.url) === monitor.url;
+}
+
+async function liveTabForMonitor(monitor, requestedTabId = null) {
+  if (typeof chrome.tabs?.query !== 'function') {
+    throw new Error('This browser cannot inspect open tabs for live monitoring.');
+  }
+  const tabs = await chrome.tabs.query({});
+  const matching = tabs.filter((tab) => tabMatchesMonitor(tab, monitor));
+  if (Number.isInteger(requestedTabId)) {
+    const requested = matching.find((tab) => tab.id === requestedTabId);
+    if (requested) return requested;
+  }
+  return matching.sort((left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active)) || left.id - right.id)[0] ?? null;
+}
+
+async function startLiveMonitor(message) {
+  const monitor = (await getMonitors()).find((item) => item.id === message?.id);
+  if (!monitor) return { ok: false, error: '추적을 찾을 수 없습니다.' };
+  if (!monitor.enabled) return { ok: false, error: '일시 정지된 추적입니다.' };
+  if (!normalizeTracking(monitor.tracking).live) {
+    return { ok: false, error: '먼저 추적 설정에서 실시간 감시를 켜 주세요.' };
+  }
+  if (!await hasSitePermission(monitor.url)) {
+    return { ok: false, reason: 'permission', error: '이 사이트의 접근 권한이 필요합니다.' };
+  }
+  let tab;
+  try {
+    tab = await liveTabForMonitor(monitor, message?.tabId);
+  } catch (error) {
+    return { ok: false, error: responseError(error) };
+  }
+  if (!tab) {
+    return { ok: false, error: '실시간으로 감시할 열린 페이지를 찾지 못했습니다. 먼저 해당 URL을 일반 탭으로 열어 주세요.' };
+  }
+  try {
+    const installed = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      func: installLiveMutationObserver,
+      args: [monitor.id, monitor.revision, normalizeTracking(monitor.tracking).liveDebounceMilliseconds]
+    });
+    const initial = await checkMonitorInOpenTab(monitor.id, tab.id, { reschedule: false });
+    return {
+      ok: true,
+      tabId: tab.id,
+      installedFrames: installed.length,
+      initial
+    };
+  } catch (error) {
+    return { ok: false, error: responseError(error) };
+  }
+}
+
+async function stopLiveMonitor(message) {
+  const monitor = (await getMonitors()).find((item) => item.id === message?.id);
+  if (!monitor) return { ok: false, error: '추적을 찾을 수 없습니다.' };
+  let tab;
+  try {
+    tab = await liveTabForMonitor(monitor, message?.tabId);
+  } catch (error) {
+    return { ok: false, error: responseError(error) };
+  }
+  if (!tab) return { ok: true, stopped: false };
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      func: removeLiveMutationObserver,
+      args: [monitor.id]
+    });
+    return { ok: true, stopped: true, tabId: tab.id };
+  } catch (error) {
+    return { ok: false, error: responseError(error) };
+  }
+}
+
+async function handleLiveMonitorMutation(message, sender) {
+  const id = typeof message?.id === 'string' ? message.id : '';
+  const tabId = sender?.tab?.id;
+  if (!id || !Number.isInteger(tabId)) return { ok: false, ignored: true };
+  const monitor = (await getMonitors()).find((item) => item.id === id);
+  if (!monitor || !monitor.enabled || monitor.revision !== message?.revision || !normalizeTracking(monitor.tracking).live) {
+    return { ok: false, ignored: true };
+  }
+  if (!tabMatchesMonitor(sender.tab, monitor)) return { ok: false, ignored: true };
+  if (checksInProgress.has(id)) return { ok: true, pending: true };
+  return checkMonitorInOpenTab(id, tabId, { reschedule: false });
 }
 
 async function checkPage(urlValue) {
@@ -1258,9 +2339,22 @@ function selectorsEqual(left, right) {
     && left.every((selector, index) => selector === right[index]);
 }
 
-function pickerItemsFromMessage(message) {
+function locatorsEqual(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((locator, index) => locatorKey(locator) === locatorKey(right[index]));
+}
+
+function trackingEqual(left, right) {
+  return JSON.stringify(normalizeTracking(left)) === JSON.stringify(normalizeTracking(right));
+}
+
+function pickerItemsFromMessage(message, defaultFrameId = 0) {
   const rawItems = Array.isArray(message.items)
     ? message.items
+    : Array.isArray(message.locators)
+      ? message.locators
     : Array.isArray(message.selectors)
       ? message.selectors.map((selector) => ({ selector }))
       : [{ selector: message.selector }];
@@ -1270,38 +2364,63 @@ function pickerItemsFromMessage(message) {
   }
 
   const items = [];
-  const seenSelectors = new Set();
+  const seenLocators = new Set();
   for (const rawItem of rawItems) {
-    const selector = cleanSelector(typeof rawItem === 'string' ? rawItem : rawItem?.selector);
-    if (!selector) return null;
-    if (seenSelectors.has(selector)) continue;
-    seenSelectors.add(selector);
-
-    items.push({ selector });
+    const locator = cleanLocator(rawItem, { frameId: defaultFrameId });
+    if (!locator) return null;
+    const key = locatorKey(locator);
+    if (seenLocators.has(key)) continue;
+    seenLocators.add(key);
+    items.push(locator);
   }
-  return items.length ? items : null;
+  return items.some((item) => item.op === 'include') ? items : null;
 }
 
-async function validateSelectorList(selectors) {
-  for (const selector of selectors) {
-    await validateSelectorSyntax(selector);
+async function validateLocatorList(locators) {
+  for (const locator of locators) {
+    await validateSelectorSyntax(locator.expr, locator.type);
   }
 }
 
 async function createMonitors(message, sender) {
-  const url = normalizeUrl(message.url);
+  const url = normalizeUrl(sender?.tab?.url ?? message.url);
   const scheduleMode = normalizeScheduleMode(message.scheduleMode, SCHEDULE_MODE_MANUAL);
   const intervalHours = clampInterval(message.intervalHours)
     ?? (scheduleMode === SCHEDULE_MODE_MANUAL ? MIN_INTERVAL_HOURS : null);
-  const pickerItems = pickerItemsFromMessage(message);
+  const trackingInput = message.tracking ?? message;
+  const pickerItems = pickerItemsFromMessage(
+    message,
+    Number.isInteger(sender?.frameId) ? sender.frameId : 0
+  );
   if (!url || !scheduleMode || !intervalHours || !pickerItems) {
     return { ok: false, error: 'URL, 확인 방식과 간격, 그리고 하나 이상의 CSS 선택자를 확인해 주세요.' };
   }
+  if (hasInvalidConfiguredRegularExpression(trackingInput)) {
+    return { ok: false, error: '변경 내용을 거를 정규식 또는 플래그가 올바르지 않습니다.' };
+  }
 
   try {
-    await validateSelectorList(pickerItems.map((item) => item.selector));
+    await validateLocatorList(pickerItems);
   } catch (error) {
     return { ok: false, error: responseError(error) };
+  }
+  if (pickerItems.some((locator) => locator.frameId !== 0) && Number.isInteger(sender?.tab?.id)) {
+    if (typeof chrome.webNavigation?.getAllFrames !== 'function') {
+      return { ok: false, error: 'This browser cannot save subframe selections.' };
+    }
+    let frames;
+    try {
+      frames = await chrome.webNavigation.getAllFrames({ tabId: sender.tab.id });
+    } catch (error) {
+      return { ok: false, error: `Could not identify the selected frame: ${responseError(error)}` };
+    }
+    for (const locator of pickerItems) {
+      const framePath = framePathForFrame(locator.frameId, frames);
+      if (framePath === null) {
+        return { ok: false, error: `The selected frame (${locator.frameId}) cannot be stably identified.` };
+      }
+      locator.framePath = framePath;
+    }
   }
   if (!await hasSitePermission(url)) {
     return { ok: false, error: '저장하기 전에 이 사이트의 접근 권한을 허용해 주세요.' };
@@ -1314,13 +2433,14 @@ async function createMonitors(message, sender) {
   const result = await mutateMonitors((monitors) => {
     const existing = monitors.find((monitor) => monitor.url === url);
     if (existing) {
-      const knownSelectors = new Set(existing.selectors);
-      const additions = pickerItems.filter((item) => !knownSelectors.has(item.selector));
+      const knownLocators = new Set(existing.locators.map(locatorKey));
+      const additions = pickerItems.filter((item) => !knownLocators.has(locatorKey(item)));
       if (additions.length) {
-        if (existing.selectors.length + additions.length > MAX_SELECTORS_PER_MONITOR) {
+        if (existing.locators.length + additions.length > MAX_SELECTORS_PER_MONITOR) {
           return { ok: false, error: `한 주소에는 CSS 선택자를 최대 ${MAX_SELECTORS_PER_MONITOR}개까지 저장할 수 있습니다.` };
         }
-        existing.selectors = [...existing.selectors, ...additions.map((item) => item.selector)];
+        existing.locators = [...existing.locators, ...additions];
+        existing.selectors = displaySelectorsForLocators(existing.locators);
         existing.revision = createRevision();
         existing.updatedAt = timestamp;
         // A picker session only knows the elements selected in that session,
@@ -1330,10 +2450,14 @@ async function createMonitors(message, sender) {
         // a manual tracker waits for the user's explicit "check now" action.
         existing.snapshot = null;
         existing.lastChange = null;
+        existing.history = [];
+        existing.runs = [];
         existing.lastCheckedAt = null;
         existing.lastChangedAt = null;
         existing.lastReviewAt = null;
+        existing.lastViewedAt = null;
         existing.lastError = null;
+        existing.lastErrorSnapshot = null;
         existing.unread = false;
         existing.status = 'needs-baseline';
         existing.nextCheckAt = isAutomaticSchedule(existing) ? timestamp : null;
@@ -1351,7 +2475,9 @@ async function createMonitors(message, sender) {
       name: baseName,
       url,
       pageTitle,
-      selectors: pickerItems.map((item) => item.selector),
+      locators: pickerItems,
+      selectors: displaySelectorsForLocators(pickerItems),
+      tracking: normalizeTracking(trackingInput),
       labels,
       scheduleMode,
       intervalHours,
@@ -1365,8 +2491,12 @@ async function createMonitors(message, sender) {
       nextCheckAt: nextCheckForSchedule(scheduleMode, null, intervalHours, timestamp),
       snapshot: null,
       lastChange: null,
+      history: [],
+      runs: [],
       lastReviewAt: null,
+      lastViewedAt: null,
       lastError: null,
+      lastErrorSnapshot: null,
       status: 'needs-baseline',
       unread: false
     };
@@ -1391,9 +2521,19 @@ async function createMonitor(message, sender) {
 
 async function saveMonitor(message) {
   const url = normalizeUrl(message.url);
-  const selectors = cleanSelectors(Object.hasOwn(message, 'selectors') ? message.selectors : message.selector);
-  if (!message.id || !url || !selectors) {
+  const locators = cleanLocators(
+    Object.hasOwn(message, 'locators')
+      ? message.locators
+      : Object.hasOwn(message, 'selectors')
+        ? message.selectors
+        : message.selector
+  );
+  if (!message.id || !url || !locators) {
     return { ok: false, error: 'URL과 CSS 선택자를 확인해 주세요.' };
+  }
+  const trackingInput = message.tracking ?? null;
+  if (trackingInput && hasInvalidConfiguredRegularExpression(trackingInput)) {
+    return { ok: false, error: '변경 내용을 거를 정규식 또는 플래그가 올바르지 않습니다.' };
   }
 
   const existing = (await getMonitors()).find((item) => item.id === message.id);
@@ -1408,12 +2548,13 @@ async function saveMonitor(message) {
   }
 
   try {
-    await validateSelectorList(selectors);
+    await validateLocatorList(locators);
   } catch (error) {
     return { ok: false, error: responseError(error) };
   }
 
   const previousUrl = existing.url;
+  const previousTracking = normalizeTracking(existing.tracking);
   const permissionGranted = await hasSitePermission(url);
   const result = await mutateMonitors((monitors) => {
     const monitor = monitors.find((item) => item.id === message.id);
@@ -1424,12 +2565,17 @@ async function saveMonitor(message) {
       return { ok: false, error: '이 주소는 이미 다른 추적으로 관리되고 있습니다.' };
     }
 
-    const selectionChanged = monitor.url !== url || !selectorsEqual(monitor.selectors, selectors);
+    const selectionChanged = monitor.url !== url || !locatorsEqual(monitor.locators, locators);
+    const nextTracking = normalizeTracking(trackingInput ?? monitor.tracking);
+    const trackingChanged = !trackingEqual(monitor.tracking, nextTracking);
+    const captureConfigurationChanged = selectionChanged || trackingChanged;
     const scheduleChanged = monitor.scheduleMode !== scheduleMode;
     monitor.name = cleanText(message.name, 120) || monitor.name;
     monitor.revision = createRevision();
     monitor.url = url;
-    monitor.selectors = [...selectors];
+    monitor.locators = [...locators];
+    monitor.selectors = displaySelectorsForLocators(locators);
+    monitor.tracking = nextTracking;
     monitor.labels = cleanLabels(message.labels);
     monitor.scheduleMode = scheduleMode;
     monitor.intervalHours = intervalHours;
@@ -1437,31 +2583,49 @@ async function saveMonitor(message) {
     monitor.enabled = requestedEnabled && permissionGranted;
     monitor.updatedAt = nowIso();
     monitor.nextCheckAt = scheduleMode === SCHEDULE_MODE_INTERVAL
-      ? (selectionChanged || scheduleChanged
+      ? (captureConfigurationChanged || scheduleChanged
         ? monitor.updatedAt
         : addHours(monitor.lastCheckedAt ?? monitor.updatedAt, intervalHours))
       : null;
 
-    if (selectionChanged) {
+    if (captureConfigurationChanged) {
       monitor.snapshot = null;
       monitor.lastChange = null;
+      monitor.history = [];
+      monitor.runs = [];
       monitor.lastChangedAt = null;
       monitor.lastReviewAt = null;
+      monitor.lastViewedAt = null;
       monitor.lastCheckedAt = null;
       monitor.unread = false;
       monitor.status = monitor.enabled ? 'needs-baseline' : requestedEnabled ? 'permission-needed' : 'needs-baseline';
       monitor.lastError = null;
+      monitor.lastErrorSnapshot = null;
     } else if (requestedEnabled && !permissionGranted) {
       monitor.status = 'permission-needed';
       monitor.lastError = '이 사이트의 접근 권한이 필요합니다.';
     } else if (!requestedEnabled && monitor.status === 'permission-needed') {
-      monitor.status = statusForStoredSnapshot(monitor.snapshot);
+      monitor.status = statusForStoredSnapshot(monitor.snapshot, monitor.tracking);
       monitor.lastError = null;
     }
 
     return { ok: true, monitor: { ...monitor }, permissionGranted };
   });
 
+  if (result?.ok) {
+    const updatedTracking = normalizeTracking(result.monitor?.tracking);
+    const liveConfigurationChanged = existing.url !== url
+      || !locatorsEqual(existing.locators, result.monitor?.locators)
+      || !trackingEqual(previousTracking, updatedTracking);
+    if (previousTracking.live && !updatedTracking.live) {
+      await stopLiveMonitor({ id: existing.id }).catch(() => undefined);
+    } else if (updatedTracking.live && liveConfigurationChanged) {
+      // A saved selector or tracking edit creates a new revision. Reinstall on
+      // any matching open page so an older isolated-world observer cannot keep
+      // sending ignored revision messages forever.
+      await startLiveMonitor({ id: existing.id }).catch(() => undefined);
+    }
+  }
   await refreshBadge();
   await scheduleNextAlarm();
   if (previousUrl !== url) {
@@ -1481,6 +2645,9 @@ async function setMonitorEnabled(message) {
   if (enabled && !permissionGranted) {
     return { ok: false, reason: 'permission', error: '이 사이트의 접근 권한이 필요합니다.' };
   }
+  if (!enabled && normalizeTracking(monitor.tracking).live) {
+    await stopLiveMonitor({ id: monitor.id }).catch(() => undefined);
+  }
 
   await mutateMonitors((monitors) => {
     const current = monitors.find((item) => item.id === message.id);
@@ -1492,10 +2659,10 @@ async function setMonitorEnabled(message) {
     current.updatedAt = nowIso();
     current.nextCheckAt = isAutomaticSchedule(current) && enabled ? nowIso() : null;
     if (enabled && current.status === 'permission-needed') {
-      current.status = statusForStoredSnapshot(current.snapshot);
+      current.status = statusForStoredSnapshot(current.snapshot, current.tracking);
       current.lastError = null;
     } else if (!enabled && current.status === 'permission-needed') {
-      current.status = statusForStoredSnapshot(current.snapshot);
+      current.status = statusForStoredSnapshot(current.snapshot, current.tracking);
       current.lastError = null;
     }
   });
@@ -1504,6 +2671,10 @@ async function setMonitorEnabled(message) {
 }
 
 async function deleteMonitor(id) {
+  const existing = (await getMonitors()).find((item) => item.id === id);
+  if (existing && normalizeTracking(existing.tracking).live) {
+    await stopLiveMonitor({ id: existing.id }).catch(() => undefined);
+  }
   let deleted;
   await mutateMonitors((monitors) => {
     const index = monitors.findIndex((item) => item.id === id);
@@ -1527,6 +2698,11 @@ function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) 
     id: copy ? createId() : monitor.id,
     revision: createRevision(),
     url,
+    locators: monitor.locators.map((locator) => ({
+      ...locator,
+      framePath: locator.framePath.map((part) => ({ ...part })),
+      fields: locator.fields.map((field) => ({ ...field }))
+    })),
     selectors: [...monitor.selectors],
     ...(copy ? { createdAt: timestamp } : {}),
     updatedAt: timestamp,
@@ -1535,8 +2711,12 @@ function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) 
     nextCheckAt: nextCheckForSchedule(monitor.scheduleMode, null, monitor.intervalHours, timestamp),
     snapshot: null,
     lastChange: null,
+    history: [],
+    runs: [],
     lastReviewAt: null,
+    lastViewedAt: null,
     lastError: null,
+    lastErrorSnapshot: null,
     status: 'needs-baseline',
     unread: false
   };
@@ -1712,16 +2892,18 @@ async function deletePage(urlValue) {
 }
 
 async function acknowledgeMonitor(id) {
+  const viewedAt = nowIso();
   await mutateMonitors((monitors) => {
     const monitor = monitors.find((item) => item.id === id);
     if (!monitor) {
       return;
     }
     monitor.unread = false;
+    monitor.lastViewedAt = viewedAt;
     if (monitor.status === 'changed') {
-      monitor.status = statusForStoredSnapshot(monitor.snapshot);
+      monitor.status = statusForStoredSnapshot(monitor.snapshot, monitor.tracking);
     }
-    monitor.updatedAt = nowIso();
+    monitor.updatedAt = viewedAt;
   });
   await refreshBadge();
   return { ok: true };
@@ -1756,7 +2938,7 @@ async function importMonitors(message) {
   let disabledForPermission = 0;
 
   for (const raw of rawMonitors) {
-    if (!raw || !Array.isArray(raw.selectors)) {
+    if (!raw || (!Array.isArray(raw.locators) && !Array.isArray(raw.selectors))) {
       rejected += 1;
       continue;
     }
@@ -1767,7 +2949,7 @@ async function importMonitors(message) {
       continue;
     }
     try {
-      await validateSelectorList(monitor.selectors);
+      await validateLocatorList(monitor.locators);
     } catch {
       rejected += 1;
       continue;
@@ -1789,7 +2971,7 @@ async function importMonitors(message) {
       monitor.lastError = '가져온 추적에 이 사이트의 접근 권한이 필요합니다.';
       disabledForPermission += 1;
     } else if (!monitor.enabled && monitor.status === 'permission-needed') {
-      monitor.status = statusForStoredSnapshot(monitor.snapshot);
+      monitor.status = statusForStoredSnapshot(monitor.snapshot, monitor.tracking);
       monitor.lastError = null;
     }
     prepared.push(monitor);
@@ -1803,7 +2985,12 @@ async function importMonitors(message) {
     for (const preparedMonitor of prepared) {
       const monitor = {
         ...preparedMonitor,
-        selectors: [...preparedMonitor.selectors]
+        selectors: [...preparedMonitor.selectors],
+        locators: preparedMonitor.locators.map((locator) => ({
+          ...locator,
+          framePath: locator.framePath.map((part) => ({ ...part })),
+          fields: locator.fields.map((field) => ({ ...field }))
+        }))
       };
       const urlIndex = monitors.findIndex((item) => item.url === monitor.url);
       const idCollision = monitors.some((item) => item.id === monitor.id && item.url !== monitor.url);
@@ -1858,7 +3045,7 @@ async function startPicker(tabId, url) {
     // settling window before asking it for any element coordinates.
     await waitForPageLoadAndPickerDelay(tabId);
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },
       files: ['selector-engine.js', 'picker.js']
     });
   } catch (error) {
@@ -1877,6 +3064,9 @@ const messageHandlers = {
   'set-monitor-enabled': (message) => setMonitorEnabled(message),
   'delete-monitor': (message) => deleteMonitor(message.id),
   'check-monitor': (message) => checkMonitor(message.id),
+  'start-live-monitor': (message) => startLiveMonitor(message),
+  'stop-live-monitor': (message) => stopLiveMonitor(message),
+  'live-monitor-mutated': (message, sender) => handleLiveMonitorMutation(message, sender),
   'check-monitors': (message) => checkMonitors(message),
   'check-page': (message) => checkPage(message.url),
   'move-page-url': (message) => reusePageUrl(message),

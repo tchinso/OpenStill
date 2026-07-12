@@ -71,7 +71,8 @@
         <input id="editId" type="hidden">
         <label>표시 이름<input id="editName" maxlength="120" required></label>
         <label>웹페이지 주소<input id="editUrl" type="url" inputmode="url" required></label>
-        <label>CSS 선택자 <span class="field-help">한 줄에 하나씩 입력합니다. 같은 주소의 선택 결과는 하나의 목록으로 비교됩니다.</span><textarea id="editSelectors" spellcheck="false" maxlength="10000" rows="6" required></textarea></label>
+        <label>선택자 <span class="field-help">기본 CSS는 한 줄에 하나씩 입력합니다. XCSS·XPath·제외 규칙과 필드는 JSON 한 줄로도 보존할 수 있습니다.</span><textarea id="editSelectors" spellcheck="false" maxlength="10000" rows="6" required></textarea></label>
+        <fieldset><legend>변경 비교</legend><label><span>기준</span><select id="editCompareMode"><option value="text">텍스트</option><option value="data">HTML·링크</option></select></label><label><span>렌더링 대기(초)</span><input id="editDelaySeconds" type="number" min="0" max="60" step="1" inputmode="numeric"></label><label><span>최대 캡처 시간(초)</span><input id="editTimeoutSeconds" type="number" min="10" max="300" step="1" inputmode="numeric"></label><label>정규식 필터 <span class="field-help">일치한 텍스트만 비교합니다. 비우면 전체 텍스트를 비교합니다.</span><input id="editRegexp" maxlength="1000" spellcheck="false" placeholder="예: 가격:\\s*\\d+"></label><label><span>정규식 플래그</span><input id="editRegexpFlags" maxlength="12" spellcheck="false" placeholder="예: gim"></label><label class="check-row"><input id="editIgnoreWhitespace" type="checkbox"><span>공백 변경 무시</span></label><label class="check-row"><input id="editAllowEmpty" type="checkbox"><span>빈 선택 결과도 값으로 추적</span></label><label class="check-row"><input id="editIncludeStyle" type="checkbox"><span>인라인 스타일·스타일시트도 포함</span></label><label class="check-row"><input id="editIncludeScript" type="checkbox"><span>인라인 스크립트도 포함</span></label><label class="check-row"><input id="editKeepComments" type="checkbox"><span>HTML 주석도 포함</span></label><label class="check-row"><input id="editLive" type="checkbox"><span>열어 둔 페이지를 실시간으로 감시</span></label><label><span>실시간 묶음 대기(ms)</span><input id="editLiveDebounce" type="number" min="250" max="30000" step="50" inputmode="numeric"></label></fieldset>
         <label>라벨 <span class="field-help">쉼표로 여러 개를 구분</span><input id="editLabels" maxlength="500" placeholder="예: 공지, 가격"></label>
         <fieldset><legend>확인 방식</legend><label><span>방식</span><select id="editScheduleMode"><option value="manual">수동</option><option value="interval">정기 확인</option></select></label><div id="editIntervalInputs" class="interval-inputs"><label><span>일</span><select id="editDays"></select></label><label><span>시간</span><select id="editHours"></select></label></div><p id="editIntervalHelp" class="field-help"></p></fieldset>
         <label class="check-row"><input id="editEnabled" type="checkbox"><span>추적 사용</span></label>
@@ -111,6 +112,13 @@
       <p class="diff-help"><span class="diff-added">초록색</span>은 추가·수정 후 텍스트, <span class="diff-removed">빨간색</span>은 삭제·수정 전 텍스트입니다.</p>
       <div class="snapshot-grid"><section><h3>이전 텍스트</h3><pre id="previousSnapshot"></pre></section><section><h3>현재 텍스트</h3><pre id="currentSnapshot"></pre></section></div>
       <div class="dialog-actions"><button id="changeOpenPage" class="button secondary" type="button">작은 창에서 열기</button><button id="acknowledgeButton" class="button primary" type="button">확인 완료</button></div>
+    </dialog>
+
+    <dialog id="historyDialog" class="dialog history-dialog">
+      <div class="dialog-heading"><div><p class="eyebrow">추적 기록</p><h2 id="historyTitle">저장된 결과</h2></div><button class="icon-button" type="button" data-close-dialog="historyDialog" aria-label="닫기">×</button></div>
+      <p id="historyDescription" class="field-help"></p>
+      <div class="history-layout"><aside><div id="historyEntries" class="history-entries"></div><div id="historyRuns" class="history-runs"></div></aside><section class="history-preview"><p id="historyWhen" class="field-help"></p><div class="snapshot-grid"><section><h3>이전 기록</h3><pre id="historyPreviousSnapshot"></pre></section><section><h3>선택한 기록</h3><pre id="historyCurrentSnapshot"></pre></section></div></section></div>
+      <div class="dialog-actions"><button class="button primary" type="button" data-close-dialog="historyDialog">닫기</button></div>
     </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
