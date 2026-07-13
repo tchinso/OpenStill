@@ -109,6 +109,7 @@ select, input:not([type="checkbox"]):not([type="file"]), textarea { border: 1px 
 .empty-state { display: grid; place-items: center; min-height: 260px; padding: 30px; border: 1px dashed #3a506d; border-radius: 10px; color: #9db0c8; font-size: 13px; line-height: 1.6; text-align: center; }
 .empty-state strong { display: block; color: #e3edf9; font-size: 14px; }
 .dialog { width: min(620px, calc(100vw - 32px)); max-height: min(800px, calc(100vh - 32px)); padding: 0; border: 1px solid #405673; border-radius: 14px; color: var(--text); background: #172335; box-shadow: 0 24px 80px rgb(0 0 0 / 55%); }
+.change-dialog:not([open]), .history-dialog:not([open]) { display: none; }
 .dialog::backdrop { background: rgb(3 8 15 / 65%); backdrop-filter: blur(3px); }
 .dialog form, .change-dialog { display: grid; gap: 13px; padding: 19px; }
 .editor-dialog { overflow: auto; }
