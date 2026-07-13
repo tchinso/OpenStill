@@ -51,7 +51,6 @@
     editIncludeScript: document.querySelector('#editIncludeScript'),
     editKeepComments: document.querySelector('#editKeepComments'),
     editLive: document.querySelector('#editLive'),
-    editLiveDebounce: document.querySelector('#editLiveDebounce'),
     editLabels: document.querySelector('#editLabels'),
     editScheduleMode: document.querySelector('#editScheduleMode'),
     editIntervalInputs: document.querySelector('#editIntervalInputs'),
@@ -93,6 +92,76 @@
     toast: document.querySelector('#toast')
   };
 
+  function installAdvancedScheduleControls() {
+    const mode = elements.editScheduleMode;
+    if (!mode) return;
+    for (const [value, label] of [['random', '무작위 간격'], ['cron', 'CRON'], ['live', '실시간']]) {
+      if (![...mode.options].some((option) => option.value === value)) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        mode.append(option);
+      }
+    }
+    const makeNumber = (id, label, value, minimum = 5, maximum = 2_592_000) => {
+      const wrapper = document.createElement('label');
+      const caption = document.createElement('span');
+      caption.textContent = label;
+      const input = document.createElement('input');
+      input.id = id;
+      input.type = 'number';
+      input.min = String(minimum);
+      input.max = String(maximum);
+      input.step = '1';
+      input.inputMode = 'numeric';
+      input.value = String(value);
+      wrapper.append(caption, input);
+      return { wrapper, input };
+    };
+    const precise = makeNumber('editIntervalSeconds', '정확한 간격(초)', 3_600);
+    elements.editIntervalInputs.append(precise.wrapper);
+    elements.editIntervalSeconds = precise.input;
+
+    const fieldset = mode.closest('fieldset');
+    const random = document.createElement('div');
+    random.id = 'editRandomInputs';
+    random.className = 'interval-inputs';
+    random.hidden = true;
+    const randomMin = makeNumber('editRandomMinSeconds', '최소(초)', 3_600);
+    const randomMax = makeNumber('editRandomMaxSeconds', '최대(초)', 7_200);
+    random.append(randomMin.wrapper, randomMax.wrapper);
+    elements.editRandomInputs = random;
+    elements.editRandomMinSeconds = randomMin.input;
+    elements.editRandomMaxSeconds = randomMax.input;
+
+    const cron = document.createElement('div');
+    cron.id = 'editCronInputs';
+    cron.className = 'interval-inputs';
+    cron.hidden = true;
+    const expressionLabel = document.createElement('label');
+    const expressionCaption = document.createElement('span');
+    expressionCaption.textContent = '식 (분 시 일 월 요일)';
+    const expression = document.createElement('input');
+    expression.id = 'editCronExpression';
+    expression.maxLength = 160;
+    expression.placeholder = '0 3 * * *';
+    expressionLabel.append(expressionCaption, expression);
+    const timezoneLabel = document.createElement('label');
+    const timezoneCaption = document.createElement('span');
+    timezoneCaption.textContent = '시간대 (선택)';
+    const timezone = document.createElement('input');
+    timezone.id = 'editCronTimezone';
+    timezone.maxLength = 80;
+    timezone.placeholder = 'Asia/Seoul';
+    timezoneLabel.append(timezoneCaption, timezone);
+    cron.append(expressionLabel, timezoneLabel);
+    elements.editCronInputs = cron;
+    elements.editCronExpression = expression;
+    elements.editCronTimezone = timezone;
+    fieldset.insertBefore(random, elements.editIntervalHelp);
+    fieldset.insertBefore(cron, elements.editIntervalHelp);
+  }
+
   function send(message) {
     return chrome.runtime.sendMessage(message);
   }
@@ -114,7 +183,9 @@
           op: item.op === 'exclude' ? 'exclude' : 'include',
           frameId: Number.isInteger(item.frameId) ? item.frameId : 0,
           framePath: Array.isArray(item.framePath) ? item.framePath : [],
-          fields: Array.isArray(item.fields) ? item.fields : [{ type: 'text' }]
+          ...(Number.isInteger(item.frameOrder) ? { frameOrder: item.frameOrder } : {}),
+          fields: Array.isArray(item.fields) ? item.fields : [{ type: 'text' }],
+          ...(item.fieldsSpecified === true ? { fieldsSpecified: true } : {})
         }))
         .filter((item) => item.expr);
     }
@@ -135,6 +206,7 @@
       && locator.op === 'include'
       && locator.frameId === 0
       && !locator.framePath?.length
+      && locator.fieldsSpecified !== true
       && (!locator.fields?.length || locator.fields.every((field) => field?.type === 'text'));
     return basic ? locator.expr : JSON.stringify(locator);
   }
@@ -190,6 +262,37 @@
     return scheduleModeOf(monitor) === 'manual' ? '수동' : formatDuration(monitor.intervalHours);
   }
 
+  // Expanded schedule descriptors are intentionally decoded in the dashboard
+  // rather than flattened to the legacy intervalHours field.
+  function scheduleModeOf(monitor) {
+    const type = String(monitor?.schedule?.type ?? monitor?.scheduleMode ?? 'manual').toLowerCase();
+    return ['manual', 'interval', 'random', 'cron', 'live'].includes(type) ? type : 'manual';
+  }
+
+  function formatSeconds(seconds) {
+    const value = Math.max(0, Math.round(Number(seconds) || 0));
+    const days = Math.floor(value / 86_400);
+    const hours = Math.floor((value % 86_400) / 3_600);
+    const minutes = Math.floor((value % 3_600) / 60);
+    const rest = value % 60;
+    return [
+      days ? `${days}일` : '',
+      hours ? `${hours}시간` : '',
+      minutes ? `${minutes}분` : '',
+      rest || !value ? `${rest}초` : ''
+    ].filter(Boolean).join(' ');
+  }
+
+  function formatSchedule(monitor) {
+    const type = scheduleModeOf(monitor);
+    const params = monitor?.schedule?.params ?? {};
+    if (type === 'manual') return '수동';
+    if (type === 'live') return '실시간';
+    if (type === 'random') return `무작위 ${formatSeconds(params.min)}–${formatSeconds(params.max)}`;
+    if (type === 'cron') return `CRON ${params.expr || ''}`.trim();
+    return formatSeconds(params.interval ?? monitor?.intervalSeconds ?? Number(monitor?.intervalHours || 0) * 3_600);
+  }
+
   function formatDate(iso) {
     const timestamp = Date.parse(iso ?? '');
     if (!Number.isFinite(timestamp)) return '아직 없음';
@@ -239,7 +342,8 @@
   function pagePath(url) {
     try {
       const parsed = new URL(url);
-      return `${parsed.pathname === '/' ? '홈' : parsed.pathname}${parsed.search}`;
+      // Fragments are part of a monitor's page identity for hash-routed apps.
+      return `${parsed.pathname === '/' ? '홈' : parsed.pathname}${parsed.search}${parsed.hash}`;
     } catch {
       return url;
     }
@@ -682,6 +786,44 @@
     return total;
   }
 
+  function updateEditorInterval() {
+    const rawMode = elements.editScheduleMode.value;
+    const scheduleMode = ['manual', 'interval', 'random', 'cron', 'live'].includes(rawMode) ? rawMode : 'manual';
+    const days = Number(elements.editDays.value);
+    const hours = Number(elements.editHours.value);
+    const friendlySeconds = Math.max(0, Math.round((days * 24 + hours) * 3_600));
+    const intervalSeconds = Number(elements.editIntervalSeconds?.value || friendlySeconds);
+    const randomMin = Number(elements.editRandomMinSeconds?.value || 0);
+    const randomMax = Number(elements.editRandomMaxSeconds?.value || 0);
+    elements.editIntervalInputs.hidden = scheduleMode !== 'interval';
+    elements.editRandomInputs.hidden = scheduleMode !== 'random';
+    elements.editCronInputs.hidden = scheduleMode !== 'cron';
+    if (elements.editLive) {
+      if (scheduleMode === 'live') elements.editLive.checked = true;
+      elements.editLive.disabled = scheduleMode === 'live';
+    }
+    const validInterval = Number.isInteger(intervalSeconds) && intervalSeconds >= 5 && intervalSeconds <= 2_592_000;
+    const validRandom = Number.isInteger(randomMin) && Number.isInteger(randomMax)
+      && randomMin >= 5 && randomMax <= 2_592_000 && randomMin <= randomMax;
+    const validCron = Boolean(elements.editCronExpression?.value.trim());
+    elements.editIntervalHelp.textContent = scheduleMode === 'manual'
+      ? '수동 확인만 수행합니다.'
+      : scheduleMode === 'live'
+        ? '열려 있는 동일 페이지에 자동으로 실시간 감시를 연결합니다.'
+        : scheduleMode === 'interval'
+          ? (validInterval ? `매 ${formatSeconds(intervalSeconds)}마다 확인합니다.` : '간격은 5초에서 30일 사이의 정수여야 합니다.')
+          : scheduleMode === 'random'
+            ? (validRandom ? `${formatSeconds(randomMin)}~${formatSeconds(randomMax)} 사이에서 무작위로 확인합니다.` : '최소/최대는 5초에서 30일 사이의 정수이며 최소가 더 작아야 합니다.')
+            : validCron ? 'CRON 식과 선택 시간대로 다음 실행 시각을 계산합니다.' : 'CRON 식을 입력하세요.';
+    return { scheduleMode, intervalSeconds, randomMin, randomMax, validInterval, validRandom, validCron };
+  }
+
+  function syncIntervalSecondsFromFriendlyInputs() {
+    const seconds = (Number(elements.editDays.value) * 24 + Number(elements.editHours.value)) * 3_600;
+    if (elements.editIntervalSeconds) elements.editIntervalSeconds.value = String(seconds);
+    updateEditorInterval();
+  }
+
   function openEditor(monitor) {
     elements.editId.value = monitor.id;
     elements.editName.value = monitor.name;
@@ -698,11 +840,18 @@
     elements.editIncludeScript.checked = monitor.tracking?.includeScript === true;
     elements.editKeepComments.checked = monitor.tracking?.keepComments === true;
     elements.editLive.checked = monitor.tracking?.live === true;
-    elements.editLiveDebounce.value = String(Number(monitor.tracking?.liveDebounceMilliseconds) || 1_200);
     elements.editLabels.value = (monitor.labels ?? []).join(', ');
     elements.editScheduleMode.value = scheduleModeOf(monitor);
-    elements.editDays.value = String(Math.floor(monitor.intervalHours / 24));
-    elements.editHours.value = String(monitor.intervalHours % 24);
+    const scheduleParams = monitor.schedule?.params ?? {};
+    const intervalSeconds = Number(scheduleParams.interval ?? monitor.intervalSeconds ?? Number(monitor.intervalHours || 1) * 3_600);
+    elements.editIntervalSeconds.value = String(Number.isFinite(intervalSeconds) ? intervalSeconds : 3_600);
+    elements.editRandomMinSeconds.value = String(Number(scheduleParams.min ?? 3_600));
+    elements.editRandomMaxSeconds.value = String(Number(scheduleParams.max ?? 7_200));
+    elements.editCronExpression.value = String(scheduleParams.expr ?? '0 3 * * *');
+    elements.editCronTimezone.value = String(scheduleParams.tz ?? '');
+    const friendlyHours = Math.max(0, Math.min(336, Math.floor(intervalSeconds / 3_600)));
+    elements.editDays.value = String(Math.floor(friendlyHours / 24));
+    elements.editHours.value = String(friendlyHours % 24);
     elements.editEnabled.checked = monitor.enabled;
     elements.editorMessage.textContent = '';
     updateEditorInterval();
@@ -711,8 +860,8 @@
 
   async function saveEditor() {
     const id = elements.editId.value;
-    const totalHours = updateEditorInterval();
-    const scheduleMode = elements.editScheduleMode.value === 'interval' ? 'interval' : 'manual';
+    const scheduleDraft = updateEditorInterval();
+    const { scheduleMode, intervalSeconds, randomMin, randomMax, validInterval, validRandom, validCron } = scheduleDraft;
     const url = elements.editUrl.value.trim();
     const locators = elements.editSelectors.value
       .split(/\r?\n/)
@@ -720,10 +869,15 @@
       .filter(Boolean);
     const delaySeconds = Number(elements.editDelaySeconds.value || 0);
     const timeoutSeconds = Number(elements.editTimeoutSeconds.value || 60);
-    const liveDebounce = Number(elements.editLiveDebounce.value || 1_200);
     const regexp = elements.editRegexp.value.trim();
     const regexpFlags = elements.editRegexpFlags.value.trim();
-    if (!id || !url || !locators.some((locator) => locator.op !== 'exclude') || (scheduleMode === 'interval' && (totalHours < MIN_HOURS || totalHours > MAX_HOURS))) {
+    // An empty locator editor intentionally means the Reference full-page
+    // default (`body`). Exclude-only input remains invalid because it has no
+    // positive capture root.
+    if (!id || !url || (locators.length && !locators.some((locator) => locator.op !== 'exclude'))
+      || (scheduleMode === 'interval' && !validInterval)
+      || (scheduleMode === 'random' && !validRandom)
+      || (scheduleMode === 'cron' && !validCron)) {
       elements.editorMessage.textContent = '필수 정보와 확인 간격을 확인해 주세요.';
       return;
     }
@@ -735,17 +889,26 @@
       elements.editorMessage.textContent = '최대 캡처 시간은 10초에서 300초 사이의 정수여야 합니다.';
       return;
     }
-    if (!Number.isFinite(liveDebounce) || liveDebounce < 250 || liveDebounce > 30_000 || !Number.isInteger(liveDebounce)) {
-      elements.editorMessage.textContent = '실시간 묶음 대기는 250ms에서 30초 사이의 정수여야 합니다.';
-      return;
-    }
-
     let enabled = elements.editEnabled.checked;
     if (enabled && !await requestSitePermission(url)) {
       enabled = false;
       elements.editEnabled.checked = false;
       elements.editorMessage.textContent = '권한을 허용하지 않아 일시정지 상태로 저장합니다.';
     }
+
+    const schedule = scheduleMode === 'interval'
+      ? { type: 'interval', params: { interval: intervalSeconds } }
+      : scheduleMode === 'random'
+        ? { type: 'random', params: { min: randomMin, max: randomMax } }
+        : scheduleMode === 'cron'
+          ? {
+              type: 'cron',
+              params: {
+                expr: elements.editCronExpression.value.trim(),
+                ...(elements.editCronTimezone.value.trim() ? { tz: elements.editCronTimezone.value.trim() } : {})
+              }
+            }
+          : { type: scheduleMode, params: {} };
 
     const response = await send({
       type: 'save-monitor',
@@ -763,12 +926,13 @@
         includeStyle: elements.editIncludeStyle.checked,
         includeScript: elements.editIncludeScript.checked,
         keepComments: elements.editKeepComments.checked,
-        live: elements.editLive.checked,
-        liveDebounceMilliseconds: liveDebounce
+        live: elements.editLive.checked || scheduleMode === 'live'
       },
       labels: elements.editLabels.value.split(','),
       scheduleMode,
-      intervalHours: totalHours,
+      schedule,
+      intervalSeconds,
+      intervalHours: intervalSeconds / 3_600,
       enabled
     });
     if (!response?.ok) {
@@ -1958,15 +2122,27 @@
     URL.revokeObjectURL(url);
   }
 
+  function importMonitorRecords(payload) {
+    if (payload?.format === 'openstill-export' && [2, 3].includes(payload?.schemaVersion) && Array.isArray(payload?.monitors)) {
+      return payload.monitors;
+    }
+    // Reference Chrome backups are either the bare sieve array or a wrapper
+    // with `sieves`. Keep the records intact; the worker performs the typed
+    // selector/schedule conversion and rejects unsupported data sources.
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.sieves)) return payload.sieves;
+    if (Array.isArray(payload?.sieve_backup)) return payload.sieve_backup;
+    return null;
+  }
+
   async function importMonitors(file) {
     if (!file) return;
     try {
       if (file.size > MAX_IMPORT_BYTES) throw new Error('32 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
       const parsed = JSON.parse(await file.text());
-      if (parsed?.format !== 'openstill-export' || ![2, 3].includes(parsed?.schemaVersion) || !Array.isArray(parsed?.monitors)) {
-        throw new Error('OpenStill 내보내기 파일 형식이 아닙니다.');
-      }
-      const response = await send({ type: 'import-monitors', monitors: parsed.monitors, mode: 'merge' });
+      const monitors = importMonitorRecords(parsed);
+      if (!monitors) throw new Error('OpenStill 또는 Reference 내보내기 파일 형식이 아닙니다.');
+      const response = await send({ type: 'import-monitors', monitors, mode: 'merge' });
       if (!response?.ok) throw new Error(response?.error || '불러오지 못했습니다.');
       showToast(`${response.imported}개를 불러왔습니다.${response.rejected ? ` ${response.rejected}개는 유효하지 않거나 최대 100개 제한을 넘어 제외했습니다.` : ''}${response.disabledForPermission ? ` ${response.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}`);
       await refresh();
@@ -2009,8 +2185,14 @@
   elements.exportButton.addEventListener('click', exportMonitors);
   elements.importButton.addEventListener('click', () => elements.importInput.click());
   elements.importInput.addEventListener('change', () => void importMonitors(elements.importInput.files?.[0]));
-  elements.editDays.addEventListener('change', updateEditorInterval);
-  elements.editHours.addEventListener('change', updateEditorInterval);
+  installAdvancedScheduleControls();
+  elements.editDays.addEventListener('change', syncIntervalSecondsFromFriendlyInputs);
+  elements.editHours.addEventListener('change', syncIntervalSecondsFromFriendlyInputs);
+  elements.editIntervalSeconds.addEventListener('input', updateEditorInterval);
+  elements.editRandomMinSeconds.addEventListener('input', updateEditorInterval);
+  elements.editRandomMaxSeconds.addEventListener('input', updateEditorInterval);
+  elements.editCronExpression.addEventListener('input', updateEditorInterval);
+  elements.editCronTimezone.addEventListener('input', updateEditorInterval);
   elements.editScheduleMode.addEventListener('change', updateEditorInterval);
   elements.editorForm.addEventListener('submit', (event) => { event.preventDefault(); void saveEditor(); });
   elements.pageUrlForm.addEventListener('submit', (event) => { event.preventDefault(); void savePageUrl(); });

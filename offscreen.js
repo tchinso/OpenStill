@@ -52,7 +52,11 @@
         const result = document.evaluate(
           selector.trim(),
           root,
-          null,
+          // Keep validation semantics aligned with the rendered-page
+          // collector.  HTML documents commonly use the `xhtml:` prefix in
+          // portable XPath locators; native evaluate otherwise treats it as
+          // an unknown namespace and rejects a locator which capture accepts.
+          (prefix) => prefix === 'xhtml' ? 'http://www.w3.org/1999/xhtml' : null,
           XPathResult.ORDERED_NODE_ITERATOR_TYPE,
           null
         );

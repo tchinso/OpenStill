@@ -3,13 +3,34 @@
 const MONITORS_KEY = 'openStill.monitors.v2';
 const SETTINGS_KEY = 'openStill.settings.v1';
 const PENDING_PICKERS_KEY = 'openStill.pending-pickers.v1';
+const LIVE_CONTROLLED_TABS_KEY = 'openStill.live-controlled-tabs.v1';
 const ALARM_NAME = 'openStill.next-check';
 
 const MIN_INTERVAL_HOURS = 1;
 const MAX_INTERVAL_HOURS = 14 * 24;
+// The local reference scheduler accepts five-second schedules. Chrome alarms
+// cannot reliably wake an MV3 worker that often, so short schedules use an
+// in-worker precision timer plus a durable alarm fallback (see
+// scheduleNextAlarm).
+const MIN_SCHEDULE_SECONDS = 5;
+const MIN_CHROME_ALARM_DELAY_MS = 30_000;
+// The reference scheduler treats a 30-day-or-longer duration as an
+// intentionally unscheduled (effectively infinite) interval.  Keep that
+// value representable for imports, but never arm an alarm for it.
+const INFINITE_SCHEDULE_SECONDS = 30 * 24 * 60 * 60;
+const MAX_SCHEDULE_SECONDS = INFINITE_SCHEDULE_SECONDS;
 const SCHEDULE_MODE_MANUAL = 'manual';
 const SCHEDULE_MODE_INTERVAL = 'interval';
-const SCHEDULE_MODES = new Set([SCHEDULE_MODE_MANUAL, SCHEDULE_MODE_INTERVAL]);
+const SCHEDULE_MODE_RANDOM = 'random';
+const SCHEDULE_MODE_CRON = 'cron';
+const SCHEDULE_MODE_LIVE = 'live';
+const SCHEDULE_MODES = new Set([
+  SCHEDULE_MODE_MANUAL,
+  SCHEDULE_MODE_INTERVAL,
+  SCHEDULE_MODE_RANDOM,
+  SCHEDULE_MODE_CRON,
+  SCHEDULE_MODE_LIVE
+]);
 // unlimitedStorage prevents a few large snapshots from blocking a legitimate
 // import of hundreds of user-configured trackers.
 const MAX_MONITORS = 1_000;
@@ -22,7 +43,6 @@ const MAX_COLLECTION_ITEMS = 10_000;
 const MAX_SNAPSHOT_CHARS = 1_000_000;
 const MAX_CHANGE_HISTORY = 20;
 const MAX_RUN_HISTORY = 40;
-const ERROR_RETRY_MS = 120_000;
 const PARSE_TIMEOUT_MS = 12_000;
 const SOUND_DEBOUNCE_MS = 3_000;
 const MAX_CHECKS_PER_SWEEP = 6;
@@ -30,12 +50,10 @@ const MAX_BATCH_CHECKS = 1_000;
 const MAX_CONCURRENT_BATCH_CHECKS = 3;
 const PENDING_PICKER_TTL_MS = 2 * 60 * 60 * 1000;
 const RENDER_LOAD_TIMEOUT_MS = 30_000;
-// Never inspect a page or calculate picker coordinates before the top-level load
-// event has completed and this additional settling period has elapsed.
-const RENDER_MINIMUM_WAIT_MS = 2_500;
+// Picker interaction deliberately waits for a settled page. Scheduled capture
+// follows the Reference runner's DOMContentLoaded + fixed two-second gate,
+// then applies the monitor's explicit delay.
 const PICKER_READY_DELAY_MS = 2_500;
-const RENDER_QUIET_MS = 650;
-const RENDER_SETTLE_TIMEOUT_MS = 5_000;
 const CHECK_EXECUTION_TIMEOUT_MS = 60_000;
 const MIN_CHECK_EXECUTION_TIMEOUT_MS = 10_000;
 const MAX_CHECK_EXECUTION_TIMEOUT_MS = 300_000;
@@ -43,9 +61,6 @@ const MAX_CHECK_EXECUTION_TIMEOUT_MS = 300_000;
 // rendered capture it retries every five seconds through retryCount 5.
 const RENDER_EMPTY_RETRY_COUNT = 4;
 const RENDER_EMPTY_RETRY_DELAY_MS = 5_000;
-const DEFAULT_LIVE_DEBOUNCE_MS = 1_200;
-const MIN_LIVE_DEBOUNCE_MS = 250;
-const MAX_LIVE_DEBOUNCE_MS = 30_000;
 
 const DEFAULT_SETTINGS = Object.freeze({ soundEnabled: true });
 const VALID_STATUSES = new Set([
@@ -68,6 +83,12 @@ let sweepRunning = false;
 let lastSoundAt = 0;
 const checksInProgress = new Set();
 let alarmQueue = Promise.resolve();
+let precisionScheduleTimer = null;
+// Service-worker memory only tracks active page observer installations. The
+// durable monitor configuration remains in storage and is restored on startup.
+const liveSessions = new Map();
+const liveDirtyByMonitor = new Map();
+let liveOwnershipQueue = Promise.resolve();
 
 function cleanText(value, maxLength = MAX_SNAPSHOT_CHARS) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -181,20 +202,405 @@ function normalizeScheduleMode(value, fallback = null) {
   if (value === undefined || value === null || value === '') {
     return fallback;
   }
-  const mode = typeof value === 'string' ? value.trim() : value;
+  const mode = typeof value === 'string' ? value.trim().toLowerCase() : value;
+  // Reference exports use AUTO for a no-op/unscheduled webpage descriptor.
+  // OpenStill has no background crawler mode, so retain it as manual rather
+  // than dropping the imported HTML monitor or inventing an interval.
+  if (mode === 'auto') return SCHEDULE_MODE_MANUAL;
   return SCHEDULE_MODES.has(mode) ? mode : null;
 }
 
-function isAutomaticSchedule(monitor) {
-  return monitor?.scheduleMode === SCHEDULE_MODE_INTERVAL;
+function scheduleSeconds(value) {
+  const parsed = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && /^\d+$/.test(value.trim())
+      ? Number(value)
+      : Number.NaN;
+  return Number.isInteger(parsed) && parsed >= MIN_SCHEDULE_SECONDS && parsed <= MAX_SCHEDULE_SECONDS
+    ? parsed
+    : null;
 }
 
-function nextCheckForSchedule(scheduleMode, lastCheckedAt, intervalHours, requestedNextCheck = null) {
-  if (scheduleMode !== SCHEDULE_MODE_INTERVAL) {
+function parseScheduleObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
     return null;
   }
-  const calculatedNextCheck = lastCheckedAt ? addHours(lastCheckedAt, intervalHours) : nowIso();
-  return asIso(requestedNextCheck, null) ?? calculatedNextCheck;
+}
+
+function cronNumber(value, names, minimum, maximum) {
+  const text = String(value ?? '').trim().toUpperCase();
+  const named = names?.[text];
+  const numeric = named ?? (/^\d+$/.test(text) ? Number(text) : Number.NaN);
+  return Number.isInteger(numeric) && numeric >= minimum && numeric <= maximum ? numeric : null;
+}
+
+function parseCronField(value, minimum, maximum, names = null) {
+  const source = String(value ?? '').trim();
+  if (!source) throw new Error('A cron field is empty.');
+  const all = new Set();
+  for (let number = minimum; number <= maximum; number += 1) all.add(number);
+  // The bundled Reference cron parser is deliberately a five-field dialect:
+  // it accepts `*`, ranges, lists, and steps, but not Quartz's `?` marker.
+  // Rejecting it here keeps an imported expression from silently changing its
+  // DOM/DOW matching semantics.
+  if (source === '?') throw new Error('Question-mark cron fields are not supported.');
+  if (source === '*') return { values: all, wildcard: true };
+
+  const values = new Set();
+  let wildcard = false;
+  for (const segment of source.split(',')) {
+    const match = segment.trim().match(/^(.+?)(?:\/(\d+))?$/);
+    if (!match) throw new Error('Invalid cron field.');
+    const range = match[1];
+    const step = match[2] === undefined ? 1 : Number(match[2]);
+    if (!Number.isInteger(step) || step <= 0 || step > maximum - minimum + 1) throw new Error('Invalid cron step.');
+    let start;
+    let end;
+    if (range === '?') throw new Error('Question-mark cron fields are not supported.');
+    if (range === '*') {
+      // Distill's cron parser records a star when any list segment is based
+      // on `*`, including `*/n`; that changes DOM/DOW from OR to its wildcard
+      // branch. Preserve that less-obvious compatibility rule.
+      wildcard = true;
+      start = minimum;
+      end = maximum;
+    } else if (range.includes('-')) {
+      const [from, to, ...extra] = range.split('-');
+      if (extra.length) throw new Error('Invalid cron range.');
+      start = cronNumber(from, names, minimum, maximum);
+      end = cronNumber(to, names, minimum, maximum);
+      if (start === null || end === null || start > end) throw new Error('Invalid cron range.');
+    } else {
+      start = cronNumber(range, names, minimum, maximum);
+      if (start === null) throw new Error('Invalid cron value.');
+      // Cron's scalar-step form (`5/15`, `MON/2`) is a stepped range from
+      // that scalar through the field maximum, not a one-value expression.
+      // This is distinct from a bare scalar, which remains exact.
+      end = match[2] === undefined ? start : maximum;
+    }
+    for (let number = start; number <= end; number += step) values.add(number);
+  }
+  if (!values.size) throw new Error('A cron field has no values.');
+  return { values, wildcard };
+}
+
+function parseCronExpression(value) {
+  const fields = String(value ?? '').trim().split(/\s+/);
+  if (fields.length !== 5) throw new Error('Cron requires five fields: minute hour day month weekday.');
+  const months = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 };
+  const weekdays = { SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 };
+  return {
+    minute: parseCronField(fields[0], 0, 59),
+    hour: parseCronField(fields[1], 0, 23),
+    dayOfMonth: parseCronField(fields[2], 1, 31),
+    month: parseCronField(fields[3], 1, 12, months),
+    // The reference parser uses Sunday=0 through Saturday=6. It intentionally
+    // does not treat `7` as an alias for Sunday.
+    dayOfWeek: parseCronField(fields[4], 0, 6, weekdays)
+  };
+}
+
+function cronDateParts(timestamp, formatter) {
+  const values = Object.fromEntries(formatter.formatToParts(new Date(timestamp))
+    .filter((part) => part.type !== 'literal')
+    .map((part) => [part.type, part.value]));
+  const weekdays = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    dayOfMonth: Number(values.day),
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+    dayOfWeek: weekdays[values.weekday]
+  };
+}
+
+function normalizeCronTimezone(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && /^[+-]?\d{1,4}$/.test(value.trim())
+      ? Number(value.trim())
+      : Number.NaN;
+  // Distill's persisted CRON schedule stores Date#getTimezoneOffset(), for
+  // example -540 for Korea.  Accept that wire format as well as an IANA zone
+  // name for newly created monitors.
+  if (Number.isInteger(numeric)) {
+    return numeric >= -14 * 60 && numeric <= 14 * 60 ? numeric : undefined;
+  }
+  const timezone = String(value).trim();
+  if (!timezone || timezone.length > 80) return undefined;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(0);
+    return timezone;
+  } catch {
+    return undefined;
+  }
+}
+
+function cronDatePartsForTimezone(timestamp, timezone, formatter) {
+  if (Number.isInteger(timezone)) {
+    // getTimezoneOffset() is UTC minus local time.  Shift into that local
+    // wall-clock time, then read UTC fields to avoid the machine timezone.
+    const local = new Date(timestamp - timezone * 60_000);
+    return {
+      year: local.getUTCFullYear(),
+      month: local.getUTCMonth() + 1,
+      dayOfMonth: local.getUTCDate(),
+      hour: local.getUTCHours(),
+      minute: local.getUTCMinutes(),
+      dayOfWeek: local.getUTCDay()
+    };
+  }
+  return cronDateParts(timestamp, formatter);
+}
+
+function sortedCronValues(field) {
+  return [...field.values].sort((left, right) => left - right);
+}
+
+// The Reference cron dialect uses JavaScript Date construction for its logical
+// month/day candidates. As a result, a syntactically valid but calendar-invalid
+// value such as `31 FEB` rolls into March. Calculate those overflow candidates
+// separately from the efficient real-calendar scan, then choose whichever is
+// earlier. This matters even when a normal candidate exists: `28-31 * *` after
+// November 30 reaches logical November 31 (December 1) before December 28.
+function nextRolledCalendarCronOccurrence(fields, timezone, afterTimestamp, deadline, formatter) {
+  // Reference persistence uses a numeric Date#getTimezoneOffset. Preserve its
+  // Date rollover behavior exactly for that format. IANA zones are an OpenStill
+  // extension; their DST wall-time conversion is left to the regular scan.
+  if (typeof timezone === 'string') return null;
+
+  const afterParts = cronDatePartsForTimezone(afterTimestamp, timezone, formatter);
+  if (!Number.isInteger(afterParts.year)) return null;
+  const months = sortedCronValues(fields.month);
+  const days = sortedCronValues(fields.dayOfMonth);
+  const hours = sortedCronValues(fields.hour);
+  const minutes = sortedCronValues(fields.minute);
+  const cutoff = Number(afterTimestamp);
+  let next = Number.POSITIVE_INFINITY;
+
+  // Include the preceding logical year because DEC 32 can roll into the first
+  // days of the current year. The absolute deadline retains the normal two-year
+  // search bound and prevents malformed imports from causing unbounded work.
+  for (let year = afterParts.year - 1; year <= afterParts.year + 2; year += 1) {
+    for (const month of months) {
+      for (const day of days) {
+        const wallMidnight = new Date(Number.isInteger(timezone)
+          ? Date.UTC(year, month - 1, day)
+          : new Date(year, month - 1, day).valueOf());
+        const rolledYear = Number.isInteger(timezone) ? wallMidnight.getUTCFullYear() : wallMidnight.getFullYear();
+        const rolledMonth = (Number.isInteger(timezone) ? wallMidnight.getUTCMonth() : wallMidnight.getMonth()) + 1;
+        const rolledDay = Number.isInteger(timezone) ? wallMidnight.getUTCDate() : wallMidnight.getDate();
+        if (rolledYear === year && rolledMonth === month && rolledDay === day) continue;
+        const dayOfWeek = Number.isInteger(timezone) ? wallMidnight.getUTCDay() : wallMidnight.getDay();
+        // With a star-based DOM or DOW segment, the reference requires both
+        // logical DOM and the rolled calendar weekday. Otherwise a selected DOM
+        // candidate is one of the ordinary DOM-or-DOW routes.
+        if ((fields.dayOfMonth.wildcard || fields.dayOfWeek.wildcard)
+          && !fields.dayOfWeek.values.has(dayOfWeek)) continue;
+
+        for (const hour of hours) {
+          for (const minute of minutes) {
+            const candidate = Number.isInteger(timezone)
+              ? Date.UTC(year, month - 1, day, hour, minute) + timezone * 60_000
+              : new Date(year, month - 1, day, hour, minute).valueOf();
+            if (candidate > cutoff && candidate <= deadline && candidate < next) next = candidate;
+          }
+        }
+      }
+    }
+  }
+  return Number.isFinite(next) ? next : null;
+}
+
+function nextCronOccurrence(expression, timezone, afterTimestamp = Date.now()) {
+  const fields = parseCronExpression(expression);
+  const normalizedTimezone = normalizeCronTimezone(timezone);
+  if (normalizedTimezone === undefined) throw new Error('Invalid cron timezone.');
+  // Constructing one formatter validates IANA names before the minute search
+  // and avoids allocating hundreds of thousands of formatters for a sparse
+  // monthly expression. Fixed UTC offsets intentionally use UTC accessors.
+  const formatter = Number.isInteger(normalizedTimezone) ? null : new Intl.DateTimeFormat('en-US', {
+    ...(normalizedTimezone ? { timeZone: normalizedTimezone } : {}),
+    year: 'numeric',
+    weekday: 'short',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+    hourCycle: 'h23'
+  });
+  let after = Number(afterTimestamp);
+  if (!Number.isFinite(after)) after = Date.now();
+  // Preserve the reference's late-minute guard: an execution after :40 must
+  // not immediately consume the next nominal cron minute.
+  if (new Date(after).getSeconds() > 40) after += 20_000;
+  let candidate = Math.floor(after / 60_000) * 60_000 + 60_000;
+  const deadline = after + 2 * 366 * 24 * 60 * 60 * 1_000;
+  const rolledCalendarCandidate = nextRolledCalendarCronOccurrence(
+    fields,
+    normalizedTimezone,
+    after,
+    deadline,
+    formatter
+  );
+  // Do not linearly format every minute of a sparse schedule.  A rejected
+  // month/day can advance one UTC day safely (the local date always moves at
+  // least one day across normal DST changes); only a matching day needs an
+  // hour/minute scan. This keeps yearly and impossible expressions bounded by
+  // a few thousand timezone conversions instead of more than one million.
+  for (let attempt = 0; candidate <= deadline && attempt < 200_000; attempt += 1) {
+    const parts = cronDatePartsForTimezone(candidate, normalizedTimezone, formatter);
+    const advanceToNextLocalDate = () => {
+      // Re-anchor the daily skip at the next local midnight. Carrying the
+      // current wall-clock hour across a month boundary would skip e.g.
+      // `0 0 1 * *` when the scan enters day 1 at noon.
+      const remainingMinutes = Math.max(1, (24 - parts.hour) * 60 - parts.minute);
+      candidate += remainingMinutes * 60_000;
+    };
+    if (!fields.month.values.has(parts.month)) {
+      advanceToNextLocalDate();
+      continue;
+    }
+    const domMatches = fields.dayOfMonth.values.has(parts.dayOfMonth);
+    const dowMatches = fields.dayOfWeek.values.has(parts.dayOfWeek);
+    // Match the reference parser's Vixie-style split: a star-based segment
+    // (`*`, `*/n`, or a list containing one) in either day field makes the
+    // two fields conjunctive. With neither star marker, DOM and DOW are an
+    // alternative route to the date.
+    const dayMatches = fields.dayOfMonth.wildcard || fields.dayOfWeek.wildcard
+      ? domMatches && dowMatches
+      : domMatches || dowMatches;
+    if (!dayMatches) {
+      advanceToNextLocalDate();
+      continue;
+    }
+    if (!fields.hour.values.has(parts.hour)) {
+      // Keep the minute walk aligned to real local clock candidates. Adding
+      // one hour while retaining an arbitrary minute (e.g. :02 after the
+      // late-minute guard) skips valid `0 0 * * *` midnight occurrences.
+      // Matching days have at most 1,440 minute probes, while nonmatching
+      // days still use the fast day skip above.
+      candidate += 60_000;
+      continue;
+    }
+    if (!fields.minute.values.has(parts.minute)) {
+      candidate += 60_000;
+      continue;
+    }
+    return rolledCalendarCandidate !== null && rolledCalendarCandidate < candidate
+      ? rolledCalendarCandidate
+      : candidate;
+  }
+  if (rolledCalendarCandidate !== null) return rolledCalendarCandidate;
+  throw new Error('Cron has no occurrence in the next two years.');
+}
+
+function normalizeScheduleDescriptor(input, fallbackMode = SCHEDULE_MODE_MANUAL, fallbackDescriptor = null) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : { scheduleMode: input };
+  const embedded = parseScheduleObject(source.schedule);
+  const fallback = fallbackDescriptor && typeof fallbackDescriptor === 'object' ? fallbackDescriptor : null;
+  const type = normalizeScheduleMode(
+    embedded?.type ?? source.scheduleMode,
+    fallback?.type ?? fallbackMode
+  );
+  if (!type) return null;
+  const params = embedded?.params && typeof embedded.params === 'object' ? embedded.params : {};
+  const fallbackParams = fallback?.type === type && fallback.params && typeof fallback.params === 'object'
+    ? fallback.params
+    : {};
+  if (type === SCHEDULE_MODE_MANUAL || type === SCHEDULE_MODE_LIVE) return { type, params: {} };
+
+  if (type === SCHEDULE_MODE_INTERVAL) {
+    const fromHours = source.intervalHours === undefined || source.intervalHours === null
+      ? null
+      : Math.round(Number(source.intervalHours) * 60 * 60);
+    const interval = scheduleSeconds(
+      params.interval ?? source.intervalSeconds ?? source.interval ?? fromHours ?? fallbackParams.interval
+    );
+    return interval ? { type, params: { interval } } : null;
+  }
+
+  if (type === SCHEDULE_MODE_RANDOM) {
+    const min = scheduleSeconds(params.min ?? source.randomMinSeconds ?? source.min ?? fallbackParams.min);
+    const max = scheduleSeconds(params.max ?? source.randomMaxSeconds ?? source.max ?? fallbackParams.max);
+    return min && max && min <= max ? { type, params: { min, max } } : null;
+  }
+
+  const expr = String(params.expr ?? source.cronExpression ?? source.cron ?? source.expr ?? fallbackParams.expr ?? '').trim();
+  const rawTimezone = params.tz ?? source.cronTimezone ?? source.timezone ?? fallbackParams.tz;
+  const tz = normalizeCronTimezone(rawTimezone);
+  if (!expr || expr.length > 160 || tz === undefined) return null;
+  // Keep an imported malformed expression as an unscheduled CRON monitor.
+  // The reference defers parsing to next-run calculation and simply returns
+  // no due time on failure; rejecting it here would drop the monitor while
+  // normalizing stored state.
+  return { type, params: { expr, ...(tz !== null ? { tz } : {}) } };
+}
+
+function scheduleDescriptorOf(monitor) {
+  return normalizeScheduleDescriptor(monitor, monitor?.scheduleMode ?? SCHEDULE_MODE_MANUAL, monitor?.schedule ?? null);
+}
+
+function isAutomaticSchedule(monitor) {
+  const schedule = scheduleDescriptorOf(monitor);
+  if (!schedule) return false;
+  if (schedule.type === SCHEDULE_MODE_INTERVAL) return schedule.params.interval < INFINITE_SCHEDULE_SECONDS;
+  if (schedule.type === SCHEDULE_MODE_RANDOM) {
+    return schedule.params.min < INFINITE_SCHEDULE_SECONDS && schedule.params.max < INFINITE_SCHEDULE_SECONDS;
+  }
+  return schedule.type === SCHEDULE_MODE_CRON;
+}
+
+function nextCheckForSchedule(scheduleOrMode, lastCheckedAt, intervalHours, requestedNextCheck = null) {
+  const descriptor = scheduleOrMode && typeof scheduleOrMode === 'object'
+    ? (scheduleOrMode.type ? normalizeScheduleDescriptor({ schedule: scheduleOrMode }) : scheduleDescriptorOf(scheduleOrMode))
+    : normalizeScheduleDescriptor({ scheduleMode: scheduleOrMode, intervalHours }, scheduleOrMode ?? SCHEDULE_MODE_MANUAL);
+  if (!descriptor || !isAutomaticSchedule({ schedule: descriptor }) || ![SCHEDULE_MODE_INTERVAL, SCHEDULE_MODE_RANDOM, SCHEDULE_MODE_CRON].includes(descriptor.type)) return null;
+  const requested = asIso(requestedNextCheck, null);
+  if (requested) return requested;
+
+  const now = Date.now();
+  const last = Date.parse(lastCheckedAt ?? '');
+  let due;
+  if (descriptor.type === SCHEDULE_MODE_INTERVAL) {
+    due = Number.isFinite(last) ? Math.max(now, last + descriptor.params.interval * 1_000) + 1_000 : now;
+  } else if (descriptor.type === SCHEDULE_MODE_RANDOM) {
+    const span = descriptor.params.max - descriptor.params.min;
+    const delay = descriptor.params.min + Math.random() * span;
+    due = Number.isFinite(last) ? Math.max(now, last + delay * 1_000) + 1_000 : now;
+  } else {
+    // The reference still parses a CRON expression before using its epoch
+    // sentinel for a first baseline. A malformed import is therefore
+    // unscheduled rather than treated as immediately due.
+    try {
+      parseCronExpression(descriptor.params.expr);
+    } catch {
+      return null;
+    }
+    // With no run history the reference scheduler uses its epoch sentinel,
+    // whose calculated cron time is already in the past; establish the first
+    // baseline immediately rather than waiting for the next calendar slot.
+    if (!Number.isFinite(last)) {
+      due = now;
+    } else {
+      try {
+        due = Math.max(now, nextCronOccurrence(descriptor.params.expr, descriptor.params.tz, last));
+      } catch {
+        // Reference scheduling treats an unresolvable CRON expression as
+        // unscheduled. Do not let one imported monitor prevent the entire
+        // storage state from normalizing or force a hot immediate-alarm loop.
+        return null;
+      }
+    }
+  }
+  return new Date(due).toISOString();
 }
 
 function createId() {
@@ -214,6 +620,21 @@ function normalizeUrl(value) {
     if (url.username || url.password) {
       return null;
     }
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+// A monitor's URL is its page identity, so retain the fragment for hash-routed
+// applications.  A frame location is different: browser frame documents are
+// re-created independently of a fragment-only navigation, and the Reference
+// frame descriptor matches the document URL rather than a client-side route.
+function normalizeFrameUrl(value) {
+  const normalized = normalizeUrl(value);
+  if (!normalized) return null;
+  try {
+    const url = new URL(normalized);
     url.hash = '';
     return url.href;
   } catch {
@@ -323,7 +744,13 @@ function cleanLocatorField(value) {
   if (type === 'builtin') type = name === 'text' ? 'text' : '';
   if (!LOCATOR_FIELD_TYPES.has(type)) return null;
   if (type === 'text') return { type: 'text' };
-  if (!/^[A-Za-z_$][\w$-]{0,80}$/.test(name)) return null;
+  // Attributes are surfaced by the reference picker verbatim, including
+  // XML/SVG names such as `xlink:href` and non-ASCII names.  Property access
+  // is also bracket-based, so it does not require a JavaScript identifier.
+  // Retain the user-visible name and only reject control/markup separators
+  // that cannot be an attribute/property field selection.
+  if (!name || name.length > 256 || /[\u0000-\u001F\u007F\s]/.test(name)) return null;
+  if (type === 'attribute' && /["'<>\/=]/.test(name)) return null;
   return { type, name };
 }
 
@@ -331,15 +758,12 @@ function cleanLocatorFields(value) {
   const explicitlyConfigured = value !== undefined && value !== null;
   const source = Array.isArray(value) ? value : explicitlyConfigured ? [value] : [];
   const fields = [];
-  const seen = new Set();
-  for (const item of source.slice(0, 12)) {
+  // Field order is the extraction order.  In particular, text may appear
+  // before/between/after several attributes, and a repeated field remains a
+  // deliberate separator in the reference field payload.  Do not dedupe it.
+  for (const item of source.slice(0, 256)) {
     const field = cleanLocatorField(item);
-    if (!field) continue;
-    const key = `${field.type}\u0000${field.name ?? ''}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      fields.push(field);
-    }
+    if (field) fields.push(field);
   }
   // Omitted fields mean the familiar text monitor. An explicit empty list is
   // different: it keeps filtered HTML/data while deliberately contributing no
@@ -353,7 +777,7 @@ function cleanFramePath(value) {
   const path = [];
   for (const entry of value) {
     if (!entry || typeof entry !== 'object') return null;
-    const url = normalizeUrl(entry.url);
+    const url = normalizeFrameUrl(entry.url);
     const indexValue = entry.index ?? entry.siblingIndex;
     const index = Number.isInteger(indexValue)
       ? indexValue
@@ -384,15 +808,51 @@ function cleanLocator(value, defaults = {}) {
       ? Number(frameValue)
       : Number.NaN;
   if (!Number.isInteger(frameId) || frameId < 0 || frameId > 1_000_000) return null;
+  // Reference frame configurations have a stable `index` used to process
+  // innermost/high-index frames first. Chrome frame IDs are reassigned after
+  // navigation, so retain a distinct saved ordering key when a locator has
+  // one; legacy locators fall back to their originally saved frame ID.
+  const frameOrderValue = raw.frameOrder ?? raw.frameIndex ?? defaults.frameOrder;
+  const frameOrder = frameOrderValue === undefined || frameOrderValue === null || frameOrderValue === ''
+    ? null
+    : Number.isInteger(frameOrderValue)
+      ? frameOrderValue
+      : typeof frameOrderValue === 'string' && /^\d+$/.test(frameOrderValue.trim())
+        ? Number(frameOrderValue)
+        : Number.NaN;
+  if (frameOrder !== null && (!Number.isInteger(frameOrder) || frameOrder < 0 || frameOrder > 1_000_000)) return null;
   const framePath = cleanFramePath(raw.framePath ?? raw.frameDescriptor);
   if (framePath === null) return null;
+  // A Reference nested-frame export can carry only a durable frame URL. Keep
+  // it as a deferred descriptor; resolution below accepts it only when exactly
+  // one current subframe matches, never by flattening into the top document.
+  const frameUrlSource = raw.frameUrl ?? raw.frameUri ?? defaults.frameUrl;
+  const frameUrl = frameUrlSource === undefined || frameUrlSource === null || frameUrlSource === ''
+    ? null
+    : normalizeFrameUrl(frameUrlSource);
+  if (frameUrlSource !== undefined && frameUrlSource !== null && frameUrlSource !== '' && !frameUrl) return null;
+  // The field list and the fact that it was explicitly supplied are distinct
+  // capture instructions. `[]` disables inherited text, while an omitted
+  // list lets the selected subtree inherit normal text mode. Preserve that
+  // bit through storage instead of flattening both into a default text field.
+  const rawDefaultTextOnly = Array.isArray(raw.fields)
+    && raw.fields.length === 1
+    && String(raw.fields[0]?.type ?? '').toLowerCase() === 'text';
+  const fieldsSpecified = raw.fieldsSpecified === true
+    // `fields: null` is the same as an omitted field configuration in the
+    // locator protocol.  It must inherit its parent's text mode instead of
+    // silently becoming an explicit empty override after a save/reload.
+    || (raw.fieldsSpecified !== false && Object.hasOwn(raw, 'fields') && raw.fields != null && !rawDefaultTextOnly);
   return {
     type,
     expr,
     op,
     frameId,
     framePath,
-    fields: cleanLocatorFields(raw.fields)
+    ...(frameOrder !== null ? { frameOrder } : {}),
+    ...(frameUrl ? { frameUrl } : {}),
+    fields: cleanLocatorFields(raw.fields),
+    ...(fieldsSpecified ? { fieldsSpecified: true } : {})
   };
 }
 
@@ -401,15 +861,24 @@ function locatorKey(locator) {
     locator.type,
     locator.op,
     locator.frameId,
+    locator.frameOrder ?? '',
     JSON.stringify(locator.framePath ?? []),
+    locator.frameUrl ?? '',
     locator.expr,
+    locator.fieldsSpecified === true ? 'fields:explicit' : 'fields:inherited',
     ...locator.fields.map((field) => `${field.type}:${field.name ?? ''}`)
   ].join('\u0001');
 }
 
 function cleanLocators(value) {
-  const source = Array.isArray(value) ? value : [value];
-  if (!source.length || source.length > MAX_SELECTORS_PER_MONITOR) return null;
+  const source = Array.isArray(value) ? value : value == null ? [] : [value];
+  // A Reference selection with no frames is a full-page capture.  Materialize
+  // that implicit frame here so stored/imported records, the picker API, and
+  // the editor all execute the same explicit CSS `body` include.
+  if (!source.length) {
+    return [cleanLocator({ type: 'css', expr: 'body', op: 'include' })];
+  }
+  if (source.length > MAX_SELECTORS_PER_MONITOR) return null;
   const locators = [];
   const seen = new Set();
   for (const item of source) {
@@ -421,6 +890,114 @@ function cleanLocators(value) {
     locators.push(locator);
   }
   return locators.some((locator) => locator.op === 'include') ? locators : null;
+}
+
+function parseReferenceConfig(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function integerFrameValue(value) {
+  if (Number.isInteger(value)) return value;
+  return typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value) : null;
+}
+
+// Distill Reference records save HTML selection state separately from their
+// feed metadata: `config.selections[0].frames[{ index, includes, excludes }]`.
+// Its bare nonzero `index` is a transient browser-frame number, not a durable
+// frame identity.  Only translate top-frame selections by default; a nested
+// frame needs an explicit OpenStill-compatible id *and* stable path. Rejecting
+// the whole record in that case is safer than silently running it in frame 0.
+function referenceLocatorsFromConfig(config) {
+  const selections = config?.selections;
+  if (selections === undefined || selections === null || (Array.isArray(selections) && !selections.length)) {
+    return { ok: true, locators: [] };
+  }
+  if (!Array.isArray(selections) || !selections[0] || typeof selections[0] !== 'object') {
+    return { ok: false };
+  }
+
+  const frames = selections[0].frames;
+  if (frames === undefined || frames === null || (Array.isArray(frames) && !frames.length)) {
+    return { ok: true, locators: [] };
+  }
+  if (!Array.isArray(frames)) return { ok: false };
+
+  const locators = [];
+  for (const frame of frames) {
+    if (!frame || typeof frame !== 'object') return { ok: false };
+    const index = integerFrameValue(frame.index ?? 0);
+    if (index === null || index < 0) return { ok: false };
+
+    let defaults;
+    if (index === 0) {
+      defaults = { frameId: 0 };
+    } else {
+      const frameId = integerFrameValue(frame.frameId ?? frame.id);
+      const framePath = frame.framePath ?? frame.frameDescriptor ?? frame.path;
+      if (frameId && Array.isArray(framePath) && framePath.length) {
+        defaults = { frameId, frameOrder: index, framePath };
+      } else {
+        const frameUrl = normalizeFrameUrl(frame.uri ?? frame.url);
+        if (!frameUrl) return { ok: false };
+        // `index` is retained only for Reference frame ordering.  The runtime
+        // resolves this descriptor by its unique frame URL and rejects an
+        // ambiguous duplicate rather than treating it as frame zero.
+        defaults = { frameId: index, frameOrder: index, frameUrl };
+      }
+    }
+
+    const includes = frame.includes ?? [];
+    const excludes = frame.excludes ?? [];
+    if (!Array.isArray(includes) || !Array.isArray(excludes)) return { ok: false };
+    // A body default applies only when the frame list itself is absent/empty.
+    // For a present frame with no includes, the Reference runner still appends
+    // its automatic `base` include; represent that narrow, text-empty capture
+    // rather than silently promoting it to the full document body.
+    const effectiveIncludes = includes.length
+      ? includes
+      : [{ type: 'css', expr: 'base' }];
+    for (const selector of effectiveIncludes) {
+      locators.push(typeof selector === 'string'
+        ? { ...defaults, type: 'css', expr: selector, op: 'include' }
+        : { ...selector, ...defaults, op: 'include' });
+    }
+    for (const selector of excludes) {
+      locators.push(typeof selector === 'string'
+        ? { ...defaults, type: 'css', expr: selector, op: 'exclude' }
+        : { ...selector, ...defaults, op: 'exclude' });
+    }
+  }
+  return { ok: true, locators };
+}
+
+function referenceTrackingFromConfig(config) {
+  const selection = Array.isArray(config?.selections) ? config.selections[0] : null;
+  return {
+    ...(config && typeof config === 'object' ? config : {}),
+    ...(selection && typeof selection === 'object' && selection.delay !== undefined
+      ? { delay: selection.delay }
+      : {})
+  };
+}
+
+function isReferenceHtmlRecord(value) {
+  const contentType = value?.content_type ?? value?.contentType;
+  if (contentType === undefined || contentType === null || contentType === '') return true;
+  if (contentType === 2) return true; // Reference C.TYPE_HTML
+  const normalized = String(contentType).trim().toLowerCase();
+  return normalized === '2' || normalized === 'html' || normalized === 'type_html';
+}
+
+function referenceSelectionUri(config) {
+  const selection = Array.isArray(config?.selections) ? config.selections[0] : null;
+  return selection && typeof selection === 'object' ? selection.uri : null;
 }
 
 function displaySelectorsForLocators(locators) {
@@ -435,14 +1012,14 @@ function framePathForFrame(frameId, frames) {
   const path = [];
   let current = byId.get(frameId);
   while (current && current.parentFrameId >= 0) {
-    const url = normalizeUrl(current.url);
+    const url = normalizeFrameUrl(current.url);
     if (!url) return null;
     // Frame ids are assigned afresh on every load.  Counting every sibling
     // makes a saved route drift merely because an unrelated ad or widget was
     // inserted before it, so disambiguate only among siblings with the same
     // normalized document URL.
     const siblings = frames
-      .filter((frame) => frame.parentFrameId === current.parentFrameId && normalizeUrl(frame.url) === url)
+      .filter((frame) => frame.parentFrameId === current.parentFrameId && normalizeFrameUrl(frame.url) === url)
       .sort((left, right) => left.frameId - right.frameId);
     const index = siblings.findIndex((frame) => frame.frameId === current.frameId);
     if (index < 0) return null;
@@ -453,7 +1030,7 @@ function framePathForFrame(frameId, frames) {
 }
 
 function stableFrameLocation(value) {
-  const normalized = normalizeUrl(value);
+  const normalized = normalizeFrameUrl(value);
   if (!normalized) return null;
   try {
     const url = new URL(normalized);
@@ -495,12 +1072,25 @@ function resolveLocatorFrame(locator, frames) {
     // reload: callers turn this sentinel into a clear configuration error.
     return -1;
   }
+  if (locator.frameUrl) {
+    const exact = frames.filter((frame) => frame.frameId !== 0 && normalizeFrameUrl(frame.url) === locator.frameUrl);
+    if (exact.length === 1) return exact[0].frameId;
+    const stable = stableFrameLocation(locator.frameUrl);
+    const relaxed = frames.filter((frame) => (
+      frame.frameId !== 0 && stableFrameLocation(frame.url) === stable
+    ));
+    // A URL-only Reference descriptor is safe only if it names exactly one
+    // current subframe. Duplicate embeds remain a visible selection failure.
+    return relaxed.length === 1 ? relaxed[0].frameId : -1;
+  }
   return Number.isInteger(locator.frameId) ? locator.frameId : 0;
 }
 
 function cleanRegularExpression(value) {
   const source = typeof value === 'string'
-    ? { expr: value }
+    // Legacy string configuration follows the reference default flags rather
+    // than silently becoming case-sensitive and single-line only.
+    ? { expr: value, flags: 'gim' }
     : value && typeof value === 'object' ? value : null;
   if (!source) return null;
   const expr = String(source.expr ?? source.pattern ?? source.value ?? '').trim();
@@ -540,7 +1130,6 @@ function normalizeTracking(value) {
     : Object.hasOwn(input, 'timeout')
       ? Number(input.timeout) * 1_000
       : CHECK_EXECUTION_TIMEOUT_MS;
-  const liveDebounce = Number(input.liveDebounceMilliseconds ?? input.liveDebounce ?? DEFAULT_LIVE_DEBOUNCE_MS);
   return {
     dataAttr,
     ignoreWhitespace: input.ignoreWhitespace !== false,
@@ -550,9 +1139,6 @@ function normalizeTracking(value) {
     includeStyle: input.includeStyle === true || input.includeStyles === true,
     keepComments: input.keepComments === true,
     live: input.live === true || input.liveMonitoring === true,
-    liveDebounceMilliseconds: Number.isFinite(liveDebounce)
-      ? Math.max(MIN_LIVE_DEBOUNCE_MS, Math.min(MAX_LIVE_DEBOUNCE_MS, Math.round(liveDebounce)))
-      : DEFAULT_LIVE_DEBOUNCE_MS,
     delayMilliseconds: Number.isFinite(delayMilliseconds)
       ? Math.max(0, Math.min(60_000, Math.round(delayMilliseconds)))
       : 0,
@@ -671,9 +1257,11 @@ function snapshotsEqual(left, right, tracking = null) {
   const comparable = options.ignoreWhitespace
     ? String(left?.[field] ?? '').replace(/\s/g, '') === String(right?.[field] ?? '').replace(/\s/g, '')
     : comparisonTokensEqual(left?.[field], right?.[field]);
-  return Boolean(left && right)
-    && left.exists === right.exists
-    && (fingerprintComparable ?? comparable);
+  // `exists` is extraction/control-flow metadata. Once allow-empty mode has
+  // admitted an empty result, the reference comparison is still solely the
+  // configured text/data payload; a matched empty element and a missing
+  // element with the same payload are not a synthetic content change.
+  return Boolean(left && right) && (fingerprintComparable ?? comparable);
 }
 
 function normalizeMonitor(value) {
@@ -681,23 +1269,61 @@ function normalizeMonitor(value) {
     return null;
   }
 
-  const url = normalizeUrl(value.url);
-  const locators = cleanLocators(value.locators ?? value.selectors);
+  const hasExplicitLocators = Object.hasOwn(value, 'locators') || Object.hasOwn(value, 'selectors');
+  const rawReferenceConfig = value.config;
+  const referenceConfig = parseReferenceConfig(rawReferenceConfig);
+  const isReferenceRecord = Object.hasOwn(value, 'uri') && (
+    !Object.hasOwn(value, 'url')
+    || Object.hasOwn(value, 'config')
+    || Object.hasOwn(value, 'content_type')
+    || Object.hasOwn(value, 'state')
+  );
+  const usesReferenceSelection = !hasExplicitLocators && (
+    isReferenceRecord
+    || Boolean(referenceConfig && Object.hasOwn(referenceConfig, 'selections'))
+  );
+  const referenceSelection = usesReferenceSelection
+    ? (rawReferenceConfig === undefined || rawReferenceConfig === null || rawReferenceConfig === ''
+      ? { ok: true, locators: [] }
+      : referenceConfig
+        ? referenceLocatorsFromConfig(referenceConfig)
+        : { ok: false })
+    : null;
+  if (isReferenceRecord && !isReferenceHtmlRecord(value)) return null;
+  const url = isReferenceRecord
+    ? normalizeUrl(referenceSelectionUri(referenceConfig)) ?? normalizeUrl(value.uri ?? value.url)
+    : normalizeUrl(value.url);
+  const locators = usesReferenceSelection
+    ? referenceSelection?.ok ? cleanLocators(referenceSelection.locators) : null
+    : cleanLocators(value.locators ?? value.selectors);
   const selectors = locators ? displaySelectorsForLocators(locators) : null;
-  // Pre-manual-mode monitors always used interval scheduling. Preserve that
-  // behavior during migration; newly created monitors explicitly store manual.
-  const scheduleMode = normalizeScheduleMode(value.scheduleMode, SCHEDULE_MODE_INTERVAL);
-  const intervalHours = clampInterval(value.intervalHours)
-    ?? (scheduleMode === SCHEDULE_MODE_MANUAL ? MIN_INTERVAL_HOURS : null);
-  if (!url || !locators || !selectors || !scheduleMode || !intervalHours) {
+  // Pre-manual-mode monitors always used an interval. Newer records retain a
+  // reference-style descriptor so RANDOM, CRON, and LIVE survive export and
+  // worker restarts without being flattened into an hour count.
+  const schedule = normalizeScheduleDescriptor(
+    value,
+    isReferenceRecord ? SCHEDULE_MODE_MANUAL : SCHEDULE_MODE_INTERVAL
+  );
+  const scheduleMode = schedule?.type;
+  const intervalHours = scheduleMode === SCHEDULE_MODE_INTERVAL
+    ? schedule.params.interval / 3_600
+    : clampInterval(value.intervalHours) ?? MIN_INTERVAL_HOURS;
+  if (!url || !locators || !selectors || !schedule) {
     return null;
   }
-  const createdAt = asIso(value.createdAt, nowIso());
-  const lastCheckedAt = asIso(value.lastCheckedAt, null);
-  const lastChangedAt = asIso(value.lastChangedAt, null);
-  const lastViewedAt = asIso(value.lastViewedAt ?? value.lastReadAt, null);
+  const createdAt = asIso(value.createdAt ?? (isReferenceRecord ? value.ts : undefined), nowIso());
+  // A Reference backup does not carry its complete run log. `ts_data` is the
+  // last persisted data change, so use it as the best durable lower bound for
+  // both the comparison/change timestamp and the next scheduler calculation.
+  const lastCheckedAt = asIso(value.lastCheckedAt ?? (isReferenceRecord ? value.ts_data : undefined), null);
+  const lastChangedAt = asIso(value.lastChangedAt ?? (isReferenceRecord ? value.ts_data : undefined), null);
+  const lastViewedAt = asIso(value.lastViewedAt ?? value.lastReadAt ?? (isReferenceRecord ? value.ts_view : undefined), null);
   const status = VALID_STATUSES.has(value.status) ? value.status : 'ok';
-  const tracking = normalizeTracking(value.tracking ?? value);
+  const trackingSource = value.tracking
+    ?? (isReferenceRecord && referenceConfig ? referenceTrackingFromConfig(referenceConfig) : value);
+  const tracking = normalizeTracking(scheduleMode === SCHEDULE_MODE_LIVE
+    ? { ...(trackingSource && typeof trackingSource === 'object' ? trackingSource : {}), live: true }
+    : trackingSource);
   const normalizedSnapshot = normalizeSnapshot(value.snapshot);
   // A no-match result is never a baseline. Keeping it here would make the
   // next successful render look like an element deletion/reappearance change.
@@ -715,7 +1341,7 @@ function normalizeMonitor(value) {
   const history = Array.isArray(value.history)
     ? value.history.slice(0, MAX_CHANGE_HISTORY).map((entry) => {
         const snapshot = normalizeSnapshot(entry?.snapshot ?? entry);
-        return snapshot?.exists
+        return snapshot && (snapshot.exists || tracking.allowEmpty)
           ? {
               snapshot,
               capturedAt: asIso(entry?.capturedAt ?? snapshot.capturedAt, null),
@@ -735,7 +1361,10 @@ function normalizeMonitor(value) {
       })).filter((entry) => entry.at)
     : [];
 
-  const id = typeof value.id === 'string' && value.id ? value.id.slice(0, 100) : createId();
+  const rawId = value.id ?? value.uuid;
+  const id = (typeof rawId === 'string' || typeof rawId === 'number') && String(rawId)
+    ? String(rawId).slice(0, 100)
+    : createId();
   const revision = typeof value.revision === 'string' && value.revision.length <= 100
     ? value.revision
     : createRevision();
@@ -743,21 +1372,25 @@ function normalizeMonitor(value) {
   return {
     id,
     revision,
-    name: cleanText(value.name, 120) || cleanText(value.pageTitle, 120) || new URL(url).hostname,
+    name: cleanText(value.name, 120) || cleanText(value.pageTitle ?? value.title, 120) || new URL(url).hostname,
     url,
-    pageTitle: cleanText(value.pageTitle, 180),
+    pageTitle: cleanText(value.pageTitle ?? value.title, 180),
     selectors,
     locators,
     tracking,
-    labels: cleanLabels(value.labels),
+    labels: cleanLabels(value.labels ?? value.tags),
+    schedule,
     scheduleMode,
     intervalHours,
-    enabled: value.enabled !== false,
+    ...(scheduleMode === SCHEDULE_MODE_INTERVAL ? { intervalSeconds: schedule.params.interval } : {}),
+    enabled: isReferenceRecord
+      ? Number(value.state) === 40 // Reference C.STATE_READY
+      : value.enabled !== false,
     createdAt,
-    updatedAt: asIso(value.updatedAt, createdAt),
+    updatedAt: asIso(value.updatedAt ?? (isReferenceRecord ? value.ts_mod ?? value.ts : undefined), createdAt),
     lastCheckedAt,
     lastChangedAt,
-    nextCheckAt: nextCheckForSchedule(scheduleMode, lastCheckedAt, intervalHours, value.nextCheckAt),
+    nextCheckAt: nextCheckForSchedule(schedule, lastCheckedAt, intervalHours, value.nextCheckAt),
     snapshot,
     lastChange,
     lastErrorSnapshot,
@@ -782,9 +1415,26 @@ function normalizeSettings(value) {
 
 async function getState() {
   const stored = await chrome.storage.local.get([MONITORS_KEY, SETTINGS_KEY]);
-  const monitors = Array.isArray(stored[MONITORS_KEY])
-    ? stored[MONITORS_KEY].map(normalizeMonitor).filter(Boolean)
-    : [];
+  const rawMonitors = Array.isArray(stored[MONITORS_KEY]) ? stored[MONITORS_KEY] : [];
+  const normalizedMonitors = rawMonitors.map(normalizeMonitor);
+  const monitors = normalizedMonitors.filter(Boolean);
+  // A pre-descriptor/imported automatic monitor can legitimately have no
+  // durable nextCheckAt. Normalize it once and persist the calculated value.
+  // Without this, every service-worker wake recalculates "now + 1 second",
+  // so a due sweep observes it just before due forever.
+  const needsSchedulePersistence = rawMonitors.some((raw, index) => {
+    const monitor = normalizedMonitors[index];
+    return Boolean(
+      monitor
+      && monitor.enabled
+      && isAutomaticSchedule(monitor)
+      && !asIso(raw?.nextCheckAt, null)
+      && monitor.nextCheckAt
+    );
+  });
+  if (needsSchedulePersistence) {
+    await chrome.storage.local.set({ [MONITORS_KEY]: monitors });
+  }
 
   return {
     monitors,
@@ -994,12 +1644,21 @@ function waitForRenderedTab(tabId) {
         finish(resolve);
       }
     };
+    const domContentLoaded = (details) => {
+      if (details?.tabId === tabId && details.frameId === 0) finish(resolve);
+    };
+    const domReadyEvents = chrome.webNavigation?.onDOMContentLoaded;
     const cleanup = () => {
       clearTimeout(timeoutId);
       chrome.tabs.onUpdated.removeListener(listener);
+      domReadyEvents?.removeListener?.(domContentLoaded);
     };
     cancel = cleanup;
     chrome.tabs.onUpdated.addListener(listener);
+    // Reference loader signals readiness at DOMContentLoaded.  A full-load
+    // tab-status event is retained only as a compatibility fallback for
+    // browsers/test environments without webNavigation's DOM-ready event.
+    domReadyEvents?.addListener?.(domContentLoaded);
 
     // A fast cached page can finish before the listener above is attached.
     // We only create this tab for the target URL, so an already-complete state
@@ -1043,25 +1702,96 @@ async function captureReferenceRenderedDocumentCollection(...args) {
   const includeInlineScripts = captureOptions?.includeScript === true || captureOptions?.includeScripts === true;
   const includeStyles = captureOptions?.includeStyle === true || captureOptions?.includeStyles === true;
   const keepComments = captureOptions?.keepComments === true;
-  const isIgnoredElement = (node) => {
+  const liveObserverRecord = (() => {
+    if (!captureOptions?.live || typeof captureOptions?.liveMonitorId !== 'string') return null;
+    try {
+      return globalThis.__openStillLiveMutationObservers?.get(captureOptions.liveMonitorId) || null;
+    } catch {
+      return null;
+    }
+  })();
+  const adblockerSelectors = () => {
+    // The reference locator receives cosmetic-filter rules through a DOM
+    // event, stores their selector text, and treats those nodes as ordinary
+    // excludes for future captures. Keep that page-local registry in the
+    // isolated world without depending on the reference implementation.
+    const key = '__openStillCaptureAdblockerSelectors';
+    let state = globalThis[key];
+    if (!state) {
+      const selectors = new Set();
+      const addStylesheet = (stylesheet) => {
+        if (typeof stylesheet !== 'string' || !stylesheet.trim()) return;
+        try {
+          const sheet = new CSSStyleSheet();
+          sheet.insertRule(stylesheet, 0);
+          const selector = String(sheet.cssRules[0]?.selectorText || '').trim();
+          if (selector) selectors.add(selector);
+        } catch {
+          // A malformed cosmetic rule must not break the monitored capture.
+        }
+      };
+      // The locator integration can already have collected rules before this
+      // isolated capture entry point first runs.  Reference capture reads the
+      // shared cache every time, rather than relying solely on future events.
+      const absorbCachedSelectors = () => {
+        const cached = globalThis.adblockerStyleSheets;
+        if (!Array.isArray(cached)) return;
+        for (const entry of cached) {
+          if (typeof entry === 'string') {
+            addStylesheet(entry);
+            continue;
+          }
+          const selector = String(entry?.selector ?? '').trim();
+          if (selector) selectors.add(selector);
+        }
+      };
+      state = { selectors, addStylesheet, absorbCachedSelectors };
+      globalThis[key] = state;
+      addEventListener('bbx:adblocker:stylesheet-update', (event) => {
+        addStylesheet(event?.detail?.stylesheet);
+      });
+      try {
+        dispatchEvent(new CustomEvent('adblocker:locator:cached-stylesheets'));
+      } catch {
+        // Custom events are optional on restricted/opaque documents.
+      }
+    }
+    state.absorbCachedSelectors?.();
+    return [...state.selectors];
+  };
+  const isIgnoredElement = (node, insideShadow = false) => {
     if (node?.nodeType !== Node.ELEMENT_NODE) return true;
-    if (['NOSCRIPT', 'FRAME', 'IFRAME'].includes(node.tagName)) return true;
+    const localName = String(node.localName || node.tagName || '').toLowerCase();
+    // Do not reserve a tag name or generic accessibility state owned by a
+    // page. Only the extension's private picker marker denotes internal UI.
+    if (String(node.localName || '').toLowerCase() === 'openstill-picker-root'
+      && node.getAttribute?.('data-openstill-picker-ui') === 'true') return true;
+    // Automatic CSS/XPath exclusions run against the cloned document's
+    // light DOM. They do not enter shadow roots, whose retained markup must
+    // therefore stay intact unless the user explicitly excludes it.
+    if (insideShadow) return false;
+    if (['noscript', 'frame', 'iframe'].includes(localName)) return true;
     // When code capture is disabled, scripts and script-preload links are
     // excluded. When it is enabled, inline scripts are added automatically,
     // while an external script remains visible if it belongs to a broader
     // user-selected subtree (the page's own markup is still meaningful data).
-    if (node.tagName === 'SCRIPT') return !includeInlineScripts;
-    if (node.tagName === 'LINK' && String(node.getAttribute('as') || '').toLowerCase() === 'script') return !includeInlineScripts;
-    if (node.tagName === 'STYLE') return !includeStyles;
-    if (node.tagName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(node.getAttribute('rel') || '')) return !includeStyles;
+    if (localName === 'script') return !includeInlineScripts;
+    if (localName === 'link' && String(node.getAttribute('as') || '').toLowerCase() === 'script') return !includeInlineScripts;
+    if (localName === 'style') return !includeStyles;
+    if (localName === 'link' && String(node.getAttribute('rel') || '').toLowerCase() === 'stylesheet') return !includeStyles;
     return false;
   };
+  // Keep these deliberately narrow lists in lockstep with the reference
+  // extractor. The clone lives in a detached HTMLDocument, where browser
+  // defaults such as P/ASIDE display are not reliably resolved; treating
+  // extra semantic elements as blocks here would manufacture line breaks
+  // that the reference text payload does not contain.
   const blockTags = new Set([
-    'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'CAPTION', 'CODE', 'DD', 'DIV', 'FIELDSET', 'FIGCAPTION',
-    'FOOTER', 'FORM', 'HEADER', 'HR', 'LI', 'MAIN', 'OL', 'P', 'SECTION', 'SUMMARY', 'TABLE',
-    'TBODY', 'TFOOT', 'THEAD', 'TR', 'UL', 'IMG', 'BR'
+    'ARTICLE', 'BLOCKQUOTE', 'CAPTION', 'CODE', 'DD', 'DIV', 'FIELDSET', 'FOOTER', 'FORM',
+    'HEADER', 'LI', 'OL', 'SECTION', 'SUMMARY', 'TABLE', 'TBODY', 'TFOOT', 'THEAD', 'TR',
+    'UL', 'IMG', 'BR'
   ]);
-  const spacedTags = new Set(['A', 'ABBR', 'ACRONYM', 'ADDRESS', 'BUTTON', 'INPUT', 'LABEL', 'TD']);
+  const spacedTags = new Set(['A', 'ABBR', 'ACRONYM', 'ADDRESS', 'BUTTON', 'TD']);
 
   const fieldOf = (value) => {
     const raw = typeof value === 'string'
@@ -1080,9 +1810,12 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     }
     if (type === 'builtin') type = name === 'text' ? 'text' : '';
     if (type === 'text') return { type: 'text' };
-    return ['attribute', 'property'].includes(type) && /^[A-Za-z_$][\w$-]{0,80}$/.test(name)
-      ? { type, name }
-      : null;
+    if (!['attribute', 'property'].includes(type)
+      || !name
+      || name.length > 256
+      || /[\u0000-\u001F\u007F\s]/.test(name)
+      || (type === 'attribute' && /["'<>\/=]/.test(name))) return null;
+    return { type, name };
   };
 
   const locatorOf = (value) => {
@@ -1093,34 +1826,61 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const expr = String(raw.expr ?? raw.selector ?? raw.value ?? '').trim();
     const op = String(raw.op ?? raw.operation ?? 'include').trim().toLowerCase();
     if (!['css', 'xcss', 'xpath'].includes(type) || !expr || !['include', 'exclude'].includes(op)) return null;
-    const hasExplicitFields = Object.hasOwn(raw, 'fields') && raw.fields != null;
+    const rawDefaultTextOnly = Array.isArray(raw.fields)
+      && raw.fields.length === 1
+      && String(raw.fields[0]?.type ?? '').toLowerCase() === 'text';
+    const hasExplicitFields = raw.fieldsSpecified === true
+      || (raw.fieldsSpecified !== false && Object.hasOwn(raw, 'fields') && raw.fields != null && !rawDefaultTextOnly);
     const values = Array.isArray(raw.fields) ? raw.fields : raw.fields == null ? [] : [raw.fields];
     const fields = [];
-    const seen = new Set();
-    for (const value of values) {
+    for (const value of values.slice(0, 256)) {
       const field = fieldOf(value);
-      const key = field && field.type + ':' + (field.name || '');
-      if (field && !seen.has(key)) {
-        seen.add(key);
-        fields.push(field);
-      }
+      if (field) fields.push(field);
     }
     return {
       type,
       expr,
       op,
       fields: fields.length || hasExplicitFields ? fields : [{ type: 'text' }],
+      fieldsSpecified: hasExplicitFields,
       legacy: typeof value === 'string'
     };
   };
 
   const locators = (Array.isArray(rawLocators) ? rawLocators : []).map(locatorOf).filter(Boolean);
   const includeLocators = locators.filter((locator) => locator.op === 'include');
-  const usesExtendedCss = locators.some((locator) => locator.type === 'xcss');
+  // The reference content-world locator keeps this flag after the first
+  // successfully evaluated XCSS expression. Subsequent CSS/XPath captures in
+  // that same frame keep declarative shadow serialization as well; resetting
+  // it per call makes data-mode snapshots depend on monitor order.
+  const xcssSerializerStateKey = '__openStillCaptureUsesExtendedCss';
+  let usesExtendedCss = globalThis[xcssSerializerStateKey] === true;
   const unique = (items) => [...new Set(items)];
   const shadowFor = (element) => {
     if (element?.nodeType !== Node.ELEMENT_NODE) return null;
-    try { return element.shadowRoot || globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element) || null; } catch { return element.shadowRoot || null; }
+    const read = (getter) => {
+      try { return getter() || null; } catch { return null; }
+    };
+    // A page-owned compatibility getter must not abort the complete
+    // clone/filter transaction. Continue with another accessible root source,
+    // or retain this host's normal light DOM when none is available.
+    const usable = (root) => root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+      && typeof root.querySelectorAll === 'function'
+      ? root
+      : null;
+    return usable(read(() => element.shadowRoot))
+      || usable(read(() => element._shadowRoot))
+      || usable(read(() => element.__openStillCaptureShadow))
+      || usable(read(() => globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element)));
+  };
+  const isInsidePickerUi = (element) => {
+    const visited = new Set();
+    for (let current = element; current && !visited.has(current); current = current.parentElement || current.getRootNode?.().host || null) {
+      visited.add(current);
+      if (String(current.localName || '').toLowerCase() === 'openstill-picker-root'
+        && current.getAttribute?.('data-openstill-picker-ui') === 'true') return true;
+    }
+    return false;
   };
 
   const splitUnion = (source) => {
@@ -1194,10 +1954,11 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const visit = (scope) => {
       if (!scope || visited.has(scope) || typeof scope.querySelectorAll !== 'function') return;
       visited.add(scope);
-      matches.push(...scope.querySelectorAll(selector));
+      matches.push(...[...scope.querySelectorAll(selector)].filter((element) => !isInsidePickerUi(element)));
       const descendants = [...scope.querySelectorAll('*')];
       const candidates = scope.nodeType === Node.ELEMENT_NODE ? [scope, ...descendants] : descendants;
       for (const element of candidates) {
+        if (isInsidePickerUi(element)) continue;
         const shadow = shadowFor(element);
         if (shadow) visit(shadow);
       }
@@ -1206,10 +1967,14 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     return unique(matches);
   };
 
-  const queryXcss = (selector) => {
+  // Non-JavaScript locators are intentionally evaluated against the cloned
+  // capture document.  Apart from making filtering self-contained, this keeps
+  // transient page state (`:focus`, `:hover`, form validity, etc.) out of a
+  // saved monitor result, which is how the reference capture pipeline works.
+  const queryXcss = (selector, rootDocument = document) => {
     const result = [];
     for (const branch of splitUnion(selector)) {
-      let roots = [document];
+      let roots = [rootDocument];
       for (const step of splitSteps(branch)) {
         roots = unique(roots.flatMap((root) => queryShadowAware(step, root)));
         if (!roots.length) break;
@@ -1219,12 +1984,19 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     return unique(result);
   };
 
-  const select = (locator) => {
-    if (locator.type === 'css') return [...document.querySelectorAll(locator.expr)].map((element) => ({ element }));
-    if (locator.type === 'xcss') return queryXcss(locator.expr).map((element) => ({ element }));
-    const iterator = document.evaluate(
+  const select = (locator, rootDocument = document) => {
+    if (locator.type === 'css') return [...rootDocument.querySelectorAll(locator.expr)]
+      .filter((element) => !isInsidePickerUi(element))
+      .map((element) => ({ element }));
+    if (locator.type === 'xcss') return queryXcss(locator.expr, rootDocument).map((element) => ({ element }));
+    // The current Reference locator evaluates XPath relative to the cloned
+    // document's first element (<html>), not the Document node itself. This
+    // only changes relative expressions such as `.` and `./body`; CSS/XCSS
+    // intentionally remain Document-scoped above.
+    const xpathContext = rootDocument.firstElementChild || rootDocument;
+    const iterator = rootDocument.evaluate(
       locator.expr,
-      document,
+      xpathContext,
       (prefix) => prefix === 'xhtml' ? 'http://www.w3.org/1999/xhtml' : null,
       XPathResult.ORDERED_NODE_ITERATOR_TYPE,
       null
@@ -1232,13 +2004,24 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const matches = [];
     for (let node = iterator.iterateNext(); node; node = iterator.iterateNext()) {
       if (node.nodeType === Node.ATTRIBUTE_NODE && node.ownerElement) {
-        matches.push({ element: node.ownerElement, attributeName: node.name });
+        // Attribute nodes are only promoted to their owner for an XPath
+        // *exclude* below.  An XPath include operates on the raw node in the
+        // reference filter and therefore cannot turn `//@href` into a whole
+        // element include.
+        matches.push({ element: node.ownerElement, attributeName: node.name, attributeNode: true });
       } else if (node.nodeType === Node.ELEMENT_NODE) {
         matches.push({ element: node });
+      } else {
+        // Preserve the locator's raw match count for text/comment/document
+        // XPath results, while correctly leaving them without an element
+        // marker. jQuery marker operations in the reference are element-only.
+        matches.push({ element: null, nonElementNode: true });
       }
     }
     const seen = new Map();
     return matches.filter((match) => {
+      if (!match.element) return true;
+      if (isInsidePickerUi(match.element)) return false;
       const names = seen.get(match.element) || new Set();
       const key = match.attributeName || '';
       if (names.has(key)) return false;
@@ -1270,140 +2053,291 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     try {
       return field.type === 'attribute'
         ? element.hasAttribute(field.name) ? element.getAttribute(field.name) || '' : 'undefined'
-        : element[field.name] ?? '';
+        : element[field.name] || '';
     } catch { return ''; }
-  }).map(String).filter(Boolean);
+  }).map(String);
 
-  const writeText = (root, included, excluded, automaticallyIncluded, fields) => {
+  const fieldPayloadKey = '__openStillCaptureFieldPayload__';
+  const writeText = (root) => {
     const out = [];
-    // A slotted light-DOM node is reached through its slot and again through
-    // the host's child list. Treat the composed text tree as a tree, not a
-    // graph, so a component does not manufacture a duplicate change.
-    const visitedNodes = new Set();
-    const visit = (node, enabled, textEnabled) => {
-      if (!node || visitedNodes.has(node)) return;
-      visitedNodes.add(node);
-      if (node.nodeType === Node.TEXT_NODE) { if (enabled && textEnabled) out.push(node.nodeValue || ''); return; }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      if (['NOSCRIPT', 'FRAME', 'IFRAME'].includes(node.tagName)) return;
-      // Script and style selection controls structural/data capture. Their
-      // source is not text-monitor content unless the user explicitly chose a
-      // text field on that node; otherwise enabling the option would create a
-      // surprising text-only change for a stylesheet or inline script.
-      if (['SCRIPT', 'STYLE'].includes(node.tagName) && !fields.has(node)) return;
-      if (isIgnoredElement(node) && !included.has(node)) return;
-      let active = enabled;
-      // Includes are applied before exclusions in the selection model, and a
-      // direct include deliberately reopens an excluded branch. This also
-      // defines the deterministic outcome when two locators match the same
-      // node: include wins instead of silently erasing the tracked root.
-      if (included.has(node)) active = true;
-      else if (excluded.has(node)) active = false;
-      else if (automaticallyIncluded.has(node)) active = true;
-      let descendantsUseText = textEnabled;
-      const inheritedSelectedText = [...included].some((ancestor) => (
-        ancestor !== node
-        && containsAcrossShadow(ancestor, node)
-        && fields.get(ancestor)?.some((field) => field.type === 'text')
-      ));
-      if (included.has(node) && fields.has(node) && !inheritedSelectedText) {
-        descendantsUseText = fields.get(node).some((field) => field.type === 'text');
+    // Text and HTML are both read from the same already-filtered clone. This
+    // prevents a removed inline style or excluded subtree from influencing the
+    // text-only comparison through the original live DOM.
+    const children = (node) => {
+      const result = node?.localName === 'template'
+        ? [...node.content.childNodes]
+        : [...(node?.childNodes || [])];
+      if (node?.shadowRoot) result.push(...node.shadowRoot.childNodes);
+      if (node?.__openStillCaptureShadow) result.push(...node.__openStillCaptureShadow.childNodes);
+      return result;
+    };
+    const visit = (node, parentTextMode = true) => {
+      if (!node) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (parentTextMode) out.push(node.nodeValue || '');
+        return;
       }
-      if (active && descendantsUseText) {
-        let block = blockTags.has(node.tagName);
-        try { block ||= getComputedStyle(node).display === 'block'; } catch { /* keep semantic block */ }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      const payload = node[fieldPayloadKey] || null;
+      // Script/style/noscript content is structural data unless a caller
+      // explicitly selected fields on that exact element. Frame elements are
+      // normally pruned, but their explicit attribute/property fields remain
+      // readable when deliberately included.
+      if (['noscript', 'script', 'style'].includes(String(node.localName || node.tagName || '').toLowerCase()) && !payload) return;
+
+      const selectedFields = payload?.fields || [];
+      const textMode = payload
+        ? selectedFields.some((field) => field.type === 'text')
+        : parentTextMode;
+      const nonTextValues = payload?.values || [];
+      // `getFieldValues()` in the reference always writes its joined value
+      // followed by a newline, including an explicit empty/text-only field
+      // list. That separator is observable when a field-mode child sits
+      // between inherited text runs.
+      if (payload) out.push(nonTextValues.join('\n'), '\n');
+
+      if (textMode) {
+        // The reference obtains display from its detached cloned document.
+        // Do not leak computed styles or inline display values from the live
+        // page into this normalized payload: Chromium normally reports an
+        // empty display for that detached clone, leaving only the reference's
+        // explicit breaking-element list as a stable fallback.
+        let computedDisplay = '';
+        try { computedDisplay = String(globalThis.getComputedStyle?.(node)?.display || '').toLowerCase(); } catch { /* detached style lookup is optional */ }
+        const block = computedDisplay === 'block' || blockTags.has(node.tagName);
         out.push(block ? '\n' : spacedTags.has(node.tagName) ? ' ' : '');
       }
-      const shadow = usesExtendedCss ? shadowFor(node) : null;
-      if (node.localName === 'slot') {
-        const assigned = node.assignedNodes?.({ flatten: true }) || [];
-        (assigned.length ? assigned : [...node.childNodes]).forEach((child) => visit(child, active, descendantsUseText));
-      } else {
-        if (shadow) [...shadow.childNodes].forEach((child) => visit(child, active, descendantsUseText));
-        [...node.childNodes].forEach((child) => visit(child, active, descendantsUseText));
-      }
-      if (active && fields.has(node)) fieldValues(node, fields.get(node)).forEach((value) => out.push('\n' + value + '\n'));
+      // The clone writes light DOM children first and serializes shadow trees
+      // as an ordinary following template. Do not follow slot assignments:
+      // that would turn the filtered document tree into a composed graph and
+      // change both ordering and duplication semantics.
+      children(node).forEach((child) => visit(child, textMode));
     };
-    visit(root, false, true);
-    return out.join('').replace(/\s*\n+(\s*\n+)*/g, '\n').replace(/[\t\f\v ]+/g, ' ').trim();
+    visit(root, true);
+    // Preserve the reference trim/compact order exactly: form-feed and
+    // vertical-tab are not silently rewritten before a regexp filter sees
+    // the extracted text.
+    return out.join('').trim().replace(/\s*\n+(\s*\n+)*/g, '\n').replace(/[ \t]+/g, ' ');
   };
 
-  const makeHtml = (included, excluded, automaticallyIncluded, excludedAttributes) => {
-    if (!included.size && !automaticallyIncluded.size) return '';
+  const cloneCaptureDocument = () => {
     const targetDocument = document.implementation.createHTMLDocument('');
-    const clones = new Map();
-    const copy = (node) => {
+    const copy = (node, insideShadow = false) => {
       if (node.nodeType === Node.TEXT_NODE) return targetDocument.createTextNode(node.nodeValue || '');
-      if (node.nodeType === Node.COMMENT_NODE) return keepComments ? targetDocument.createComment(node.nodeValue || '') : null;
+      // Keep comments through selector evaluation even for an XCSS capture:
+      // XPath predicates can rely on them. Filtering/serialization decides
+      // later whether they are retained or emitted.
+      if (node.nodeType === Node.COMMENT_NODE) return targetDocument.createComment(node.nodeValue || '');
       if (node.nodeType !== Node.ELEMENT_NODE) return null;
       const clone = targetDocument.importNode(node, false);
-      clones.set(node, clone);
-      [...node.childNodes].forEach((child) => { const next = copy(child); if (next) clone.append(next); });
+      if (insideShadow) clone.__openStillCaptureShadowContext = true;
+      [...node.childNodes].forEach((child) => { const next = copy(child, insideShadow); if (next) clone.append(next); });
+      // The clone must retain a real, open shadow tree. CSS/XPath never cross
+      // it, while XCSS can query it exactly as it would the source's closed or
+      // open tree. Serialization decides separately whether to emit it.
       const shadow = shadowFor(node);
-      if (shadow) {
-        const template = targetDocument.createElement('template');
-        template.setAttribute('shadowrootmode', 'open');
-        [...shadow.childNodes].forEach((child) => { const next = copy(child); if (next) template.content.append(next); });
-        clone.insertBefore(template, clone.firstChild);
+      if (shadow?.childNodes) {
+        let shadowClone;
+        try { shadowClone = clone.shadowRoot || clone.attachShadow({ mode: 'open' }); } catch {
+          shadowClone = targetDocument.createDocumentFragment();
+          clone.__openStillCaptureShadow = shadowClone;
+        }
+        Array.from(shadow.childNodes ?? []).forEach((child) => { const next = copy(child, true); if (next) shadowClone.append(next); });
       }
       return clone;
     };
     const rootCopy = copy(document.documentElement);
-    if (!rootCopy) return '';
+    if (!rootCopy) return null;
     targetDocument.replaceChild(rootCopy, targetDocument.documentElement);
-    // Reference captures always expose an absolute base. Create one when the
-    // page did not provide it, then mark it as retained before the pruning
-    // pass; otherwise a fragment-only capture would lose the only URL context.
-    let base = rootCopy.querySelector('base');
-    if (!base) {
-      base = targetDocument.createElement('base');
-      const head = rootCopy.querySelector('head');
-      if (head) head.prepend(base);
-      else rootCopy.prepend(base);
-      base.setAttribute(automaticIncludeMark, '1');
-    }
-    try { base.setAttribute('href', document.baseURI); } catch { /* preserve a malformed source value */ }
-    included.forEach((node) => clones.get(node)?.setAttribute(includeMark, '1'));
-    excluded.forEach((node) => clones.get(node)?.setAttribute(excludeMark, '1'));
-    automaticallyIncluded.forEach((node) => clones.get(node)?.setAttribute(automaticIncludeMark, '1'));
-    excludedAttributes.forEach((names, node) => {
-      const clone = clones.get(node);
-      if (!clone) return;
-      names.forEach((name) => clone.removeAttribute(name));
-    });
-    const children = (node) => node.localName === 'template' ? [...node.content.childNodes] : [...node.childNodes];
-    const prune = (node, active = false) => {
+    return { targetDocument, rootCopy };
+  };
+
+  const makeHtml = (captureClone, included, excluded, automaticallyIncluded, excludedAttributes, fields = new Map(), structuralContext = new Set()) => {
+    const { targetDocument, rootCopy } = captureClone || {};
+    if (!targetDocument || !rootCopy) return { html: '', text: '' };
+    // The reference filter marks the cloned <html> as structural before
+    // removing unmatched descendants. Retain that shell even on data:/about:
+    // documents where no automatic <base> can provide a retained child.
+    const structuralNodes = new Set(structuralContext);
+    structuralNodes.add(rootCopy);
+    included.forEach((node) => node?.setAttribute?.(includeMark, '1'));
+    excluded.forEach((node) => node?.setAttribute?.(excludeMark, '1'));
+    automaticallyIncluded.forEach((node) => node?.setAttribute?.(automaticIncludeMark, '1'));
+    const children = (node) => {
+      const result = node.localName === 'template' ? [...node.content.childNodes] : [...node.childNodes];
+      if (node.shadowRoot) result.push(...node.shadowRoot.childNodes);
+      if (node.__openStillCaptureShadow) result.push(...node.__openStillCaptureShadow.childNodes);
+      return result;
+    };
+    const prune = (node, active = false, parentStructural = false) => {
       if (node.nodeType === Node.TEXT_NODE) { if (!active) node.remove(); return active; }
-      if (node.nodeType === Node.COMMENT_NODE) { if (!keepComments || !active) node.remove(); return keepComments && active; }
+      // `filterDoc` removes text from a has-include context but leaves its
+      // direct comments when requested. A true include keeps all descendants;
+      // a structural context only keeps comments directly attached to it.
+      if (node.nodeType === Node.COMMENT_NODE) {
+        const retainComment = keepComments && (active || parentStructural);
+        if (!retainComment) node.remove();
+        return retainComment;
+      }
       if (node.nodeType !== Node.ELEMENT_NODE) { node.remove(); return false; }
-      // A user-selected node wins over an automatic script/style exclusion,
-      // matching the include-over-exclude contract of the filtered DOM. The
-      // dashboard later renders this preserved markup inertly.
-      if (isIgnoredElement(node) && !node.hasAttribute(includeMark)) { node.remove(); return false; }
+      // Explicit and automatic includes both win over the global script/style
+      // exclusion. Automatic base/style/script locators are ordinary include
+      // rules in the reference pipeline, so a matching exclude must not erase
+      // them after they were added for structural context.
+      if (isIgnoredElement(node, node.__openStillCaptureShadowContext === true)
+        && !node.hasAttribute(includeMark)
+        && !node.hasAttribute(automaticIncludeMark)) { node.remove(); return false; }
       let enabled = active;
-      if (node.hasAttribute(includeMark)) enabled = true;
+      if (node.hasAttribute(includeMark) || node.hasAttribute(automaticIncludeMark)) enabled = true;
       else if (node.hasAttribute(excludeMark)) enabled = false;
-      else if (node.hasAttribute(automaticIncludeMark)) enabled = true;
-      const retained = children(node).map((child) => prune(child, enabled)).some(Boolean);
-      if (!enabled && !retained) { node.remove(); return false; }
+      const retained = children(node).map((child) => prune(child, enabled, structuralNodes.has(node))).some(Boolean);
+      // An XCSS result needs hosts, shadow ancestors, and slot paths as
+      // structure, but those nodes are not text inclusions in their own
+      // right. Keeping the context lets a slotted include survive without
+      // accidentally turning surrounding fallback text into tracked text.
+      if (!enabled && !retained && !structuralNodes.has(node)) { node.remove(); return false; }
       return true;
     };
     prune(rootCopy);
-    const absolute = (value) => { try { return new URL(value, document.baseURI).href; } catch { return value; } };
+    // Attribute excludes are represented as xdel-* markers in the reference
+    // pipeline and removed only after element filtering. Removing `as`/`rel`
+    // earlier can disguise a script-preload or stylesheet from the automatic
+    // exclusion rules and accidentally retain its whole element.
+    excludedAttributes.forEach((names, node) => {
+      if (!node) return;
+      names.forEach((name) => node.removeAttribute(name));
+    });
+    // Reference excludes only data: documents. An about:blank document can
+    // still carry an explicit <base>, whose href/src properties must be made
+    // absolute in the captured clone.
+    const canNormalizeLinks = !/^data:/i.test(String(location?.protocol || document.baseURI || ''));
+    const absolute = (value) => { try { return new URL(value ?? '', document.baseURI).href; } catch { return String(value ?? ''); } };
+    const normalizeUrlAttribute = (node, name) => {
+      // HTML URL properties return an empty string when the corresponding
+      // attribute is absent. Do not invent a page-URL link for `<a>`/`<img>`
+      // without href/src; reference normalization serializes that case as an
+      // explicit empty attribute.
+      const raw = node.getAttribute(name);
+      node.setAttribute(name, raw === null ? '' : absolute(raw));
+    };
     const sanitize = (node) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const insideShadow = node.__openStillCaptureShadowContext === true;
       for (const attribute of [...node.attributes]) {
         const internalMarker = [includeMark, excludeMark, automaticIncludeMark].includes(attribute.name);
-        if ((/^on/i.test(attribute.name) && !includeInlineScripts) || internalMarker || (attribute.name === 'style' && !includeStyles)) {
+        if (internalMarker || (!insideShadow && ((/^on/i.test(attribute.name) && !includeInlineScripts)
+          || (attribute.name === 'style' && !includeStyles)))) {
           node.removeAttribute(attribute.name);
         }
       }
-      if (node.matches('a[href]')) node.setAttribute('href', absolute(node.getAttribute('href')));
-      if (node.matches('img[src],audio[src],video[src]')) node.setAttribute('src', absolute(node.getAttribute('src')));
+      if (!insideShadow && canNormalizeLinks && node.matches('a')) normalizeUrlAttribute(node, 'href');
+      if (!insideShadow && canNormalizeLinks && node.matches('img,audio,video')) normalizeUrlAttribute(node, 'src');
       children(node).forEach(sanitize);
     };
     sanitize(rootCopy);
-    return rootCopy.outerHTML;
+    // Field extraction occurs after the clone has had automatic/user
+    // attribute exclusions and URL normalization applied. In particular,
+    // `style` and `on*` fields must not leak through when their corresponding
+    // structural capture option is disabled.
+    fields.forEach((payload, node) => {
+      if (!node) return;
+      const selectedFields = payload.fields.map((field) => ({ ...field }));
+      node[fieldPayloadKey] = {
+        fields: selectedFields,
+        values: fieldValues(node, selectedFields)
+      };
+    });
+    const text = writeText(rootCopy);
+    const serializeWithShadow = (node) => {
+      // The declarative-shadow serializer has an element/text-only contract.
+      // Comments remain available to CSS/XPath filtering above, but never
+      // appear in an XCSS HTML snapshot.
+      if (node.nodeType === Node.COMMENT_NODE) return '';
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        const holder = targetDocument.createElement('div');
+        holder.append(node.cloneNode(true));
+        return holder.innerHTML;
+      }
+      // Let the platform serialize the opening/closing tag so namespaces and
+      // escaped attributes stay browser-correct, then place a declarative
+      // shadow template before the element's light-DOM children. This is the
+      // XCSS snapshot order; text keeps its separate light-then-shadow walk.
+      const shell = node.cloneNode(false).outerHTML;
+      const openingEnd = shell.indexOf('>') + 1;
+      const closingStart = shell.lastIndexOf('</');
+      if (!openingEnd || closingStart < openingEnd) return shell;
+      const shadow = node.shadowRoot || node.__openStillCaptureShadow || null;
+      const shadowHtml = shadow
+        ? `<template shadowrootmode="open">${[...shadow.childNodes].map(serializeWithShadow).join('')}</template>`
+        : '';
+      const lightChildren = node.localName === 'template'
+        ? [...node.content.childNodes]
+        : [...node.childNodes];
+      return shell.slice(0, openingEnd)
+        + shadowHtml
+        + lightChildren.map(serializeWithShadow).join('')
+        + shell.slice(closingStart);
+    };
+    return {
+      html: (usesExtendedCss ? serializeWithShadow(rootCopy) : rootCopy.outerHTML).trim().replace(/\s*\n+(\s*\n+)*/g, '\n'),
+      text
+    };
+  };
+
+  const ensureCaptureBase = () => {
+    if (/^(?:data|about):/i.test(String(document.baseURI || location?.protocol || ''))) return null;
+    let base = document.getElementsByTagName('base')[0] || null;
+    if (!base) {
+      base = document.createElement('base');
+      const head = document.getElementsByTagName('head')[0];
+      if (head) head.prepend(base);
+    }
+    try {
+      const href = String(document.baseURI || '');
+      // Rewriting an identical attribute still emits a MutationObserver
+      // record in Chromium. Capture may run under a live observer, so keep
+      // the reference base normalization idempotent after its first write.
+      if (base.getAttribute('href') !== href) base.setAttribute('href', href);
+    } catch { /* preserve the page's original base on malformed URLs */ }
+    return base;
+  };
+
+  const makeErrorEvidence = () => {
+    const targetDocument = document.implementation.createHTMLDocument('');
+    const rootCopy = targetDocument.importNode(document.documentElement, true);
+    targetDocument.replaceChild(rootCopy, targetDocument.documentElement);
+    const selfAndDescendants = (selector) => {
+      const nodes = [...rootCopy.querySelectorAll(selector)];
+      try { if (rootCopy.matches(selector)) nodes.push(rootCopy); } catch { /* selector is internal and fixed */ }
+      return nodes;
+    };
+    selfAndDescendants('script,noscript').forEach((node) => {
+      node.textContent = '';
+      node.removeAttribute('src');
+    });
+    selfAndDescendants('link[as="script"]').forEach((node) => node.removeAttribute('href'));
+    selfAndDescendants('[integrity]').forEach((node) => node.removeAttribute('integrity'));
+    selfAndDescendants('head iframe,head frame').forEach((node) => {
+      node.replaceWith(targetDocument.createElement('script'));
+    });
+    selfAndDescendants('iframe,frame').forEach((node) => {
+      node.setAttribute('src', 'about:blank');
+      node.removeAttribute('srcdoc');
+    });
+    selfAndDescendants('a').forEach((node) => {
+      node.removeAttribute('target');
+      node.setAttribute('target', '_blank');
+    });
+    const stripEvents = (node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      [...node.attributes].forEach((attribute) => {
+        if (/^on/i.test(attribute.name)) node.removeAttribute(attribute.name);
+      });
+      [...node.childNodes].forEach(stripEvents);
+    };
+    stripEvents(rootCopy);
+    return rootCopy.outerHTML.trim().replace(/\s*\n+(\s*\n+)*/g, '\n');
   };
 
   const waitForStable = async () => {
@@ -1412,6 +2346,7 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const min = Math.max(0, Number(minimumWaitMilliseconds) || 0);
     const quiet = Math.max(0, Number(quietMilliseconds) || 0);
     const limit = Math.max(min, Number(settleTimeoutMilliseconds) || min);
+    if (!min && !quiet && !limit) return;
     await new Promise((resolve) => {
       const started = performance.now(); let changed = started;
       const observer = new MutationObserver(() => { changed = performance.now(); });
@@ -1426,67 +2361,169 @@ async function captureReferenceRenderedDocumentCollection(...args) {
   };
 
   const capture = () => {
+    // The base is part of the source document before selectors run, so a
+    // locator targeting `base` observes the same document shape as the saved
+    // filtered snapshot.
+    ensureCaptureBase();
+    const captureClone = cloneCaptureDocument();
+    if (!captureClone) return { roots: [], matchCount: 0, items: [], text: '', html: '', selectorMatches: [] };
+    const { targetDocument } = captureClone;
     const included = new Set();
     const excluded = new Set();
     const automaticallyIncluded = new Set();
     const excludedAttributes = new Map();
     const fields = new Map();
+    const structuralContext = new Set();
+    const markLightStructuralContext = (element) => {
+      // CSS/XPath `markInclude()` marks every light-DOM parent with
+      // hasinclude__. That marker removes direct text but intentionally keeps
+      // direct comments when keepComments is enabled.
+      for (let current = element?.parentElement || null; current; current = current.parentElement) {
+        structuralContext.add(current);
+      }
+    };
+    const markSlotsForHost = (host) => {
+      const shadow = shadowFor(host);
+      if (!shadow?.querySelectorAll) return;
+      for (const slot of shadow.querySelectorAll('slot')) {
+        for (let current = slot; current?.nodeType === Node.ELEMENT_NODE; current = current.parentElement) {
+          structuralContext.add(current);
+        }
+      }
+    };
+    const markXcssStructuralContext = (element) => {
+      let parent = element?.parentNode || null;
+      let currentRoot = element?.getRootNode?.() || targetDocument;
+      const visited = new Set();
+      while (parent && !visited.has(parent)) {
+        visited.add(parent);
+        if (parent.nodeType === Node.ELEMENT_NODE) {
+          structuralContext.add(parent);
+          markSlotsForHost(parent);
+        }
+        if (parent === currentRoot && currentRoot !== targetDocument) {
+          const host = currentRoot.host;
+          if (host) {
+            structuralContext.add(host);
+            markSlotsForHost(host);
+            parent = host.parentNode;
+            currentRoot = host.getRootNode?.() || targetDocument;
+            continue;
+          }
+        }
+        parent = parent.parentNode;
+      }
+    };
     const selectorMatches = [];
     for (const locator of locators) {
-      const matches = select(locator);
+      const matches = select(locator, targetDocument);
+      if (locator.type === 'xcss') {
+        usesExtendedCss = true;
+        globalThis[xcssSerializerStateKey] = true;
+      }
       selectorMatches.push(locator.legacy
         ? { selector: locator.expr, matchCount: matches.length }
         : { type: locator.type, expr: locator.expr, op: locator.op, matchCount: matches.length });
       matches.forEach(({ element, attributeName }) => {
-        if (locator.op === 'exclude' && attributeName) {
-          const names = excludedAttributes.get(element) || new Set();
-          names.add(attributeName);
-          excludedAttributes.set(element, names);
+        if (!element) return;
+        if (attributeName) {
+          if (locator.op === 'exclude') {
+            const names = excludedAttributes.get(element) || new Set();
+            names.add(attributeName);
+            excludedAttributes.set(element, names);
+          }
+          // XPath attribute includes do not make the owner an include. This
+          // distinction is what lets XPath attribute exclusions work without
+          // giving the attribute form a different CSS/XCSS selection reach.
           return;
         }
         (locator.op === 'include' ? included : excluded).add(element);
         if (locator.op === 'include') {
-          // Locator processing is ordered. A later rule for the same element
-          // intentionally replaces its extraction-field mode instead of
-          // merging unrelated text/attribute values into one result.
-          fields.set(element, locator.fields.map((field) => ({ ...field })));
+          if (locator.type === 'xcss') markXcssStructuralContext(element);
+          else markLightStructuralContext(element);
+        }
+        if (locator.op === 'include' && locator.fieldsSpecified) {
+          // An explicit field list is a per-node mode override. A later
+          // omitted list deliberately leaves a preceding explicit [] or text
+          // mode intact instead of flattening it back to default text.
+          const copiedFields = locator.fields.map((field) => ({ ...field }));
+          fields.set(element, {
+            fields: copiedFields
+          });
         }
       });
     }
+    for (const selector of adblockerSelectors()) {
+      try {
+        targetDocument.querySelectorAll(selector).forEach((element) => excluded.add(element));
+      } catch {
+        // Cosmetic filters can use browser-specific selector syntax. Ignore an
+        // incompatible rule while preserving the user's explicit locators.
+      }
+    }
     if (includeInlineScripts) {
-      document.querySelectorAll('script:not([src])').forEach((element) => automaticallyIncluded.add(element));
+      // Reference adds this automatic include with the XPath
+      // `//script[not(@src)]`. In an HTML document that selects HTML script
+      // elements, not SVG's namesake element. Detached clone documents may
+      // expose imported HTML nodes with a nonstandard/null namespace in some
+      // Chromium paths, so exclude SVG explicitly rather than requiring the
+      // XHTML namespace literal.
+      [...targetDocument.querySelectorAll('script:not([src])')]
+        .filter((element) => element.namespaceURI !== 'http://www.w3.org/2000/svg')
+        .forEach((element) => {
+          automaticallyIncluded.add(element);
+          markLightStructuralContext(element);
+        });
     }
     if (includeStyles) {
-      document.querySelectorAll('style, link').forEach((element) => {
-        if (element.tagName === 'STYLE' || (element.tagName === 'LINK' && /(^|\s)stylesheet(\s|$)/i.test(element.getAttribute('rel') || ''))) {
-          automaticallyIncluded.add(element);
-        }
+      targetDocument.querySelectorAll('style, link[rel="stylesheet"]').forEach((element) => {
+        automaticallyIncluded.add(element);
+        markLightStructuralContext(element);
       });
     }
     // A captured fragment still needs its document base to keep relative
     // resources and links meaningful when it is rendered later.
-    document.querySelectorAll('base').forEach((element) => automaticallyIncluded.add(element));
+    targetDocument.querySelectorAll('base').forEach((element) => {
+      automaticallyIncluded.add(element);
+      markLightStructuralContext(element);
+    });
     const rootCandidates = [...included, ...automaticallyIncluded];
     const roots = rootCandidates
       .filter((element) => !rootCandidates.some((candidate) => candidate !== element && containsAcrossShadow(candidate, element)))
       .sort(compare);
-    // Empty structural roots (for example an opted-in external stylesheet)
-    // belong in the filtered HTML/data representation, not as blank lines in
-    // text-mode comparison. Match count still records that the root existed.
-    const items = roots
-      .map((root) => ({ text: writeText(root, included, excluded, automaticallyIncluded, fields) }))
-      .filter((item) => item.text);
-    const text = items.map((item) => item.text).filter(Boolean).join('\n\n');
-    const html = makeHtml(included, excluded, automaticallyIncluded, excludedAttributes);
-    return { roots, items, text, html, selectorMatches };
+    // Automatic base/style/script retention is structural context, not a user
+    // selector match. Keep its markup without turning a zero-match locator
+    // into a false successful match count.
+    const matchedRoots = [...included]
+      .filter((element) => ![...included].some((candidate) => candidate !== element && containsAcrossShadow(candidate, element)))
+      .sort(compare);
+    // Text is produced by one traversal of the filtered document. Joining
+    // per-root strings invents blank boundaries that do not exist in the DOM
+    // and turns harmless wrapper/list changes into alerts.
+    const filtered = makeHtml(captureClone, included, excluded, automaticallyIncluded, excludedAttributes, fields, structuralContext);
+    const text = filtered.text;
+    const items = text ? [{ text }] : [];
+    const html = filtered.html;
+    return { roots, matchCount: matchedRoots.length, items, text, html, selectorMatches };
   };
 
+  // Reference live.js disconnects its observer before calling the filter. The
+  // clone pipeline can normalize the source <base>, so do the same around the
+  // complete live capture transaction to avoid feeding that write back in.
+  liveObserverRecord?.pause?.();
   try {
     if (!includeLocators.length) return { ok: true, exists: false, matchCount: 0, items: [], html: '', data: '', selectorMatches: [] };
-    await waitForStable();
+    // Live content checks run immediately on the mutation callback; page
+    // settling is a scheduled-render concern only.
+    if (!captureOptions?.live) await waitForStable();
     const configuredDelay = Math.max(0, Math.min(60_000, Number(captureOptions?.delayMilliseconds) || 0));
     if (configuredDelay) await new Promise((resolve) => setTimeout(resolve, configuredDelay));
     let result = capture();
+    // The reference frame filter appends HTML before deciding whether an
+    // empty-text retry is needed. Preserve every attempt in data mode rather
+    // than silently replacing an earlier structural snapshot with the final
+    // retry's markup.
+    let capturedData = result.html;
     // HTML/data comparison still needs a nonempty selected text result to
     // distinguish a real page from a broken selection, but the reference
     // runner limits that mode to two delayed retries rather than waiting the
@@ -1494,27 +2531,35 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const retryLimit = captureOptions?.dataAttr === 'data'
       ? Math.min(1, Math.max(0, Number(emptyRetryCount) || 0))
       : Math.max(0, Number(emptyRetryCount) || 0);
-    for (let attempt = 0; !captureOptions?.allowEmpty && !result.text && attempt <= retryLimit; attempt += 1) {
+    for (let attempt = 0; !captureOptions?.live && !result.text && attempt <= retryLimit; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(emptyRetryDelayMilliseconds) || 0)));
       result = capture();
+      capturedData += result.html;
     }
-    const exists = captureOptions?.allowEmpty ? result.roots.length > 0 : Boolean(result.text);
-    const errorHtml = exists
-      ? ''
-      : result.html || makeHtml(new Set([document.documentElement]), new Set(), new Set(), new Map());
+    const exists = captureOptions?.allowEmpty ? result.matchCount > 0 : Boolean(result.text);
+    // Empty selection evidence must show the whole rendered page, not merely
+    // the matched-but-textless fragment. That makes login walls, redirects,
+    // and page-layout changes diagnosable without overwriting the baseline.
+    // A regexp can turn an otherwise successful selection into an empty
+    // tracking result later in the worker. Request the same sanitized page
+    // evidence up front for that case, then retain it only if filtering really
+    // produces a selection-empty outcome.
+    const errorHtml = !exists || captureOptions?.captureErrorEvidence === true ? makeErrorEvidence() : '';
     return {
       ok: true,
       exists,
-      matchCount: result.roots.length,
+      matchCount: result.matchCount,
       items: result.items,
       text: result.text,
       html: result.html,
-      data: result.html,
+      data: capturedData,
       errorHtml,
       selectorMatches: result.selectorMatches
     };
   } catch (error) {
     return { ok: false, error: 'Selector capture could not be evaluated: ' + error.message };
+  } finally {
+    liveObserverRecord?.resume?.();
   }
 }
 
@@ -1794,11 +2839,70 @@ async function inspectLegacyRenderedDocumentCollection(selectors, minimumWaitMil
   }
 }
 
-async function captureRenderedSnapshot(monitor, existingTabId = null) {
+// This is intentionally self-contained because chrome.scripting serializes a
+// `func` into the target frame without its lexical scope.  It mirrors the
+// reference runner's page-level `getSanitizedDoc` call, which is used as
+// selection-empty evidence regardless of which configured subframe failed.
+function captureSanitizedErrorEvidenceDocument() {
+  try {
+    const baseURI = String(document.baseURI || '');
+    if (!/^(?:data:|about:)/.test(baseURI)) {
+      let base = document.getElementsByTagName('base')[0] || null;
+      if (!base) {
+        base = document.createElement('base');
+        const head = document.getElementsByTagName('head')[0];
+        if (head) head.prepend(base);
+      }
+      base?.setAttribute('href', baseURI);
+    }
+
+    const clonedDocument = document.cloneNode(true);
+    const root = clonedDocument.documentElement;
+    if (!root) return { ok: true, html: '' };
+    const selfAndDescendants = (selector) => {
+      const matches = [...root.querySelectorAll(selector)];
+      try { if (root.matches(selector)) matches.push(root); } catch { /* fixed internal selector */ }
+      return matches;
+    };
+    selfAndDescendants('script,noscript').forEach((node) => {
+      node.textContent = '';
+      node.removeAttribute('src');
+    });
+    selfAndDescendants('link[as="script"]').forEach((node) => node.removeAttribute('href'));
+    selfAndDescendants('[integrity]').forEach((node) => node.removeAttribute('integrity'));
+    selfAndDescendants('head iframe,head frame').forEach((node) => {
+      node.replaceWith(clonedDocument.createElement('script'));
+    });
+    selfAndDescendants('iframe,frame').forEach((node) => {
+      node.setAttribute('src', 'about:blank');
+      node.removeAttribute('srcdoc');
+    });
+    selfAndDescendants('a').forEach((node) => {
+      node.removeAttribute('target');
+      node.setAttribute('target', '_blank');
+    });
+    const stripEventAttributes = (node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      [...node.attributes].forEach((attribute) => {
+        if (/^on/i.test(attribute.name)) node.removeAttribute(attribute.name);
+      });
+      [...node.childNodes].forEach(stripEventAttributes);
+    };
+    stripEventAttributes(root);
+    return {
+      ok: true,
+      html: root.outerHTML.trim().replace(/\s*\n+(\s*\n+)*/g, '\n')
+    };
+  } catch (error) {
+    return { ok: false, error: 'Could not sanitize page evidence: ' + (error?.message || String(error)) };
+  }
+}
+
+async function captureRenderedSnapshot(monitor, existingTabId = null, { live = false, frameId: liveFrameId = null } = {}) {
   // Pinned tabs are Chrome's favicon-only, leftmost tab UI. They make a
   // scheduled check visible without taking focus or leaving a titled tab in
-  // the strip; a live watcher passes an already-open tab, which this function
-  // deliberately leaves untouched after reusing the exact same capture path.
+  // the strip; a live watcher passes its extension-owned tab, which this
+  // function deliberately leaves open after reusing the same capture path.
   const ownsTab = !Number.isInteger(existingTabId);
   const tab = ownsTab ? await chrome.tabs.create({
     url: monitor.url,
@@ -1816,43 +2920,66 @@ async function captureRenderedSnapshot(monitor, existingTabId = null) {
       ready = waitForRenderedTab(tab.id);
       await ready.promise;
     }
+    const requestedLiveFrame = live && Number.isInteger(liveFrameId) ? liveFrameId : null;
     let frames = [{ frameId: 0, parentFrameId: -1 }];
-    if (monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length)) {
+    if (monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length)
+      || (requestedLiveFrame !== null && requestedLiveFrame !== 0)) {
       if (typeof chrome.webNavigation?.getAllFrames !== 'function') throw new Error('Subframe selector capture is unavailable.');
       frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
     }
     const frameById = new Map(frames.map((frame) => [frame.frameId, frame]));
     const frameGroups = new Map();
+    const savedFrameOrder = new Map();
     for (const locator of monitor.locators) {
       const frameId = resolveLocatorFrame(locator, frames);
+      // Reference live_init places one independent watcher in every selected
+      // frame. A frame mutation filters only that frame rather than rebuilding
+      // a cross-frame aggregate for every event.
+      if (requestedLiveFrame !== null && frameId !== requestedLiveFrame) continue;
       if (!frameGroups.has(frameId)) frameGroups.set(frameId, []);
       frameGroups.get(frameId).push(locator);
+      // Reference Runner orders selected frame configurations by their saved
+      // `frame.index`, descending.  A stored `frameOrder` preserves that key
+      // across Chrome frame-ID reassignment; legacy records use the original
+      // frameId, which is the closest equivalent ordering key they retained.
+      const order = Number.isInteger(locator.frameOrder) ? locator.frameOrder : locator.frameId;
+      const prior = savedFrameOrder.get(frameId);
+      if (!Number.isInteger(prior) || order > prior) savedFrameOrder.set(frameId, order);
     }
     const requestedFrameIds = [...frameGroups.keys()];
     for (const frameId of requestedFrameIds) {
       if (!frameById.has(frameId)) throw new Error(`The configured frame (${frameId}) is not available on this page.`);
     }
-    const depthFor = (frame) => {
-      let current = frame;
-      let depth = 0;
-      while (current?.parentFrameId >= 0) { depth += 1; current = frameById.get(current.parentFrameId); }
-      return depth;
-    };
     const captures = [];
-    for (const frame of frames.filter((frame) => frameGroups.has(frame.frameId)).sort((left, right) => depthFor(right) - depthFor(left) || right.frameId - left.frameId)) {
+    const orderedFrames = frames
+      .filter((frame) => frameGroups.has(frame.frameId))
+      .sort((left, right) => (
+        (savedFrameOrder.get(right.frameId) ?? right.frameId)
+        - (savedFrameOrder.get(left.frameId) ?? left.frameId)
+      ) || right.frameId - left.frameId);
+    for (let frameIndex = 0; frameIndex < orderedFrames.length; frameIndex += 1) {
+      const frame = orderedFrames[frameIndex];
+      // Page settling and a configured delay apply once to the complete
+      // capture transaction, before the innermost configured frame. Repeating
+      // them for every frame makes a multi-frame monitor wait N times longer
+      // and can capture each frame at a different logical page moment.
+      const firstFrame = frameIndex === 0;
       let execution;
       try {
         execution = await chrome.scripting.executeScript({
           target: frame.frameId === 0 ? { tabId: tab.id } : { tabId: tab.id, frameIds: [frame.frameId] },
           func: captureReferenceRenderedDocumentCollection,
-          args: [frameGroups.get(frame.frameId), RENDER_MINIMUM_WAIT_MS, RENDER_QUIET_MS, RENDER_SETTLE_TIMEOUT_MS,
-            RENDER_EMPTY_RETRY_COUNT, RENDER_EMPTY_RETRY_DELAY_MS, {
+          args: [frameGroups.get(frame.frameId), firstFrame && !live ? 2_000 : 0, 0, firstFrame && !live ? 2_000 : 0,
+            live ? 0 : RENDER_EMPTY_RETRY_COUNT, live ? 0 : RENDER_EMPTY_RETRY_DELAY_MS, {
               allowEmpty: monitor.tracking?.allowEmpty === true,
-              delayMilliseconds: monitor.tracking?.delayMilliseconds ?? 0,
+              delayMilliseconds: firstFrame && !live ? monitor.tracking?.delayMilliseconds ?? 0 : 0,
               includeScript: monitor.tracking?.includeScript === true,
               includeStyle: monitor.tracking?.includeStyle === true,
               keepComments: monitor.tracking?.keepComments === true,
-              dataAttr: monitor.tracking?.dataAttr === 'data' ? 'data' : 'text'
+              captureErrorEvidence: Boolean(normalizeTracking(monitor.tracking).regexp),
+              dataAttr: monitor.tracking?.dataAttr === 'data' ? 'data' : 'text',
+              live: Boolean(live),
+              liveMonitorId: live ? monitor.id : null
             }]
         });
       } catch (error) {
@@ -1864,26 +2991,40 @@ async function captureRenderedSnapshot(monitor, existingTabId = null) {
     }
     const result = {
       ok: true,
-      items: captures.flatMap(({ result }) => Array.isArray(result.items) ? result.items : []),
       selectorMatches: captures.flatMap(({ frameId, result }) => (result.selectorMatches || []).map((match) => ({ ...match, frameId })))
     };
-    result.text = result.items.map((item) => item?.text).filter(Boolean).join('\n\n');
-    // Raw <html> documents cannot be safely nested in an element.  A template
-    // keeps each subframe's serialized document intact for the dashboard's
-    // inert structural diff, while a single-frame snapshot remains compact.
-    const frameMarkup = (frameId, html) => `<openstill-frame data-frame-id="${frameId}"><template data-openstill-frame-content="1">${html || ''}</template></openstill-frame>`;
-    result.html = captures.length === 1
-      ? captures[0].result.html || ''
-      : captures.map(({ frameId, result: frameResult }) => frameMarkup(frameId, frameResult.html)).join('\n');
-    result.data = result.html;
-    const errorCaptures = captures.filter(({ result: frameResult }) => frameResult.errorHtml);
-    result.errorHtml = errorCaptures.length === 1
-      ? errorCaptures[0].result.errorHtml
-      : errorCaptures.map(({ frameId, result: frameResult }) => frameMarkup(frameId, frameResult.errorHtml)).join('\n');
+    // The reference runner appends each configured frame's filtered document
+    // text in capture order. Keep one aggregate item so snapshot normalization
+    // cannot introduce a synthetic separator between frame results.
+    const rawText = captures.map(({ result: frameResult }) => {
+      // New rendered collectors return their already-normalized aggregate in
+      // `text`.  Older persisted/background capture adapters only returned
+      // `items`, though, so preserve that real payload instead of converting a
+      // successful selection into an empty result during migration.
+      if (typeof frameResult.text === 'string') return frameResult.text;
+      return Array.isArray(frameResult.items)
+        ? frameResult.items.map((item) => String(item?.text ?? '')).join('\n\n')
+        : '';
+    }).join('');
+    result.text = rawText;
+    result.items = result.text ? [{ text: result.text }] : [];
+    // The reference runner appends each filtered frame document directly to
+    // `result.data` (`result.data += html`).  Preserve that byte order rather
+    // than wrapping nested <html> documents in dashboard-only markup: wrapper
+    // nodes become part of a data-mode comparison and make an unchanged page
+    // appear different from the reference result.
+    const frameHtml = (frameResult) => typeof frameResult.html === 'string'
+      ? frameResult.html
+      : typeof frameResult.data === 'string' ? frameResult.data : '';
+    const frameData = (frameResult) => typeof frameResult.data === 'string'
+      ? frameResult.data
+      : frameHtml(frameResult);
+    result.data = captures.map(({ result: frameResult }) => frameData(frameResult)).join('');
+    result.html = result.data;
     result.matchCount = captures.reduce((total, { result: frameResult }) => (
       total + (Number.isInteger(frameResult.matchCount) ? frameResult.matchCount : Array.isArray(frameResult.items) ? frameResult.items.length : 0)
     ), 0);
-    const filteredText = filterCapturedText(result.text, monitor.tracking);
+    const filteredText = filterCapturedText(rawText, monitor.tracking);
     if (normalizeTracking(monitor.tracking).regexp) {
       // A regular-expression monitor observes the matched aggregate, not each
       // original DOM root.  Keep one ordered item so snapshot normalization
@@ -1891,7 +3032,38 @@ async function captureRenderedSnapshot(monitor, existingTabId = null) {
       result.items = [{ text: filteredText }];
     }
     result.text = filteredText;
-    result.exists = monitor.tracking?.allowEmpty ? result.matchCount > 0 : Boolean(result.text);
+    // The reference content observer performs its nonempty gate before the
+    // live runner applies regexp filtering. Thus a raw selection with no
+    // regexp matches is an ordinary empty comparison, not selector failure.
+    result.exists = live
+      ? Boolean(rawText)
+      : monitor.tracking?.allowEmpty ? result.matchCount > 0 : Boolean(result.text);
+    if (result.exists) {
+      result.errorHtml = '';
+    } else if (live) {
+      // Suppressed live-empty observations never generate full-page evidence.
+      result.errorHtml = '';
+    } else {
+      // Selection-empty snapshots always come from the top-level document in
+      // the reference runner, even if the configured selector lives only in a
+      // nested frame.  Do not combine subframe evidence: it would be a
+      // different document and cannot explain the page-level load state.
+      try {
+        const evidenceExecution = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: captureSanitizedErrorEvidenceDocument
+        });
+        const evidence = evidenceExecution[0]?.result;
+        result.errorHtml = evidence?.ok && typeof evidence.html === 'string'
+          ? evidence.html
+          : captures.find(({ frameId }) => frameId === 0)?.result?.errorHtml || '';
+      } catch {
+        // Keep the top-frame collector evidence as a narrow compatibility
+        // fallback when an environment forbids a second script injection. A
+        // subframe result is deliberately never substituted here.
+        result.errorHtml = captures.find(({ frameId }) => frameId === 0)?.result?.errorHtml || '';
+      }
+    }
 
     const snapshot = normalizeSnapshot({
       exists: Boolean(result.exists),
@@ -1905,6 +3077,16 @@ async function captureRenderedSnapshot(monitor, existingTabId = null) {
     });
     if (!snapshot) {
       throw new Error('선택자 목록 결과를 정리하지 못했습니다.');
+    }
+    if (live) {
+      // The value is deliberately non-enumerable: it is needed to reproduce
+      // content-side live dedupe, but it is not part of the persisted
+      // comparison snapshot (which contains regexp-filtered `text`).
+      Object.defineProperty(snapshot, 'liveRawText', {
+        value: rawText,
+        enumerable: false,
+        configurable: true
+      });
     }
     return snapshot;
   } finally {
@@ -1924,7 +3106,7 @@ async function captureRenderedSnapshot(monitor, existingTabId = null) {
 // into the monitored page.  It observes only; the service worker always makes
 // the actual typed-locator capture, so live and scheduled checks share one
 // filtering, frame, retry, and comparison implementation.
-function installLiveMutationObserver(monitorId, revision, debounceMilliseconds) {
+function installLiveMutationObserver(monitorId, revision) {
   const registryKey = '__openStillLiveMutationObservers';
   const registry = globalThis[registryKey] || (globalThis[registryKey] = new Map());
   const existing = registry.get(monitorId);
@@ -1932,12 +3114,9 @@ function installLiveMutationObserver(monitorId, revision, debounceMilliseconds) 
     return { ok: true, reused: true };
   }
   existing?.observer?.disconnect();
-  if (existing?.timer) clearTimeout(existing.timer);
+  if (existing?.shadowRescanTimer) clearInterval(existing.shadowRescanTimer);
 
-  const wait = Math.max(250, Math.min(30_000, Number(debounceMilliseconds) || 1_200));
-  let timer = null;
   const notify = () => {
-    timer = null;
     try {
       const sent = chrome.runtime.sendMessage({
         type: 'live-monitor-mutated',
@@ -1950,19 +3129,92 @@ function installLiveMutationObserver(monitorId, revision, debounceMilliseconds) 
       // A page can be unloading while the isolated world still has an observer.
     }
   };
-  const observer = new MutationObserver(() => {
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(notify, wait);
+  const observedRoots = new Set();
+  let paused = false;
+  const observerOptions = {
+    attributes: true,
+    attributeFilter: ['class', 'id', 'name', 'value', 'src', 'href'],
+    childList: true,
+    characterData: true,
+    subtree: true
+  };
+  // The picker is extension UI hosted in a closed shadow tree.  We deliberately
+  // pierce page shadow trees for live monitoring, but enrolling our own UI
+  // would turn ordinary editor/highlight updates into monitor captures.  A
+  // native document observer cannot see into that closed root, so preserve
+  // the same boundary when using chrome.dom.openOrClosedShadowRoot().
+  const isPickerHost = (element) => String(element?.localName || '').toLowerCase() === 'openstill-picker-root'
+    && element.getAttribute?.('data-openstill-picker-ui') === 'true';
+  const shadowFor = (element) => {
+    const read = (getter) => {
+      try { return getter() || null; } catch { return null; }
+    };
+    const usable = (root) => root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+      && typeof root.querySelectorAll === 'function'
+      ? root
+      : null;
+    return usable(read(() => element?.shadowRoot))
+      || usable(read(() => element?._shadowRoot))
+      || usable(read(() => chrome?.dom?.openOrClosedShadowRoot?.(element)));
+  };
+  const discoverShadowRoots = (node) => {
+    if (!(node instanceof Element)) return;
+    if (isPickerHost(node)) return;
+    const candidates = [node, ...node.querySelectorAll('*')];
+    for (const element of candidates) {
+      if (!isPickerHost(element)) observeRoot(shadowFor(element));
+    }
+  };
+  const observer = new MutationObserver((records) => {
+    if (paused) return;
+    for (const record of records) {
+      record.addedNodes.forEach(discoverShadowRoots);
+    }
+    // Reference Live immediately starts its filter for each delivered batch.
+    // In-flight worker capture is coalesced separately by requestLiveCapture;
+    // delaying here would make a short-lived DOM value invisible.
+    notify();
   });
+  const observeRoot = (root) => {
+    if (!(root instanceof Node) || observedRoots.has(root)) return;
+    observedRoots.add(root);
+    if (!paused) observer.observe(root, observerOptions);
+    if (typeof root.querySelectorAll === 'function') {
+      root.querySelectorAll('*').forEach((element) => {
+        if (!isPickerHost(element)) observeRoot(shadowFor(element));
+      });
+    }
+  };
+  const pause = () => {
+    if (paused) return;
+    paused = true;
+    observer.disconnect();
+  };
+  const resume = () => {
+    if (!paused) return;
+    paused = false;
+    observedRoots.forEach((observedRoot) => observer.observe(observedRoot, observerOptions));
+  };
   const root = document.documentElement;
   if (!root) return { ok: false, error: 'The page has no document root.' };
-  observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true });
-  const record = { revision, observer, get timer() { return timer; } };
+  observeRoot(root);
+  // Attaching a shadow root itself is not a MutationObserver record. Rescan
+  // hosts at a modest cadence so a component which creates a *closed* root
+  // after live monitoring starts is enrolled before its next internal change.
+  const shadowRescanTimer = setInterval(() => discoverShadowRoots(document.documentElement), 1_500);
+  const record = {
+    revision,
+    observer,
+    observedRoots,
+    shadowRescanTimer,
+    pause,
+    resume
+  };
   registry.set(monitorId, record);
   addEventListener('pagehide', () => {
     if (registry.get(monitorId) !== record) return;
     observer.disconnect();
-    if (timer) clearTimeout(timer);
+    clearInterval(shadowRescanTimer);
     registry.delete(monitorId);
   }, { once: true });
   return { ok: true, reused: false };
@@ -1973,6 +3225,7 @@ function removeLiveMutationObserver(monitorId) {
   const record = registry?.get(monitorId);
   record?.observer?.disconnect();
   if (record?.timer) clearTimeout(record.timer);
+  if (record?.shadowRescanTimer) clearInterval(record.shadowRescanTimer);
   registry?.delete(monitorId);
   return { ok: true };
 }
@@ -2013,21 +3266,51 @@ async function announceChange(monitor) {
 
 function dueTimestamp(monitor) {
   const timestamp = Date.parse(monitor.nextCheckAt ?? '');
-  return Number.isFinite(timestamp) ? timestamp : Date.now();
+  // A malformed/imported CRON expression can be retained but deliberately
+  // unscheduled. Treat its absent due time as infinity rather than "now" so
+  // it cannot wake the service worker in a tight loop.
+  return Number.isFinite(timestamp) ? timestamp : Number.POSITIVE_INFINITY;
 }
 
 async function scheduleNextAlarm() {
   const operation = alarmQueue.catch(() => undefined).then(async () => {
     const monitors = await getMonitors();
-    const enabled = monitors.filter((monitor) => monitor.enabled && isAutomaticSchedule(monitor));
+    const enabled = monitors
+      .filter((monitor) => monitor.enabled && isAutomaticSchedule(monitor))
+      .map((monitor) => ({ monitor, due: dueTimestamp(monitor) }))
+      .filter(({ due }) => Number.isFinite(due));
+    if (precisionScheduleTimer !== null) {
+      clearTimeout(precisionScheduleTimer);
+      precisionScheduleTimer = null;
+    }
     await chrome.alarms.clear(ALARM_NAME);
 
     if (!enabled.length) {
       return;
     }
 
-    const nextDue = Math.min(...enabled.map(dueTimestamp));
-    await chrome.alarms.create(ALARM_NAME, { when: Math.max(Date.now() + 1_000, nextDue) });
+    const nextDue = Math.min(...enabled.map(({ due }) => due));
+    const now = Date.now();
+    const delay = Math.max(0, nextDue - now);
+    if (delay < MIN_CHROME_ALARM_DELAY_MS) {
+      // Chrome alarms may defer sub-30-second wakeups, but a live service
+      // worker can honor the five-second Reference cadence precisely. Keep an
+      // alarm at Chrome's reliable floor as a recovery fallback if MV3 tears
+      // down this worker before the in-memory timer fires.
+      let timer;
+      timer = setTimeout(() => {
+        if (precisionScheduleTimer !== timer) return;
+        precisionScheduleTimer = null;
+        void runDueChecks();
+      }, delay);
+      // Node-based tests should not be held open by a future precision timer;
+      // browser timeout ids are numeric and simply do not expose unref().
+      timer?.unref?.();
+      precisionScheduleTimer = timer;
+      await chrome.alarms.create(ALARM_NAME, { when: now + MIN_CHROME_ALARM_DELAY_MS });
+      return;
+    }
+    await chrome.alarms.create(ALARM_NAME, { when: Math.max(now + 1_000, nextDue) });
   });
   alarmQueue = operation.catch(() => undefined);
   return operation;
@@ -2045,17 +3328,45 @@ function appendRunHistory(monitor, entry) {
   }, ...prior].slice(0, MAX_RUN_HISTORY);
 }
 
-async function setCheckFailure(id, expectedRevision, status, errorMessage) {
+function hasSuccessfulRun(monitor, { pendingFailure = false } = {}) {
+  // The reference scheduler queries the newest ten work logs *after* the
+  // current failed run is recorded.  Failure scheduling here happens just
+  // before appendRunHistory(), so reserve one of those ten slots to avoid
+  // granting a quick retry based on an eleventh-old success.
+  const limit = pendingFailure ? 9 : 10;
+  const runs = Array.isArray(monitor?.runs) ? monitor.runs.slice(0, limit) : [];
+  if (runs.length) return runs.some((run) => run?.status === 'ok' || run?.status === 'changed');
+  // Legacy/imported monitors can have a baseline before run-history support.
+  const snapshot = monitor?.snapshot;
+  return Boolean(snapshot && (snapshot.exists || normalizeTracking(monitor?.tracking).allowEmpty));
+}
+
+function retryDelayForSchedule(monitor) {
+  const schedule = scheduleDescriptorOf(monitor);
+  if (!schedule) return null;
+  if (schedule.type === SCHEDULE_MODE_INTERVAL) return Math.min(120_000, schedule.params.interval * 1_000);
+  if (schedule.type === SCHEDULE_MODE_RANDOM) return Math.min(120_000, schedule.params.max * 1_000);
+  if (schedule.type === SCHEDULE_MODE_CRON) return 60_000;
+  return null;
+}
+
+async function setCheckFailure(id, expectedRevision, status, errorMessage, source = 'manual') {
   const checkedAt = nowIso();
   await mutateMonitors((monitors) => {
     const monitor = monitors.find((item) => item.id === id);
     if (!monitor || !monitor.enabled || monitor.revision !== expectedRevision) {
       return null;
     }
-    monitor.lastCheckedAt = checkedAt;
-    monitor.nextCheckAt = isAutomaticSchedule(monitor) && monitor.snapshot
-      ? new Date(Date.now() + ERROR_RETRY_MS).toISOString()
-      : nextCheckForSchedule(monitor.scheduleMode, checkedAt, monitor.intervalHours);
+    const advancesSchedule = source !== 'live' || scheduleDescriptorOf(monitor)?.type === SCHEDULE_MODE_LIVE;
+    if (advancesSchedule) monitor.lastCheckedAt = checkedAt;
+    const retryDelay = isAutomaticSchedule(monitor) && hasSuccessfulRun(monitor, { pendingFailure: true })
+      ? retryDelayForSchedule(monitor)
+      : null;
+    if (advancesSchedule) {
+      monitor.nextCheckAt = retryDelay
+        ? new Date(Date.now() + retryDelay).toISOString()
+        : nextCheckForSchedule(monitor.schedule, checkedAt, monitor.intervalHours);
+    }
     monitor.status = status;
     monitor.lastReviewAt = null;
     monitor.lastError = cleanText(errorMessage, 300);
@@ -2135,7 +3446,19 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
   return { changed, needsReview: false };
 }
 
-async function checkMonitorWithCapture(id, capture, { reschedule = true } = {}) {
+function liveRawTextOf(snapshot) {
+  // Normal live captures place this field on the snapshot as non-enumerable
+  // metadata. `rawText` keeps the function useful with older/adapted capture
+  // implementations and test doubles.
+  return String(snapshot?.liveRawText ?? snapshot?.rawText ?? snapshot?.text ?? '');
+}
+
+async function checkMonitorWithCapture(id, capture, {
+  reschedule = true,
+  source = 'manual',
+  liveFrameId = 0,
+  liveTabId = null
+} = {}) {
   if (checksInProgress.has(id)) {
     return { ok: false, reason: 'checking', error: '이미 확인 중입니다.' };
   }
@@ -2150,22 +3473,57 @@ async function checkMonitorWithCapture(id, capture, { reschedule = true } = {}) 
       return { ok: false, reason: 'disabled', error: '일시정지된 모니터입니다.' };
     }
     if (!await hasSitePermission(monitor.url)) {
-      await setCheckFailure(id, monitor.revision, 'permission-needed', '이 사이트의 접근 권한이 필요합니다.');
+      await setCheckFailure(id, monitor.revision, 'permission-needed', '이 사이트의 접근 권한이 필요합니다.', source);
       return { ok: false, reason: 'permission', error: '이 사이트의 접근 권한이 필요합니다.' };
     }
 
     let nextSnapshot;
     try {
-      const captureTimeout = monitor.tracking?.timeoutMilliseconds ?? CHECK_EXECUTION_TIMEOUT_MS;
-      nextSnapshot = await timeout(
-        capture(monitor),
-        captureTimeout + (monitor.tracking?.delayMilliseconds ?? 0),
-        'The page capture exceeded its allowed time.'
-      );
+      // The reference live runner gives page loading a timeout, but mutation
+      // callbacks themselves filter immediately. Do not impose scheduled
+      // capture delay/timeout semantics on a live event.
+      if (source === 'live') {
+        nextSnapshot = await capture(monitor);
+      } else {
+        const captureTimeout = monitor.tracking?.timeoutMilliseconds ?? CHECK_EXECUTION_TIMEOUT_MS;
+        nextSnapshot = await timeout(
+          capture(monitor),
+          captureTimeout,
+          'The page capture exceeded its allowed time.'
+        );
+      }
     } catch (error) {
       const message = responseError(error);
-      await setCheckFailure(id, monitor.revision, 'error', message);
+      await setCheckFailure(id, monitor.revision, 'error', message, source);
       return { ok: false, error: message };
+    }
+
+    if (source === 'live') {
+      // The reference live content observer deliberately suppresses empty
+      // filter results and uses filtered text—not HTML/data mode—as its
+      // deduplication key. A transient disappearance therefore waits for a
+      // later nonempty mutation instead of rewriting the saved baseline.
+      const rawText = liveRawTextOf(nextSnapshot);
+      if (!rawText) {
+        return { ok: true, liveNoop: true, empty: true };
+      }
+      const session = liveSessions.get(id);
+      const expectedSession = session
+        && session.revision === monitor.revision
+        && (!Number.isInteger(liveTabId) || session.tabId === liveTabId);
+      const frameId = Number.isInteger(liveFrameId) ? liveFrameId : 0;
+      if (expectedSession) {
+        session.rawTextByFrame || (session.rawTextByFrame = new Map());
+        if (session.rawTextByFrame.get(frameId) === rawText) {
+          return { ok: true, liveNoop: true, unchanged: true };
+        }
+        // Content advances lastResult before the runner applies regexp or
+        // persists its comparison result, so cache this raw frame value now.
+        session.rawTextByFrame.set(frameId, rawText);
+      }
+      // A raw nonempty regexp miss is a successful empty comparison in live
+      // mode, not the scheduled selection-empty/review condition.
+      if (nextSnapshot && !nextSnapshot.exists) nextSnapshot.exists = true;
     }
 
     const checkedAt = nowIso();
@@ -2175,20 +3533,54 @@ async function checkMonitorWithCapture(id, capture, { reschedule = true } = {}) 
         return { ok: false, reason: 'outdated', error: '확인 중 모니터 설정이 변경되었습니다.' };
       }
 
-      current.lastCheckedAt = checkedAt;
-      current.nextCheckAt = nextCheckForSchedule(current.scheduleMode, checkedAt, current.intervalHours);
-      current.updatedAt = checkedAt;
+      // A live mutation is an additional signal, not a new periodic cadence.
+      // Keep interval/random/cron due times intact so busy pages cannot defer
+      // their scheduled verification forever. A pure LIVE schedule still
+      // records its most recent check because it has no alarm cadence to move.
+      const advancesSchedule = source !== 'live' || scheduleDescriptorOf(current)?.type === SCHEDULE_MODE_LIVE;
+      if (advancesSchedule) {
+        current.lastCheckedAt = checkedAt;
+        current.nextCheckAt = nextCheckForSchedule(current.schedule, checkedAt, current.intervalHours);
+      }
+      const previousStatus = current.status;
+      const previousError = current.lastError;
+      const previousReviewAt = current.lastReviewAt;
+      const hadErrorSnapshot = Boolean(current.lastErrorSnapshot);
+      const hadSnapshot = Boolean(current.snapshot);
       const applied = applySnapshotOutcome(current, nextSnapshot, checkedAt);
-      appendRunHistory(current, {
-        at: checkedAt,
-        status: applied.needsReview ? 'needs-review' : applied.changed ? 'changed' : 'ok',
-        code: applied.needsReview ? 'selection-empty' : null,
-        message: applied.needsReview ? current.lastError : null,
-        changed: applied.changed,
-        matchCount: nextSnapshot.matchCount
-      });
+      // A nonempty baseline followed by an empty selection is an execution
+      // error in the reference scheduler. Keep the baseline/evidence, but
+      // perform its bounded quick retry instead of waiting a full interval.
+      if (applied.needsReview && advancesSchedule) {
+        const retryDelay = isAutomaticSchedule(current) && hasSuccessfulRun(current, { pendingFailure: true })
+          ? retryDelayForSchedule(current)
+          : null;
+        if (retryDelay) current.nextCheckAt = new Date(Date.now() + retryDelay).toISOString();
+      }
+      // The reference live observer emits an initial nonempty result and then
+      // only filtered-text changes. Preserve recovery/error evidence, but do
+      // not add a run or churn updatedAt for an equal live mutation.
+      const recordOutcome = source !== 'live'
+        || !hadSnapshot
+        || applied.changed
+        || applied.needsReview
+        || previousStatus !== current.status
+        || previousError !== current.lastError
+        || previousReviewAt !== current.lastReviewAt
+        || hadErrorSnapshot !== Boolean(current.lastErrorSnapshot);
+      if (recordOutcome) {
+        current.updatedAt = checkedAt;
+        appendRunHistory(current, {
+          at: checkedAt,
+          status: applied.needsReview ? 'needs-review' : applied.changed ? 'changed' : 'ok',
+          code: applied.needsReview ? 'selection-empty' : null,
+          message: applied.needsReview ? current.lastError : null,
+          changed: applied.changed,
+          matchCount: nextSnapshot.matchCount
+        });
+      }
 
-      return { ok: true, ...applied, monitor: { ...current } };
+      return { ok: true, ...applied, liveNoop: source === 'live' && !recordOutcome, monitor: { ...current } };
     });
 
     if (result?.changed) {
@@ -2211,83 +3603,380 @@ async function checkMonitor(id, options = {}) {
 }
 
 async function checkMonitorInOpenTab(id, tabId, options = {}) {
-  return checkMonitorWithCapture(id, (monitor) => captureRenderedSnapshot(monitor, tabId), options);
+  return checkMonitorWithCapture(
+    id,
+    (monitor) => captureRenderedSnapshot(monitor, tabId, {
+      live: options.source === 'live',
+      frameId: options.liveFrameId
+    }),
+    { ...options, liveTabId: tabId }
+  );
 }
 
 function tabMatchesMonitor(tab, monitor) {
   return Number.isInteger(tab?.id) && normalizeUrl(tab.url) === monitor.url;
 }
 
-async function liveTabForMonitor(monitor, requestedTabId = null) {
-  if (typeof chrome.tabs?.query !== 'function') {
-    throw new Error('This browser cannot inspect open tabs for live monitoring.');
+function normalizeLiveOwnedTabs(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const result = {};
+  for (const [monitorId, entry] of Object.entries(source)) {
+    const id = String(monitorId || '').trim();
+    const rawTabId = entry?.tabId;
+    const tabId = typeof rawTabId === 'number'
+      ? rawTabId
+      : typeof rawTabId === 'string' && /^\d+$/.test(rawTabId) ? Number(rawTabId) : Number.NaN;
+    const revision = String(entry?.revision || '').trim();
+    const url = normalizeUrl(entry?.url);
+    if (id && Number.isInteger(tabId) && tabId >= 0 && revision && url) {
+      result[id] = { tabId, revision, url };
+    }
   }
-  const tabs = await chrome.tabs.query({});
-  const matching = tabs.filter((tab) => tabMatchesMonitor(tab, monitor));
-  if (Number.isInteger(requestedTabId)) {
-    const requested = matching.find((tab) => tab.id === requestedTabId);
-    if (requested) return requested;
+  return result;
+}
+
+async function mutateLiveOwnedTabs(mutator) {
+  const operation = liveOwnershipQueue.catch(() => undefined).then(async () => {
+    const stored = await chrome.storage.session.get(LIVE_CONTROLLED_TABS_KEY);
+    const owned = normalizeLiveOwnedTabs(stored?.[LIVE_CONTROLLED_TABS_KEY]);
+    const value = await mutator(owned);
+    await chrome.storage.session.set({ [LIVE_CONTROLLED_TABS_KEY]: owned });
+    return value;
+  });
+  liveOwnershipQueue = operation.catch(() => undefined);
+  return operation;
+}
+
+async function getLiveOwnedTabs() {
+  await liveOwnershipQueue.catch(() => undefined);
+  const stored = await chrome.storage.session.get(LIVE_CONTROLLED_TABS_KEY);
+  return normalizeLiveOwnedTabs(stored?.[LIVE_CONTROLLED_TABS_KEY]);
+}
+
+async function rememberLiveControlledTab(monitor, tabId) {
+  return mutateLiveOwnedTabs((owned) => {
+    owned[monitor.id] = { tabId, revision: monitor.revision, url: monitor.url };
+  });
+}
+
+async function forgetLiveControlledTab(monitorId, expectedTabId = null) {
+  return mutateLiveOwnedTabs((owned) => {
+    const entry = owned[monitorId];
+    if (entry && (!Number.isInteger(expectedTabId) || entry.tabId === expectedTabId)) {
+      delete owned[monitorId];
+    }
+  });
+}
+
+async function forgetLiveControlledTabByTabId(tabId) {
+  if (!Number.isInteger(tabId)) return;
+  return mutateLiveOwnedTabs((owned) => {
+    for (const [monitorId, entry] of Object.entries(owned)) {
+      if (entry.tabId === tabId) delete owned[monitorId];
+    }
+  });
+}
+
+async function tabById(tabId) {
+  if (!Number.isInteger(tabId)) return null;
+  if (typeof chrome.tabs?.get === 'function') return chrome.tabs.get(tabId).catch(() => null);
+  if (typeof chrome.tabs?.query === 'function') {
+    return (await chrome.tabs.query({})).find((tab) => tab.id === tabId) || null;
   }
-  return matching.sort((left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active)) || left.id - right.id)[0] ?? null;
+  return null;
+}
+
+async function adoptLiveControlledSession(monitor) {
+  const current = liveSessions.get(monitor.id);
+  if (current) return current;
+  const owned = await getLiveOwnedTabs();
+  const entry = owned[monitor.id];
+  if (!entry) return null;
+
+  // The stored tab id is only a candidate. Require the exact monitor
+  // revision and normalized URL before treating it as extension-owned again.
+  if (entry.revision !== monitor.revision || entry.url !== monitor.url) {
+    await removeLiveControlledTab(entry.tabId);
+    await forgetLiveControlledTab(monitor.id, entry.tabId);
+    return null;
+  }
+  const tab = await tabById(entry.tabId);
+  if (!tab || !tabMatchesMonitor(tab, monitor)) {
+    if (tab) await removeLiveControlledTab(entry.tabId);
+    await forgetLiveControlledTab(monitor.id, entry.tabId);
+    return null;
+  }
+  const session = {
+    tabId: entry.tabId,
+    revision: entry.revision,
+    frameIds: new Set(),
+    rawTextByFrame: new Map(),
+    ownedTab: true,
+    // The old worker's isolated observer may still exist, but this worker has
+    // no reliable registration state. Re-run live_init against the verified
+    // controlled tab before accepting mutations.
+    navigating: true
+  };
+  liveSessions.set(monitor.id, session);
+  return session;
+}
+
+async function reconcileLiveControlledTabs(monitors) {
+  const byId = new Map(monitors.map((monitor) => [monitor.id, monitor]));
+  const owned = await getLiveOwnedTabs();
+  let adopted = 0;
+  for (const [monitorId, entry] of Object.entries(owned)) {
+    const monitor = byId.get(monitorId);
+    const validMonitor = monitor
+      && monitor.enabled
+      && isLiveTracking(monitor)
+      && monitor.revision === entry.revision
+      && monitor.url === entry.url;
+    if (!validMonitor) {
+      await removeLiveControlledTab(entry.tabId);
+      await forgetLiveControlledTab(monitorId, entry.tabId);
+      continue;
+    }
+    if (!liveSessions.has(monitorId) && await adoptLiveControlledSession(monitor)) adopted += 1;
+  }
+  return { adopted };
+}
+
+async function removeLiveControlledTab(tabId) {
+  if (!Number.isInteger(tabId)) return;
+  await chrome.tabs.remove(tabId).catch(async () => {
+    // Keep the same best-effort unpin fallback used by one-shot captures.
+    await chrome.tabs.update(tabId, { pinned: false }).catch(() => undefined);
+    await chrome.tabs.remove(tabId).catch(() => undefined);
+  });
+}
+
+async function createLiveControlledTab(monitor) {
+  if (typeof chrome.tabs?.create !== 'function') {
+    throw new Error('This browser cannot create a controlled live-monitor tab.');
+  }
+  // LiveRunner always creates its own pinned, background loader. Reusing a
+  // user tab would make the extension observe and mutate a page the runner
+  // does not own, and differs from the reference lifecycle.
+  const tab = await chrome.tabs.create({
+    url: monitor.url,
+    active: false,
+    pinned: true,
+    index: 0
+  });
+  if (!Number.isInteger(tab?.id)) {
+    throw new Error('Could not create a controlled tab for live monitoring.');
+  }
+  const ready = waitForRenderedTab(tab.id);
+  try {
+    await ready.promise;
+    return tab;
+  } catch (error) {
+    await removeLiveControlledTab(tab.id);
+    throw error;
+  } finally {
+    ready.cancel();
+  }
+}
+
+async function liveFrameIdsForMonitor(monitor, tabId) {
+  const needsFrames = monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length);
+  if (!needsFrames) return [0];
+  if (typeof chrome.webNavigation?.getAllFrames !== 'function') {
+    throw new Error('Subframe live monitoring is unavailable in this browser.');
+  }
+  const frames = await chrome.webNavigation.getAllFrames({ tabId });
+  const ids = [...new Set(monitor.locators.map((locator) => resolveLocatorFrame(locator, frames)))];
+  if (ids.some((frameId) => !Number.isInteger(frameId) || frameId < 0)) {
+    throw new Error('A saved live-monitor frame is no longer available on this page.');
+  }
+  return ids;
+}
+
+function liveTarget(tabId, frameIds) {
+  // Supplying frameIds (rather than allFrames) keeps unrelated ads/widgets
+  // from waking the monitor. Chrome accepts frame 0 in this explicit list.
+  return { tabId, frameIds: [...new Set(frameIds)] };
+}
+
+async function detachLiveSession(monitorId) {
+  const session = liveSessions.get(monitorId);
+  if (!session) {
+    liveDirtyByMonitor.delete(monitorId);
+    return { ok: true, stopped: false };
+  }
+  const frameIds = [...(session.frameIds || [])];
+  const ownsTab = session.ownedTab === true;
+  try {
+    if (frameIds.length) {
+      await chrome.scripting.executeScript({
+        target: liveTarget(session.tabId, frameIds),
+        func: removeLiveMutationObserver,
+        args: [monitorId]
+      });
+    }
+    return { ok: true, stopped: true, tabId: session.tabId };
+  } catch (error) {
+    // A navigated/closed frame can reject an otherwise successful teardown.
+    // Always discard the worker-side session so a new revision can recover.
+    return { ok: false, stopped: false, tabId: session.tabId, error: responseError(error) };
+  } finally {
+    liveSessions.delete(monitorId);
+    liveDirtyByMonitor.delete(monitorId);
+    if (ownsTab) {
+      await removeLiveControlledTab(session.tabId);
+      await forgetLiveControlledTab(monitorId, session.tabId);
+    }
+  }
+}
+
+function queueLiveDirtyFrame(monitorId, tabId, revision, frameId) {
+  const normalizedFrameId = Number.isInteger(frameId) && frameId >= 0 ? frameId : 0;
+  const existing = liveDirtyByMonitor.get(monitorId);
+  if (existing?.revision === revision && existing.tabId === tabId) {
+    existing.frameIds.add(normalizedFrameId);
+    return existing;
+  }
+  const dirty = { tabId, revision, frameIds: new Set([normalizedFrameId]) };
+  liveDirtyByMonitor.set(monitorId, dirty);
+  return dirty;
+}
+
+function takeLiveDirtyFrames(monitorId, tabId, revision) {
+  const dirty = liveDirtyByMonitor.get(monitorId);
+  if (!dirty || dirty.revision !== revision || dirty.tabId !== tabId) return [];
+  liveDirtyByMonitor.delete(monitorId);
+  return [...dirty.frameIds];
+}
+
+async function requestLiveCapture(monitor, tabId, frameId = 0) {
+  if (checksInProgress.has(monitor.id)) {
+    queueLiveDirtyFrame(monitor.id, tabId, monitor.revision, frameId);
+    return { ok: true, pending: true };
+  }
+
+  let result;
+  let rounds = 0;
+  let frameIds = [Number.isInteger(frameId) ? frameId : 0];
+  // Process the full first concurrent batch, rather than retaining only the
+  // latest frame event. A busy page can continue to mutate forever, so leave
+  // a later batch to the normal asynchronous requeue after two bounded rounds.
+  while (frameIds.length && rounds < 2) {
+    for (const currentFrameId of frameIds) {
+      result = await checkMonitorInOpenTab(monitor.id, tabId, {
+        reschedule: false,
+        source: 'live',
+        liveFrameId: currentFrameId
+      });
+    }
+    rounds += 1;
+    frameIds = takeLiveDirtyFrames(monitor.id, tabId, monitor.revision);
+  }
+
+  // `frameIds` already holds a batch taken at the end of the final bounded
+  // round; include it before taking any newer events so it cannot be dropped.
+  const remaining = [...new Set([
+    ...frameIds,
+    ...takeLiveDirtyFrames(monitor.id, tabId, monitor.revision)
+  ])];
+  if (remaining.length) {
+    setTimeout(() => {
+      for (const remainingFrameId of remaining) {
+        void handleLiveMonitorMutation(
+          { id: monitor.id, revision: monitor.revision },
+          { tab: { id: tabId, url: monitor.url }, frameId: remainingFrameId }
+        );
+      }
+    }, 0);
+  }
+  return result;
+}
+
+
+async function initializeLiveSession(monitor, session) {
+  const frameIds = await liveFrameIdsForMonitor(monitor, session.tabId);
+  session.frameIds = new Set(frameIds);
+  session.rawTextByFrame = new Map();
+
+  // Content live_init performs its first filter before attaching its mutation
+  // observer. Doing the same prevents capture-owned source writes (notably the
+  // capture base element) from scheduling a self-feedback check.
+  const initialResults = [];
+  for (const frameId of frameIds) {
+    initialResults.push(await requestLiveCapture(monitor, session.tabId, frameId));
+  }
+
+  const installed = await chrome.scripting.executeScript({
+    target: liveTarget(session.tabId, frameIds),
+    func: installLiveMutationObserver,
+    args: [monitor.id, monitor.revision]
+  });
+  return {
+    installedFrames: installed.length,
+    initial: initialResults.length === 1 ? initialResults[0] : initialResults
+  };
 }
 
 async function startLiveMonitor(message) {
   const monitor = (await getMonitors()).find((item) => item.id === message?.id);
-  if (!monitor) return { ok: false, error: '추적을 찾을 수 없습니다.' };
-  if (!monitor.enabled) return { ok: false, error: '일시 정지된 추적입니다.' };
+  if (!monitor) return { ok: false, error: 'Live monitor was not found.' };
+  if (!monitor.enabled) return { ok: false, error: 'Live monitor is disabled.' };
   if (!normalizeTracking(monitor.tracking).live) {
-    return { ok: false, error: '먼저 추적 설정에서 실시간 감시를 켜 주세요.' };
+    return { ok: false, error: 'Live monitoring is not enabled for this monitor.' };
   }
   if (!await hasSitePermission(monitor.url)) {
-    return { ok: false, reason: 'permission', error: '이 사이트의 접근 권한이 필요합니다.' };
+    return { ok: false, reason: 'permission', error: 'Site access is required for live monitoring.' };
   }
-  let tab;
-  try {
-    tab = await liveTabForMonitor(monitor, message?.tabId);
-  } catch (error) {
-    return { ok: false, error: responseError(error) };
-  }
-  if (!tab) {
-    return { ok: false, error: '실시간으로 감시할 열린 페이지를 찾지 못했습니다. 먼저 해당 URL을 일반 탭으로 열어 주세요.' };
-  }
-  try {
-    const installed = await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      func: installLiveMutationObserver,
-      args: [monitor.id, monitor.revision, normalizeTracking(monitor.tracking).liveDebounceMilliseconds]
-    });
-    const initial = await checkMonitorInOpenTab(monitor.id, tab.id, { reschedule: false });
+
+  let existing = liveSessions.get(monitor.id);
+  if (!existing) existing = await adoptLiveControlledSession(monitor);
+  if (existing?.revision === monitor.revision && !existing.navigating) {
     return {
       ok: true,
-      tabId: tab.id,
-      installedFrames: installed.length,
-      initial
+      tabId: existing.tabId,
+      reused: true,
+      installedFrames: existing.frameIds?.size ?? 0
     };
+  }
+
+  let session;
+  try {
+    if (existing?.revision === monitor.revision && existing.navigating) {
+      // A navigation destroys the isolated observer but the controlled tab is
+      // still ours. Reuse only that known tab after the new document finishes.
+      session = existing;
+      session.navigating = false;
+    } else {
+      if (existing) await detachLiveSession(monitor.id);
+      const tab = await createLiveControlledTab(monitor);
+      session = {
+        tabId: tab.id,
+        revision: monitor.revision,
+        frameIds: new Set(),
+        rawTextByFrame: new Map(),
+        ownedTab: true,
+        navigating: false
+      };
+      liveSessions.set(monitor.id, session);
+      await rememberLiveControlledTab(monitor, tab.id);
+    }
+    const initialized = await initializeLiveSession(monitor, session);
+    return { ok: true, tabId: session.tabId, ...initialized };
   } catch (error) {
+    if (session && liveSessions.get(monitor.id) === session) {
+      await detachLiveSession(monitor.id).catch(() => undefined);
+    }
     return { ok: false, error: responseError(error) };
   }
 }
 
 async function stopLiveMonitor(message) {
   const monitor = (await getMonitors()).find((item) => item.id === message?.id);
-  if (!monitor) return { ok: false, error: '추적을 찾을 수 없습니다.' };
-  let tab;
-  try {
-    tab = await liveTabForMonitor(monitor, message?.tabId);
-  } catch (error) {
-    return { ok: false, error: responseError(error) };
-  }
-  if (!tab) return { ok: true, stopped: false };
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      func: removeLiveMutationObserver,
-      args: [monitor.id]
-    });
-    return { ok: true, stopped: true, tabId: tab.id };
-  } catch (error) {
-    return { ok: false, error: responseError(error) };
-  }
+  if (!monitor) return { ok: false, error: 'Live monitor was not found.' };
+  // There is intentionally no matching-tab fallback: reference LiveRunner
+  // owns the page it observes, so stop must never inject into a user tab.
+  if (!liveSessions.has(monitor.id)) await adoptLiveControlledSession(monitor);
+  return detachLiveSession(monitor.id);
 }
 
 async function handleLiveMonitorMutation(message, sender) {
@@ -2299,8 +3988,128 @@ async function handleLiveMonitorMutation(message, sender) {
     return { ok: false, ignored: true };
   }
   if (!tabMatchesMonitor(sender.tab, monitor)) return { ok: false, ignored: true };
-  if (checksInProgress.has(id)) return { ok: true, pending: true };
-  return checkMonitorInOpenTab(id, tabId, { reschedule: false });
+  const session = liveSessions.get(id);
+  if (!session || session.revision !== monitor.revision || session.tabId !== tabId) {
+    return { ok: false, ignored: true };
+  }
+  const frameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
+  if (!session.frameIds.has(frameId)) return { ok: false, ignored: true };
+  return requestLiveCapture(monitor, tabId, frameId);
+}
+
+function isLiveTracking(monitor) {
+  return normalizeTracking(monitor?.tracking).live || scheduleDescriptorOf(monitor)?.type === SCHEDULE_MODE_LIVE;
+}
+
+async function restoreLiveForTab(tabId, knownTab = null) {
+  let tab = knownTab;
+  if (!tab && typeof chrome.tabs?.get === 'function') {
+    tab = await chrome.tabs.get(tabId).catch(() => null);
+  }
+  if (!tab && typeof chrome.tabs?.query === 'function') {
+    tab = (await chrome.tabs.query({})).find((candidate) => candidate.id === tabId) || null;
+  }
+  if (!tab) return { restored: 0 };
+  const monitors = new Map((await getMonitors()).map((monitor) => [monitor.id, monitor]));
+  // A tab update must only ever restore a session we already own. Do not turn
+  // a user navigating to the same URL into a new live injection.
+  const matching = [...liveSessions.entries()].flatMap(([id, session]) => {
+    const monitor = monitors.get(id);
+    return monitor
+      && session.tabId === tabId
+      && session.navigating
+      && session.revision === monitor.revision
+      && monitor.enabled
+      && isLiveTracking(monitor)
+      && tabMatchesMonitor(tab, monitor)
+      ? [monitor]
+      : [];
+  });
+  const outcomes = await Promise.allSettled(matching.map((monitor) => startLiveMonitor({ id: monitor.id })));
+  return { restored: outcomes.filter((outcome) => outcome.status === 'fulfilled' && outcome.value?.ok).length };
+}
+
+async function restoreLiveMonitoring() {
+  const monitors = (await getMonitors()).filter((monitor) => monitor.enabled && isLiveTracking(monitor));
+  await reconcileLiveControlledTabs(monitors);
+  let restored = 0;
+  for (const monitor of monitors) {
+    const session = liveSessions.get(monitor.id);
+    if (session?.revision === monitor.revision && !session.navigating) continue;
+    const outcome = await startLiveMonitor({ id: monitor.id }).catch(() => null);
+    if (outcome?.ok) restored += 1;
+  }
+  return { restored };
+}
+
+// Every mutation path (save, import, URL replacement, deletion, enable) can
+// change the eligibility or revision of a live monitor. Reconcile the
+// in-memory observers centrally so an old isolated-world observer never
+// survives merely because its monitor was edited through a different UI.
+async function reconcileLiveSessions() {
+  const monitors = await getMonitors();
+  await reconcileLiveControlledTabs(monitors);
+  const byId = new Map(monitors.map((monitor) => [monitor.id, monitor]));
+  for (const [id, session] of [...liveSessions]) {
+    const monitor = byId.get(id);
+    if (!monitor || !monitor.enabled || !isLiveTracking(monitor) || monitor.revision !== session.revision) {
+      await detachLiveSession(id);
+    }
+  }
+  let restored = 0;
+  for (const monitor of monitors) {
+    if (!monitor.enabled || !isLiveTracking(monitor)) continue;
+    const session = liveSessions.get(monitor.id);
+    if (session?.revision === monitor.revision && !session.navigating) continue;
+    const result = await startLiveMonitor({ id: monitor.id }).catch(() => null);
+    if (result?.ok) restored += 1;
+  }
+  return { restored };
+}
+
+async function reinstallLiveFrame(tabId, frameId) {
+  if (!Number.isInteger(tabId) || !Number.isInteger(frameId) || frameId < 0) return { reinstalled: 0 };
+  let tab = null;
+  if (typeof chrome.tabs?.get === 'function') tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab && typeof chrome.tabs?.query === 'function') {
+    tab = (await chrome.tabs.query({})).find((candidate) => candidate.id === tabId) || null;
+  }
+  if (!tab) return { reinstalled: 0 };
+  const monitors = new Map((await getMonitors()).map((monitor) => [monitor.id, monitor]));
+  let reinstalled = 0;
+  for (const [id, session] of [...liveSessions]) {
+    if (session.tabId !== tabId) continue;
+    const monitor = monitors.get(id);
+    if (!monitor || !monitor.enabled || !isLiveTracking(monitor) || monitor.revision !== session.revision || !tabMatchesMonitor(tab, monitor)) {
+      await detachLiveSession(id);
+      continue;
+    }
+    let frameIds;
+    try {
+      frameIds = await liveFrameIdsForMonitor(monitor, tabId);
+    } catch {
+      continue;
+    }
+    session.frameIds = new Set(frameIds);
+    if (!session.frameIds.has(frameId)) continue;
+    try {
+      // A new frame document has no content-side lastResult. Reset only this
+      // frame's raw key and perform its live_init-equivalent capture before
+      // listening for subsequent mutations.
+      session.rawTextByFrame?.delete(frameId);
+      await requestLiveCapture(monitor, tabId, frameId);
+      await chrome.scripting.executeScript({
+        target: liveTarget(tabId, [frameId]),
+        func: installLiveMutationObserver,
+        args: [monitor.id, monitor.revision]
+      });
+      reinstalled += 1;
+    } catch {
+      // The frame may still be tearing down; its next completed navigation
+      // event will attempt installation again.
+    }
+  }
+  return { reinstalled };
 }
 
 async function checkPage(urlValue) {
@@ -2309,19 +4118,24 @@ async function checkPage(urlValue) {
     return { ok: false, error: '확인할 페이지 주소가 올바르지 않습니다.' };
   }
 
-  const monitor = (await getMonitors()).find((item) => item.enabled && item.url === url);
-  if (!monitor) {
+  const matching = (await getMonitors()).filter((item) => item.url === url);
+  const monitors = matching.filter((item) => item.enabled);
+  if (!monitors.length) {
     return { ok: false, reason: 'disabled', error: '이 페이지에서 활성화된 추적을 찾을 수 없습니다.' };
   }
 
-  try {
-    const result = await checkMonitor(monitor.id, { reschedule: false });
-    return result?.ok
-      ? { ok: true, changed: Boolean(result.changed), needsReview: Boolean(result.needsReview), checked: 1 }
-      : result;
-  } finally {
-    await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
-  }
+  const result = await checkMonitors({ ids: monitors.map((monitor) => monitor.id) });
+  if (!result?.ok) return result;
+  return {
+    ...result,
+    // Preserve the page-action shape while reporting all independently
+    // configured monitors that were actually checked.
+    checked: result.completed,
+    changed: Boolean(result.changed),
+    needsReview: Boolean(result.needsReview),
+    matched: matching.length,
+    skipped: matching.length - monitors.length
+  };
 }
 
 function batchMonitorIds(value) {
@@ -2403,14 +4217,10 @@ async function runDueChecks() {
       .filter((monitor) => monitor.enabled && isAutomaticSchedule(monitor) && dueTimestamp(monitor) <= now)
       .sort((left, right) => dueTimestamp(left) - dueTimestamp(right));
 
-    const scheduledUrls = new Set();
-    const scheduled = [];
-    for (const monitor of due) {
-      if (scheduledUrls.has(monitor.url)) continue;
-      scheduledUrls.add(monitor.url);
-      scheduled.push(monitor);
-      if (scheduled.length >= MAX_CHECKS_PER_SWEEP) break;
-    }
+    // Configurations that watch one page remain independent.  In particular,
+    // do not collapse due work by URL: they may have different locators,
+    // fields, schedules, or comparison filters.
+    const scheduled = due.slice(0, MAX_CHECKS_PER_SWEEP);
 
     await Promise.allSettled(scheduled.map((monitor) => checkMonitor(monitor.id, { reschedule: false })));
   } finally {
@@ -2433,6 +4243,12 @@ function locatorsEqual(left, right) {
     && left.every((locator, index) => locatorKey(locator) === locatorKey(right[index]));
 }
 
+function schedulesEqual(left, right) {
+  const normalizedLeft = left && typeof left === 'object' ? left : null;
+  const normalizedRight = right && typeof right === 'object' ? right : null;
+  return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
 function trackingEqual(left, right) {
   return JSON.stringify(normalizeTracking(left)) === JSON.stringify(normalizeTracking(right));
 }
@@ -2442,18 +4258,31 @@ function pickerItemsFromMessage(message, defaultFrameId = 0) {
     ? message.items
     : Array.isArray(message.locators)
       ? message.locators
-    : Array.isArray(message.selectors)
-      ? message.selectors.map((selector) => ({ selector }))
-      : [{ selector: message.selector }];
+      : Array.isArray(message.selectors)
+        ? message.selectors.map((selector) => ({ selector }))
+        : Object.hasOwn(message, 'selector')
+          ? [{ selector: message.selector }]
+          : [];
 
-  if (!rawItems.length || rawItems.length > MAX_SELECTORS_PER_MONITOR) {
-    return null;
+  if (!rawItems.length) {
+    return [cleanLocator({
+      type: 'css',
+      expr: 'body',
+      op: 'include'
+    }, {
+      frameId: defaultFrameId,
+      ...(defaultFrameId > 0 ? { frameOrder: defaultFrameId } : {})
+    })];
   }
+  if (rawItems.length > MAX_SELECTORS_PER_MONITOR) return null;
 
   const items = [];
   const seenLocators = new Set();
   for (const rawItem of rawItems) {
-    const locator = cleanLocator(rawItem, { frameId: defaultFrameId });
+    const locator = cleanLocator(rawItem, {
+      frameId: defaultFrameId,
+      ...(defaultFrameId > 0 ? { frameOrder: defaultFrameId } : {})
+    });
     if (!locator) return null;
     const key = locatorKey(locator);
     if (seenLocators.has(key)) continue;
@@ -2471,15 +4300,17 @@ async function validateLocatorList(locators) {
 
 async function createMonitors(message, sender) {
   const url = normalizeUrl(sender?.tab?.url ?? message.url);
-  const scheduleMode = normalizeScheduleMode(message.scheduleMode, SCHEDULE_MODE_MANUAL);
-  const intervalHours = clampInterval(message.intervalHours)
-    ?? (scheduleMode === SCHEDULE_MODE_MANUAL ? MIN_INTERVAL_HOURS : null);
+  const schedule = normalizeScheduleDescriptor(message, SCHEDULE_MODE_MANUAL);
+  const scheduleMode = schedule?.type;
+  const intervalHours = scheduleMode === SCHEDULE_MODE_INTERVAL
+    ? schedule.params.interval / 3_600
+    : MIN_INTERVAL_HOURS;
   const trackingInput = message.tracking ?? message;
   const pickerItems = pickerItemsFromMessage(
     message,
     Number.isInteger(sender?.frameId) ? sender.frameId : 0
   );
-  if (!url || !scheduleMode || !intervalHours || !pickerItems) {
+  if (!url || !schedule || !pickerItems) {
     return { ok: false, error: 'URL, 확인 방식과 간격, 그리고 하나 이상의 CSS 선택자를 확인해 주세요.' };
   }
   if (hasInvalidConfiguredRegularExpression(trackingInput)) {
@@ -2518,44 +4349,12 @@ async function createMonitors(message, sender) {
   const baseName = cleanText(message.name, 120) || pageTitle || new URL(url).hostname;
   const labels = cleanLabels(message.labels);
   const result = await mutateMonitors((monitors) => {
-    const existing = monitors.find((monitor) => monitor.url === url);
-    if (existing) {
-      const knownLocators = new Set(existing.locators.map(locatorKey));
-      const additions = pickerItems.filter((item) => !knownLocators.has(locatorKey(item)));
-      if (additions.length) {
-        if (existing.locators.length + additions.length > MAX_SELECTORS_PER_MONITOR) {
-          return { ok: false, error: `한 주소에는 CSS 선택자를 최대 ${MAX_SELECTORS_PER_MONITOR}개까지 저장할 수 있습니다.` };
-        }
-        existing.locators = [...existing.locators, ...additions];
-        existing.selectors = displaySelectorsForLocators(existing.locators);
-        existing.revision = createRevision();
-        existing.updatedAt = timestamp;
-        // A picker session only knows the elements selected in that session,
-        // not the DOM order of the already-saved selectors.  Do not append its
-        // text to an old collection snapshot: that would manufacture a change
-        // on the next rendered check.  An automatic tracker checks immediately;
-        // a manual tracker waits for the user's explicit "check now" action.
-        existing.snapshot = null;
-        existing.lastChange = null;
-        existing.history = [];
-        existing.runs = [];
-        existing.lastCheckedAt = null;
-        existing.lastChangedAt = null;
-        existing.lastReviewAt = null;
-        existing.lastViewedAt = null;
-        existing.lastError = null;
-        existing.lastErrorSnapshot = null;
-        existing.unread = false;
-        existing.status = 'needs-baseline';
-        existing.nextCheckAt = isAutomaticSchedule(existing) ? timestamp : null;
-      }
-      return { ok: true, monitor: { ...existing } };
-    }
-
     if (monitors.length >= MAX_MONITORS) {
       throw new Error('추적은 최대 개수에 도달했습니다.');
     }
 
+    // A URL identifies a page, not a monitor. Each save is an independent
+    // configuration with its own locators, schedule, filtering, and history.
     const monitor = {
       id: createId(),
       revision: createRevision(),
@@ -2564,10 +4363,14 @@ async function createMonitors(message, sender) {
       pageTitle,
       locators: pickerItems,
       selectors: displaySelectorsForLocators(pickerItems),
-      tracking: normalizeTracking(trackingInput),
+      tracking: normalizeTracking(scheduleMode === SCHEDULE_MODE_LIVE
+        ? { ...(trackingInput && typeof trackingInput === 'object' ? trackingInput : {}), live: true }
+        : trackingInput),
       labels,
+      schedule,
       scheduleMode,
       intervalHours,
+      ...(scheduleMode === SCHEDULE_MODE_INTERVAL ? { intervalSeconds: schedule.params.interval } : {}),
       enabled: true,
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -2575,7 +4378,7 @@ async function createMonitors(message, sender) {
       lastChangedAt: null,
       // A manual tracker has no due time. Its first baseline is established
       // only by an explicit user check.
-      nextCheckAt: nextCheckForSchedule(scheduleMode, null, intervalHours, timestamp),
+      nextCheckAt: nextCheckForSchedule(schedule, null, intervalHours, timestamp),
       snapshot: null,
       lastChange: null,
       history: [],
@@ -2594,6 +4397,9 @@ async function createMonitors(message, sender) {
   if (!result?.ok) return result;
   await forgetPendingPicker(sender?.tab?.id);
   await scheduleNextAlarm();
+  if (isLiveTracking(result.monitor)) {
+    await startLiveMonitor({ id: result.monitor.id, tabId: sender?.tab?.id }).catch(() => undefined);
+  }
   return { ok: true, monitor: result.monitor, monitors: [result.monitor], count: 1 };
 }
 
@@ -2627,10 +4433,12 @@ async function saveMonitor(message) {
   if (!existing) {
     return { ok: false, error: '추적을 찾을 수 없습니다.' };
   }
-  const scheduleMode = normalizeScheduleMode(message.scheduleMode, existing.scheduleMode);
-  const intervalHours = clampInterval(message.intervalHours)
-    ?? (scheduleMode === SCHEDULE_MODE_MANUAL ? existing.intervalHours ?? MIN_INTERVAL_HOURS : null);
-  if (!scheduleMode || !intervalHours) {
+  const schedule = normalizeScheduleDescriptor(message, existing.scheduleMode, existing.schedule);
+  const scheduleMode = schedule?.type;
+  const intervalHours = scheduleMode === SCHEDULE_MODE_INTERVAL
+    ? schedule.params.interval / 3_600
+    : existing.intervalHours ?? MIN_INTERVAL_HOURS;
+  if (!schedule) {
     return { ok: false, error: '확인 방식과 간격을 확인해 주세요.' };
   }
 
@@ -2648,15 +4456,9 @@ async function saveMonitor(message) {
     if (!monitor) {
       return { ok: false, error: '추적을 찾을 수 없습니다.' };
     }
-    if (monitors.some((item) => item.id !== monitor.id && item.url === url)) {
-      return { ok: false, error: '이 주소는 이미 다른 추적으로 관리되고 있습니다.' };
-    }
-
-    const selectionChanged = monitor.url !== url || !locatorsEqual(monitor.locators, locators);
-    const nextTracking = normalizeTracking(trackingInput ?? monitor.tracking);
-    const trackingChanged = !trackingEqual(monitor.tracking, nextTracking);
-    const captureConfigurationChanged = selectionChanged || trackingChanged;
-    const scheduleChanged = monitor.scheduleMode !== scheduleMode;
+    const nextTracking = normalizeTracking(scheduleMode === SCHEDULE_MODE_LIVE
+      ? { ...((trackingInput ?? monitor.tracking) && typeof (trackingInput ?? monitor.tracking) === 'object' ? (trackingInput ?? monitor.tracking) : {}), live: true }
+      : trackingInput ?? monitor.tracking);
     monitor.name = cleanText(message.name, 120) || monitor.name;
     monitor.revision = createRevision();
     monitor.url = url;
@@ -2664,31 +4466,24 @@ async function saveMonitor(message) {
     monitor.selectors = displaySelectorsForLocators(locators);
     monitor.tracking = nextTracking;
     monitor.labels = cleanLabels(message.labels);
+    monitor.schedule = schedule;
     monitor.scheduleMode = scheduleMode;
     monitor.intervalHours = intervalHours;
+    if (scheduleMode === SCHEDULE_MODE_INTERVAL) monitor.intervalSeconds = schedule.params.interval;
+    else delete monitor.intervalSeconds;
     const requestedEnabled = message.enabled !== false;
     monitor.enabled = requestedEnabled && permissionGranted;
     monitor.updatedAt = nowIso();
-    monitor.nextCheckAt = scheduleMode === SCHEDULE_MODE_INTERVAL
-      ? (captureConfigurationChanged || scheduleChanged
-        ? monitor.updatedAt
-        : addHours(monitor.lastCheckedAt ?? monitor.updatedAt, intervalHours))
+    monitor.nextCheckAt = isAutomaticSchedule(monitor)
+      ? nextCheckForSchedule(monitor.schedule, monitor.lastCheckedAt, intervalHours)
       : null;
 
-    if (captureConfigurationChanged) {
-      monitor.snapshot = null;
-      monitor.lastChange = null;
-      monitor.history = [];
-      monitor.runs = [];
-      monitor.lastChangedAt = null;
-      monitor.lastReviewAt = null;
-      monitor.lastViewedAt = null;
-      monitor.lastCheckedAt = null;
-      monitor.unread = false;
-      monitor.status = monitor.enabled ? 'needs-baseline' : requestedEnabled ? 'permission-needed' : 'needs-baseline';
-      monitor.lastError = null;
-      monitor.lastErrorSnapshot = null;
-    } else if (requestedEnabled && !permissionGranted) {
+    // A selector/filter edit changes the next extraction, not the identity of
+    // the monitored history. Keep the previous successful capture as the
+    // comparison baseline, then make an automatic monitor due immediately.
+    // Resetting here would silently turn a real post-edit difference into a
+    // new baseline rather than reporting it.
+    if (requestedEnabled && !permissionGranted) {
       monitor.status = 'permission-needed';
       monitor.lastError = '이 사이트의 접근 권한이 필요합니다.';
     } else if (!requestedEnabled && monitor.status === 'permission-needed') {
@@ -2701,18 +4496,23 @@ async function saveMonitor(message) {
 
   if (result?.ok) {
     const updatedTracking = normalizeTracking(result.monitor?.tracking);
+    const previousLive = isLiveTracking(existing);
+    const updatedLive = isLiveTracking(result.monitor);
     const liveConfigurationChanged = existing.url !== url
       || !locatorsEqual(existing.locators, result.monitor?.locators)
-      || !trackingEqual(previousTracking, updatedTracking);
-    if (previousTracking.live && !updatedTracking.live) {
-      await stopLiveMonitor({ id: existing.id }).catch(() => undefined);
-    } else if (updatedTracking.live && liveConfigurationChanged) {
+      || !trackingEqual(previousTracking, updatedTracking)
+      || !schedulesEqual(existing.schedule, result.monitor?.schedule);
+    if (previousLive && (!updatedLive || !result.monitor.enabled || liveConfigurationChanged)) {
+      await detachLiveSession(existing.id);
+    }
+    if (updatedLive && result.monitor.enabled && (!previousLive || liveConfigurationChanged)) {
       // A saved selector or tracking edit creates a new revision. Reinstall on
       // any matching open page so an older isolated-world observer cannot keep
       // sending ignored revision messages forever.
       await startLiveMonitor({ id: existing.id }).catch(() => undefined);
     }
   }
+  await reconcileLiveSessions().catch(() => undefined);
   await refreshBadge();
   await scheduleNextAlarm();
   if (previousUrl !== url) {
@@ -2732,7 +4532,7 @@ async function setMonitorEnabled(message) {
   if (enabled && !permissionGranted) {
     return { ok: false, reason: 'permission', error: '이 사이트의 접근 권한이 필요합니다.' };
   }
-  if (!enabled && normalizeTracking(monitor.tracking).live) {
+  if (!enabled && isLiveTracking(monitor)) {
     await stopLiveMonitor({ id: monitor.id }).catch(() => undefined);
   }
 
@@ -2744,7 +4544,9 @@ async function setMonitorEnabled(message) {
     current.enabled = enabled;
     current.revision = createRevision();
     current.updatedAt = nowIso();
-    current.nextCheckAt = isAutomaticSchedule(current) && enabled ? nowIso() : null;
+    current.nextCheckAt = isAutomaticSchedule(current) && enabled
+      ? nextCheckForSchedule(current.schedule, current.lastCheckedAt, current.intervalHours)
+      : null;
     if (enabled && current.status === 'permission-needed') {
       current.status = statusForStoredSnapshot(current.snapshot, current.tracking);
       current.lastError = null;
@@ -2753,13 +4555,17 @@ async function setMonitorEnabled(message) {
       current.lastError = null;
     }
   });
+  if (enabled && isLiveTracking(monitor)) {
+    await startLiveMonitor({ id: monitor.id }).catch(() => undefined);
+  }
+  await reconcileLiveSessions().catch(() => undefined);
   await scheduleNextAlarm();
   return { ok: true };
 }
 
 async function deleteMonitor(id) {
   const existing = (await getMonitors()).find((item) => item.id === id);
-  if (existing && normalizeTracking(existing.tracking).live) {
+  if (existing && isLiveTracking(existing)) {
     await stopLiveMonitor({ id: existing.id }).catch(() => undefined);
   }
   let deleted;
@@ -2795,7 +4601,7 @@ function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) 
     updatedAt: timestamp,
     lastCheckedAt: null,
     lastChangedAt: null,
-    nextCheckAt: nextCheckForSchedule(monitor.scheduleMode, null, monitor.intervalHours, timestamp),
+    nextCheckAt: nextCheckForSchedule(monitor.schedule, null, monitor.intervalHours, timestamp),
     snapshot: null,
     lastChange: null,
     history: [],
@@ -2820,46 +4626,52 @@ async function reusePageUrl(message, { copy = false } = {}) {
   }
 
   const monitors = await getMonitors();
-  const sourceMonitor = monitors.find((monitor) => monitor.url === sourceUrl);
-  if (!sourceMonitor) {
+  const sourceMonitors = monitors.filter((monitor) => monitor.url === sourceUrl);
+  if (!sourceMonitors.length) {
     return { ok: false, error: '주소를 재사용할 추적 페이지를 찾을 수 없습니다.' };
   }
-  if (monitors.some((monitor) => monitor.url === targetUrl)) {
-    return { ok: false, error: '새 주소는 이미 추적 중입니다.' };
-  }
-  if (copy && monitors.length >= MAX_MONITORS) {
+  if (copy && monitors.length + sourceMonitors.length > MAX_MONITORS) {
     return { ok: false, error: '추적은 최대 개수에 도달했습니다.' };
   }
-  if (sourceMonitor.enabled && !await hasSitePermission(targetUrl)) {
+  if (sourceMonitors.some((monitor) => monitor.enabled) && !await hasSitePermission(targetUrl)) {
     return { ok: false, reason: 'permission', error: '새 사이트의 접근 권한이 필요합니다.' };
   }
 
   const timestamp = nowIso();
   const result = await mutateMonitors((currentMonitors) => {
-    const sourceIndex = currentMonitors.findIndex((monitor) => monitor.id === sourceMonitor.id);
-    if (sourceIndex < 0) {
+    // Resolve all matching records inside the serialized mutation.  A page
+    // action applies to the page group, while each affected monitor preserves
+    // its own configuration and reset baseline.
+    const currentSources = currentMonitors.filter((monitor) => monitor.url === sourceUrl);
+    if (!currentSources.length) {
       return { ok: false, error: '주소를 재사용할 추적 페이지를 찾을 수 없습니다.' };
     }
-    if (currentMonitors.some((monitor) => monitor.id !== sourceMonitor.id && monitor.url === targetUrl)) {
-      return { ok: false, error: '새 주소는 이미 추적 중입니다.' };
-    }
-
-    const affected = resetMonitorForPageUrl(currentMonitors[sourceIndex], targetUrl, timestamp, { copy });
     if (copy) {
-      if (currentMonitors.length >= MAX_MONITORS) {
+      if (currentMonitors.length + currentSources.length > MAX_MONITORS) {
         return { ok: false, error: '추적은 최대 개수에 도달했습니다.' };
       }
-      currentMonitors.push(affected);
+      const affected = currentSources.map((monitor) => resetMonitorForPageUrl(monitor, targetUrl, timestamp, { copy: true }));
+      currentMonitors.push(...affected);
+      return { ok: true, monitor: { ...affected[0] }, monitors: affected.map((monitor) => ({ ...monitor })), count: affected.length };
     } else {
-      currentMonitors[sourceIndex] = affected;
+      const affectedById = new Map(currentSources.map((monitor) => [
+        monitor.id,
+        resetMonitorForPageUrl(monitor, targetUrl, timestamp)
+      ]));
+      for (let index = 0; index < currentMonitors.length; index += 1) {
+        const affected = affectedById.get(currentMonitors[index].id);
+        if (affected) currentMonitors[index] = affected;
+      }
+      const affected = [...affectedById.values()];
+      return { ok: true, monitor: { ...affected[0] }, monitors: affected.map((monitor) => ({ ...monitor })), count: affected.length };
     }
-    return { ok: true, monitor: { ...affected }, monitors: [{ ...affected }], count: 1 };
   });
 
   if (!result?.ok) return result;
   if (!copy) {
     await releaseUnusedSitePermission(sourceUrl);
   }
+  await reconcileLiveSessions().catch(() => undefined);
   await refreshBadge();
   await scheduleNextAlarm();
   return result;
@@ -2867,7 +4679,6 @@ async function reusePageUrl(message, { copy = false } = {}) {
 
 function planSiteHostReplacement(monitors, sourceHost, targetHost) {
   const replacements = [];
-  const targetUrls = new Set();
 
   for (const monitor of monitors) {
     if (siteHostOfUrl(monitor.url) !== sourceHost) {
@@ -2878,24 +4689,11 @@ function planSiteHostReplacement(monitors, sourceHost, targetHost) {
     if (!targetUrl) {
       return { ok: false, error: '일괄 변경할 주소를 준비하지 못했습니다.' };
     }
-    if (targetUrls.has(targetUrl)) {
-      return { ok: false, error: '변경 결과가 같은 주소로 겹쳐 일괄 변경을 취소했습니다.' };
-    }
-    targetUrls.add(targetUrl);
     replacements.push({ id: monitor.id, sourceUrl: monitor.url, targetUrl, enabled: monitor.enabled });
   }
 
   if (!replacements.length) {
     return { ok: false, error: '기존 사이트 주소에 해당하는 추적을 찾지 못했습니다.' };
-  }
-
-  const movingIds = new Set(replacements.map((replacement) => replacement.id));
-  const collisions = monitors.filter((monitor) => !movingIds.has(monitor.id) && targetUrls.has(monitor.url));
-  if (collisions.length) {
-    return {
-      ok: false,
-      error: `새 사이트에 이미 추적 중인 ${collisions.length}개 페이지가 있어 안전하게 일괄 변경을 취소했습니다. 먼저 중복 페이지를 정리한 뒤 다시 시도해 주세요.`
-    };
   }
 
   return { ok: true, replacements };
@@ -2954,6 +4752,7 @@ async function replaceSiteHost(message) {
   }
 
   await Promise.all([...new Set(result.sourceUrls)].map((sourceUrl) => releaseUnusedSitePermission(sourceUrl)));
+  await reconcileLiveSessions().catch(() => undefined);
   await refreshBadge();
   await scheduleNextAlarm();
   return { ok: true, count: result.count };
@@ -2963,19 +4762,26 @@ async function deletePage(urlValue) {
   const url = normalizeUrl(urlValue);
   if (!url) return { ok: false, error: '삭제할 페이지 주소가 올바르지 않습니다.' };
 
-  let deleted;
+  const existing = (await getMonitors()).filter((monitor) => monitor.url === url);
+  await Promise.all(existing
+    .filter((monitor) => isLiveTracking(monitor))
+    .map((monitor) => detachLiveSession(monitor.id)));
+  let deleted = [];
   await mutateMonitors((monitors) => {
-    const index = monitors.findIndex((monitor) => monitor.url === url);
-    if (index >= 0) {
-      deleted = monitors.splice(index, 1)[0];
+    const kept = [];
+    for (const monitor of monitors) {
+      if (monitor.url === url) deleted.push(monitor);
+      else kept.push(monitor);
     }
+    monitors.splice(0, monitors.length, ...kept);
   });
-  if (!deleted) return { ok: false, error: '삭제할 추적 페이지를 찾을 수 없습니다.' };
+  if (!deleted.length) return { ok: false, error: '삭제할 추적 페이지를 찾을 수 없습니다.' };
 
   await releaseUnusedSitePermission(url);
+  await reconcileLiveSessions().catch(() => undefined);
   await refreshBadge();
   await scheduleNextAlarm();
-  return { ok: true, deletedCount: 1 };
+  return { ok: true, deletedCount: deleted.length };
 }
 
 async function acknowledgeMonitor(id) {
@@ -3018,20 +4824,19 @@ async function importMonitors(message) {
   const sourceMonitors = Array.isArray(message.monitors) ? message.monitors : [];
   const rawMonitors = sourceMonitors.slice(0, MAX_MONITORS);
   const prepared = [];
-  const preparedUrls = new Set();
   const usedIds = new Set();
   let rejected = Math.max(0, sourceMonitors.length - MAX_MONITORS);
   let imported = 0;
   let disabledForPermission = 0;
 
   for (const raw of rawMonitors) {
-    if (!raw || (!Array.isArray(raw.locators) && !Array.isArray(raw.selectors))) {
+    if (!raw || typeof raw !== 'object') {
       rejected += 1;
       continue;
     }
 
     const monitor = normalizeMonitor(raw);
-    if (!monitor || preparedUrls.has(monitor.url)) {
+    if (!monitor) {
       rejected += 1;
       continue;
     }
@@ -3042,11 +4847,10 @@ async function importMonitors(message) {
       continue;
     }
 
-    if (usedIds.has(monitor.id)) {
+    while (usedIds.has(monitor.id)) {
       monitor.id = createId();
     }
     usedIds.add(monitor.id);
-    preparedUrls.add(monitor.url);
     monitor.revision = createRevision();
 
     if (!monitor.snapshot && monitor.status === 'ok') {
@@ -3079,16 +4883,13 @@ async function importMonitors(message) {
           fields: locator.fields.map((field) => ({ ...field }))
         }))
       };
-      const urlIndex = monitors.findIndex((item) => item.url === monitor.url);
-      const idCollision = monitors.some((item) => item.id === monitor.id && item.url !== monitor.url);
-      if (idCollision) {
+      // Importing is additive in merge mode. URLs are intentionally not a
+      // uniqueness key; only the persistent monitor id must be unique.
+      while (monitors.some((item) => item.id === monitor.id)) {
         monitor.id = createId();
       }
 
-      if (urlIndex >= 0) {
-        monitors[urlIndex] = monitor;
-        imported += 1;
-      } else if (monitors.length < MAX_MONITORS) {
+      if (monitors.length < MAX_MONITORS) {
         monitors.push(monitor);
         imported += 1;
       } else {
@@ -3098,6 +4899,7 @@ async function importMonitors(message) {
     return { ok: true, imported, rejected, disabledForPermission };
   });
 
+  await reconcileLiveSessions().catch(() => undefined);
   await refreshBadge();
   await scheduleNextAlarm();
   await Promise.all(beforeImport.map((monitor) => releaseUnusedSitePermission(monitor.url)));
@@ -3194,13 +4996,66 @@ chrome.notifications.onClicked.addListener((notificationId) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void releasePendingPicker(tabId);
+  void forgetLiveControlledTabByTabId(tabId);
+  for (const [monitorId, session] of liveSessions) {
+    if (session.tabId === tabId) {
+      liveSessions.delete(monitorId);
+      liveDirtyByMonitor.delete(monitorId);
+    }
+  }
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading') {
     void releasePendingPicker(tabId);
+    for (const [monitorId, session] of liveSessions) {
+      if (session.tabId === tabId) {
+        // Keep ownership through a controlled-tab reload. The old isolated
+        // observer is destroyed by navigation; completion reuses this exact
+        // tab and installs a fresh one without ever falling back to a user tab.
+        session.navigating = true;
+        session.frameIds = new Set();
+        session.rawTextByFrame = new Map();
+        liveDirtyByMonitor.delete(monitorId);
+      }
+    }
+  } else if (changeInfo.status === 'complete') {
+    void restoreLiveForTab(tabId, changeInfo.url ? { id: tabId, url: changeInfo.url } : null).catch(() => undefined);
+  }
+  if (changeInfo.url && changeInfo.status !== 'loading') {
+    void (async () => {
+      const url = normalizeUrl(changeInfo.url);
+      if (!url) return;
+      const monitors = new Map((await getMonitors()).map((monitor) => [monitor.id, monitor]));
+      for (const [monitorId, session] of [...liveSessions]) {
+        if (session.tabId !== tabId) continue;
+        const monitor = monitors.get(monitorId);
+        if (!monitor || monitor.url !== url) await detachLiveSession(monitorId);
+      }
+      await restoreLiveForTab(tabId, { id: tabId, url });
+    })().catch(() => undefined);
   }
 });
+
+if (chrome.webNavigation?.onCompleted) {
+  chrome.webNavigation.onCompleted.addListener((details) => {
+    if (details.frameId === 0) {
+      void restoreLiveForTab(details.tabId).catch(() => undefined);
+    } else {
+      void reinstallLiveFrame(details.tabId, details.frameId).catch(() => undefined);
+    }
+  });
+}
+
+if (chrome.webNavigation?.onHistoryStateUpdated) {
+  chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+    if (details.frameId === 0) {
+      void restoreLiveForTab(details.tabId).catch(() => undefined);
+    } else {
+      void reinstallLiveFrame(details.tabId, details.frameId).catch(() => undefined);
+    }
+  });
+}
 
 async function initialize({ cleanupPermissions = false } = {}) {
   if (chrome.storage.local.setAccessLevel) {
@@ -3213,6 +5068,7 @@ async function initialize({ cleanupPermissions = false } = {}) {
     await cleanupUnusedSitePermissions();
   }
   await scheduleNextAlarm();
+  await restoreLiveMonitoring().catch(() => undefined);
 }
 
 chrome.runtime.onInstalled.addListener(() => {

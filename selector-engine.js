@@ -151,7 +151,12 @@
 
   function callbackAllows(options, type, name, value, depth, offset) {
     if (typeof options.filterCallback !== 'function') return true;
-    return Boolean(options.filterCallback(type, name, value, depth, offset));
+    // Token metadata distinguishes an absent value from an empty attribute.
+    // Preserve that boundary for extension callbacks: tags, relation bridges,
+    // and attribute-presence tests carry no value in the SelectorX contract.
+    const callbackName = type === 'immediate' ? null : name;
+    const callbackValue = ['tag', 'immediate', 'attribOnly'].includes(type) ? null : value;
+    return Boolean(options.filterCallback(type, callbackName, callbackValue, depth, offset));
   }
 
   function wordParts(value, { includePhrases = true, classValue = false } = {}) {
@@ -191,6 +196,32 @@
     const split = words.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
     if (!split.length) return 0;
     return split.filter((word) => CSS_VOCABULARY.has(word)).length / split.length;
+  }
+
+  function readableTextTokens(node) {
+    const values = [];
+    const visited = new Set();
+    const visit = (current) => {
+      if (!current || visited.has(current) || values.length >= 15) return;
+      visited.add(current);
+      if (current.nodeType === Node.TEXT_NODE) {
+        const text = cleanXPathText(current.nodeValue);
+        if (!text || text.includes("'") || text.length > 180 || hasGeneratedShape(text)) return;
+        const words = text.split(/\s+/).filter(Boolean);
+        if (words.length <= 3) {
+          values.push(text);
+        } else if (words.length <= 5) {
+          for (const word of words) {
+            if (word.length > 3 && !hasGeneratedShape(word)) values.push(word);
+          }
+        }
+        return;
+      }
+      if (current.nodeType !== Node.ELEMENT_NODE) return;
+      for (const child of current.childNodes) visit(child);
+    };
+    visit(node);
+    return [...new Set(values)].slice(0, 15);
   }
 
   function baseCost(kind, name, localLevel, details) {
@@ -248,6 +279,7 @@
         offset: this.offset,
         nodeRef: this.node,
         css: this.css,
+        xpathOnly: Boolean(this.xpathOnly),
         metrics: { ...this.metrics }
       };
     }
@@ -298,6 +330,7 @@
         offset,
         semantic: Boolean(details.semantic),
         bridge: type === 'immediate',
+        xpathOnly: Boolean(details.xpathOnly),
         baseCost: baseCost(type, name, step.localLevel, details) + lanePenalty
       });
       if (!this.evidence.some((item) => item.id === evidence.id)) {
@@ -310,6 +343,19 @@
       if (!tag) return;
       const nodeDetails = { node };
       this._add('tag', tag, '', escapeIdentifier(tag), step, offset, nodeDetails);
+
+      // XPath can express stable rendered text directly, while CSS cannot.
+      // Surface it to XPath callbacks and token sorters without allowing an
+      // empty CSS atom to enter the CSS draft.
+      if (this.options.useText) {
+        for (const text of readableTextTokens(node)) {
+          this._add('text', 'text', text, '', step, offset, {
+            ...nodeDetails,
+            semantic: true,
+            xpathOnly: true
+          });
+        }
+      }
 
       const position = childPosition(node);
       if (position.index > 0 && position.count > 1) {
@@ -330,18 +376,20 @@
       }
 
       for (const className of classNames) {
-        if (!isStableValue(className, { allowShort: true })) continue;
-        const simple = /^[a-zA-Z_][\w-]*$/.test(className);
-        const css = simple
-          ? '.' + escapeIdentifier(className)
-          : "[class*='" + escapeString(className) + "']";
-        this._add('attrib', 'class', className, css, step, offset, {
-          ...nodeDetails,
-          semantic: true,
-          specialClass: !simple
-        });
+        if (!className) continue;
+        if (isStableValue(className, { allowShort: true })) {
+          const simple = /^[a-zA-Z_][\w-]*$/.test(className);
+          const css = simple
+            ? '.' + escapeIdentifier(className)
+            : "[class*='" + escapeString(className) + "']";
+          this._add('attrib', 'class', className, css, step, offset, {
+            ...nodeDetails,
+            semantic: true,
+            specialClass: !simple
+          });
+        }
 
-        if (this.options.partAttrib) {
+        if (this.options.partAttrib && className.length <= 2_000 && !hasGeneratedShape(className)) {
           for (const part of wordParts(className, { classValue: true })) {
             this._add('attribContain', 'class', part, "[class*='" + escapeString(part) + "']", step, offset, {
               ...nodeDetails,
@@ -362,14 +410,19 @@
           ...nodeDetails,
           semantic: name.startsWith('data-')
         });
-        if (!value || !isStableValue(value, { allowShort: true })) continue;
+        if (!value) continue;
+        if (isStableValue(value, { allowShort: true })) {
+          this._add('attrib', name, value, '[' + escapedName + "='" + escapeString(value) + "']", step, offset, {
+            ...nodeDetails,
+            semantic: name.startsWith('data-') || SEMANTIC_ATTRIBUTE_NAMES.has(name)
+          });
+        }
 
-        this._add('attrib', name, value, '[' + escapedName + "='" + escapeString(value) + "']", step, offset, {
-          ...nodeDetails,
-          semantic: name.startsWith('data-') || SEMANTIC_ATTRIBUTE_NAMES.has(name)
-        });
-
-        if (!this.options.partAttrib) continue;
+        // Long values such as descriptive data attributes are poor exact
+        // selectors, but their readable word fragments can still be the most
+        // stable evidence. Extract those independently of the exact-value
+        // length limit while bounding work on pathological payloads.
+        if (!this.options.partAttrib || value.length > 2_000 || hasGeneratedShape(value)) continue;
         for (const part of wordParts(value, { includePhrases: true })) {
           const atStart = value.indexOf(part) === 0;
           const atEnd = value.lastIndexOf(part) === value.length - part.length;
@@ -432,9 +485,14 @@
     }
 
     canAdd(item) {
+      if (item.xpathOnly) return false;
       if (this.evidenceIds.has(item.id)) return false;
       if (!this.evidence.length) {
-        return !item.bridge && item.localLevel === 0 && item.offset === 0;
+        // A stable ancestor or preceding sibling can be the only usable
+        // semantic evidence. The serializer appends an implicit descendant
+        // wildcard when a target-level atom is unavailable, rather than
+        // forcing an unstable nth-child path just to start at the leaf.
+        return !item.bridge;
       }
       if (item.bridge) {
         return this.hasStemAt(item.localLevel) && this.hasStemAt(item.localLevel + 1);
@@ -488,6 +546,9 @@
           row += lane;
           priorOffset = offset;
         }
+        if (priorOffset !== null && !laneOffsets.includes(0)) {
+          row += this.route.isImmediateSiblingStep(localLevel, priorOffset, 0) ? ' + *' : ' ~ *';
+        }
         if (!row) row = '*';
 
         if (parts.length) {
@@ -498,6 +559,13 @@
         parts.push(row);
         priorLevel = localLevel;
       }
+      // Evidence may stop at an ancestor/sibling lane. Preserve the route's
+      // target reachability with a descendant wildcard, the CSS analogue of a
+      // relative selector tail. It is added only when no leaf lane was chosen
+      // so ordinary compact selectors remain unchanged.
+      if (levels.length && Math.min(...levels) > 0) {
+        parts.push(' *');
+      }
       return parts.join('');
     }
   }
@@ -505,6 +573,61 @@
   function rootContains(root, element) {
     if (root === element) return true;
     if (isDocument(root)) return Boolean(root.documentElement && root.documentElement.contains(element));
+    return typeof root?.contains === 'function' && root.contains(element);
+  }
+
+  // An extended CSS root is a composed-tree boundary, not merely a light-DOM
+  // one.  `Element.contains()` deliberately stops at a shadow boundary, which
+  // made a closed-shadow target look outside an otherwise valid host/root.
+  // Walk through shadow hosts explicitly so XCSS can validate the same reach
+  // that its executor provides, while still rejecting disconnected and
+  // unrelated nodes.
+  function composedParent(element) {
+    if (!isElement(element)) return null;
+    if (element.parentElement) return element.parentElement;
+    const root = element.getRootNode?.();
+    return isShadowRoot(root) ? root.host : null;
+  }
+
+  function xcssRootContains(root, element) {
+    if (!root || !isElement(element)) return false;
+    const rootDocument = isDocument(root) ? root : root.ownerDocument;
+    if (!rootDocument || element.ownerDocument !== rootDocument) return false;
+
+    const visited = new Set();
+    let current = element;
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      if (current === root || current.getRootNode?.() === root) return true;
+      current = composedParent(current);
+    }
+    return false;
+  }
+
+  function validateExtendedContext(selected, options) {
+    const documentNode = selected[0].ownerDocument;
+    const root = options.root || documentNode.documentElement;
+    const rootDocument = isDocument(root) ? root : root?.ownerDocument;
+    if (rootDocument !== documentNode) {
+      throw new Error('root node does not belong to the same document');
+    }
+    if (!root || typeof root.querySelectorAll !== 'function') {
+      throw new Error('root node does not support selector queries');
+    }
+    for (const element of selected) {
+      if (element.ownerDocument !== documentNode) {
+        throw new Error('elements do not belong to the same document');
+      }
+      if (!xcssRootContains(root, element)) {
+        throw new Error('target is not in subtree of root');
+      }
+    }
+    return { documentNode, root };
+  }
+
+  function nativeRootContains(root, element) {
+    if (root === element) return true;
+    if (isDocument(root)) return Boolean(root.documentElement?.contains(element));
     return typeof root?.contains === 'function' && root.contains(element);
   }
 
@@ -523,7 +646,8 @@
       debug: Boolean(input.debug),
       partAttrib: input.partAttrib !== false,
       siblingNodes: input.siblingNodes !== false,
-      immediate: input.immediate !== false
+      immediate: input.immediate !== false,
+      useText: input.useText === true
     };
   }
 
@@ -648,11 +772,9 @@
         }
       } else if (Array.isArray(supplied)) {
         const byId = new Map(ordered.map((item) => [item.id, item]));
-        const reordered = supplied
+        ordered = supplied
           .map((token) => byId.get(typeof token === 'string' ? token : token?.id))
-          .filter(Boolean);
-        const remainder = ordered.filter((item) => !reordered.includes(item));
-        ordered = [...reordered, ...remainder];
+          .filter((item, index, values) => item && values.indexOf(item) === index);
       }
     }
     return ordered;
@@ -808,6 +930,8 @@
     const selected = asElements(elements);
     if (!selected.length) return '';
     const options = normalizeOptions(rawOptions);
+    const { documentNode: selectedDocument, root: configuredRoot } = validateExtendedContext(selected, options);
+    const scopedOptions = { ...options, root: configuredRoot };
     const lightNodes = [];
     const shadowGroups = new Map();
 
@@ -823,19 +947,27 @@
 
     const branches = [];
     if (lightNodes.length) {
-      const selector = getCSSSync(lightNodes, options);
+      const selector = getCSSSync(lightNodes, scopedOptions);
       if (selector) branches.push(selector);
     }
 
     for (const [shadowRoot, nodes] of shadowGroups) {
-      const documentNode = nodes[0].ownerDocument;
-      const hosts = shadowHostsFor(nodes[0], documentNode);
+      const hosts = shadowHostsFor(nodes[0], selectedDocument)
+        // A configured host/root is already the starting point of an XCSS
+        // query. Repeating it would ask querySelectorAll() to find itself,
+        // while hosts above a shadow-root scope are unreachable from that
+        // scope and must not leak into the generated route.
+        .filter((host) => host !== configuredRoot && xcssRootContains(configuredRoot, host));
       const hostSelectors = [];
-      for (const host of hosts) {
+      for (let index = 0; index < hosts.length; index += 1) {
+        const host = hosts[index];
         const hostRoot = host.getRootNode();
+        const hostScope = index === 0 && nativeRootContains(configuredRoot, host)
+          ? configuredRoot
+          : hostRoot === selectedDocument ? selectedDocument.documentElement : hostRoot;
         const selector = getCSSSync([host], {
-          ...options,
-          root: hostRoot === documentNode ? documentNode.documentElement : hostRoot
+          ...scopedOptions,
+          root: hostScope
         });
         if (!selector) {
           hostSelectors.length = 0;
@@ -843,7 +975,7 @@
         }
         hostSelectors.push(selector);
       }
-      const terminal = getCSSSync(nodes, { ...options, root: shadowRoot });
+      const terminal = getCSSSync(nodes, { ...scopedOptions, root: shadowRoot });
       if (terminal) branches.push([...hostSelectors, terminal].join(' '));
     }
 
@@ -856,10 +988,9 @@
     const supplied = await options.tokenSorter(ordered.map((item) => item.asSorterToken()));
     if (!Array.isArray(supplied)) return ordered;
     const byId = new Map(ordered.map((item) => [item.id, item]));
-    const reordered = supplied
+    return supplied
       .map((token) => byId.get(typeof token === 'string' ? token : token?.id))
-      .filter(Boolean);
-    return [...reordered, ...ordered.filter((item) => !reordered.includes(item))];
+      .filter((item, index, values) => item && values.indexOf(item) === index);
   }
 
   async function synthesizeBranchAsync(anchor, pending, context) {
@@ -918,6 +1049,8 @@
     const selected = asElements(elements);
     if (!selected.length) return '';
     const options = normalizeOptions(rawOptions);
+    const { documentNode: selectedDocument, root: configuredRoot } = validateExtendedContext(selected, options);
+    const scopedOptions = { ...options, root: configuredRoot };
     const lightNodes = [];
     const shadowGroups = new Map();
     for (const node of selected) {
@@ -930,18 +1063,22 @@
     }
     const branches = [];
     if (lightNodes.length) {
-      const selector = await getCSSAsync(lightNodes, options);
+      const selector = await getCSSAsync(lightNodes, scopedOptions);
       if (selector) branches.push(selector);
     }
     for (const [shadowRoot, nodes] of shadowGroups) {
-      const documentNode = nodes[0].ownerDocument;
-      const hosts = shadowHostsFor(nodes[0], documentNode);
+      const hosts = shadowHostsFor(nodes[0], selectedDocument)
+        .filter((host) => host !== configuredRoot && xcssRootContains(configuredRoot, host));
       const hostSelectors = [];
-      for (const host of hosts) {
+      for (let index = 0; index < hosts.length; index += 1) {
+        const host = hosts[index];
         const hostRoot = host.getRootNode();
+        const hostScope = index === 0 && nativeRootContains(configuredRoot, host)
+          ? configuredRoot
+          : hostRoot === selectedDocument ? selectedDocument.documentElement : hostRoot;
         const selector = await getCSSAsync([host], {
-          ...options,
-          root: hostRoot === documentNode ? documentNode.documentElement : hostRoot
+          ...scopedOptions,
+          root: hostScope
         });
         if (!selector) {
           hostSelectors.length = 0;
@@ -949,7 +1086,7 @@
         }
         hostSelectors.push(selector);
       }
-      const terminal = await getCSSAsync(nodes, { ...options, root: shadowRoot });
+      const terminal = await getCSSAsync(nodes, { ...scopedOptions, root: shadowRoot });
       if (terminal) branches.push([...hostSelectors, terminal].join(' '));
     }
     return branches.join(',');
@@ -980,14 +1117,14 @@
     if (typeof rawOptions?.tokenSorter === 'function') {
       return getCSSAsync(elements, rawOptions).then((selector) => scopeCssForConfiguredRoot(selector, rawOptions));
     }
-    return Promise.resolve(scopeCssForConfiguredRoot(getCSSSync(elements, rawOptions), rawOptions));
+    return Promise.resolve().then(() => scopeCssForConfiguredRoot(getCSSSync(elements, rawOptions), rawOptions));
   }
 
   function getExtendedCSS(elements, rawOptions) {
     if (typeof rawOptions?.tokenSorter === 'function') {
       return getExtendedCSSAsync(elements, rawOptions);
     }
-    return Promise.resolve(getExtendedCSSSync(elements, rawOptions));
+    return Promise.resolve().then(() => getExtendedCSSSync(elements, rawOptions));
   }
 
   // Extended CSS is a small, explicit traversal language used by the picker
@@ -995,15 +1132,41 @@
   // a whitespace boundary may cross from a host into one of its shadow roots.
   // Keeping parsing and traversal here (rather than teaching every caller a
   // special case) also makes ordinary CSS a strict subset of the same API.
+  function isInternalPickerHost(element) {
+    return isElement(element)
+      && String(element.localName || '').toLowerCase() === 'openstill-picker-root'
+      && element.getAttribute?.('data-openstill-picker-ui') === 'true';
+  }
+
+  function isInsideInternalPicker(element) {
+    let current = isElement(element) ? element : null;
+    const visited = new Set();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      if (isInternalPickerHost(current)) return true;
+      current = composedParent(current);
+    }
+    return false;
+  }
+
   function shadowRootFor(element) {
     if (!isElement(element)) return null;
-    try {
-      return element.shadowRoot
-        || globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element)
-        || null;
-    } catch {
-      return element.shadowRoot || null;
-    }
+    // The picker itself is a closed shadow tree. It is extension UI rather
+    // than page content, so letting XCSS pierce it would make broad selectors
+    // such as `button` or `input` match the picker controls while editing.
+    if (isInternalPickerHost(element)) return null;
+    // A page can expose a compatibility `_shadowRoot` getter which throws.
+    // Treat only that host as opaque rather than failing an entire XCSS query.
+    const read = (getter) => {
+      try { return getter() || null; } catch { return null; }
+    };
+    const usable = (root) => root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+      && typeof root.querySelectorAll === 'function'
+      ? root
+      : null;
+    return usable(read(() => element.shadowRoot))
+      || usable(read(() => element._shadowRoot))
+      || usable(read(() => globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element)));
   }
 
   function splitSelectorUnion(value) {
@@ -1157,8 +1320,8 @@
       let matches = [];
       let descendants = [];
       try {
-        matches = [...scope.querySelectorAll(selector)];
-        descendants = [...scope.querySelectorAll('*')];
+        matches = [...scope.querySelectorAll(selector)].filter((element) => !isInsideInternalPicker(element));
+        descendants = [...scope.querySelectorAll('*')].filter((element) => !isInsideInternalPicker(element));
       } catch {
         // An invalid selector should have the same observable behaviour as
         // native querySelectorAll: no partial result is returned to callers.
@@ -1208,12 +1371,16 @@
     const scope = root || globalThis.document;
     const documentNode = isDocument(scope) ? scope : scope?.ownerDocument;
     if (!documentNode || typeof documentNode.evaluate !== 'function') return [];
+    // The Reference locator uses a Document's first element (<html>) as the
+    // XPath context. Preserve an explicitly supplied Element/ShadowRoot as-is
+    // so scoped selector APIs keep their documented relative-root contract.
+    const contextNode = isDocument(scope) ? scope.documentElement || scope : scope;
     const iteratorType = globalThis.XPathResult?.ORDERED_NODE_ITERATOR_TYPE ?? 5;
     let result;
     try {
       result = documentNode.evaluate(
         String(value || ''),
-        scope,
+        contextNode,
         (prefix) => prefix === 'xhtml' ? 'http://www.w3.org/1999/xhtml' : null,
         iteratorType,
         null
@@ -1286,12 +1453,12 @@
       if (!anchor) continue;
       const descendants = chain.slice(0, index).reverse();
       return anchor + descendants.map((node) => (
-        '/' + node.localName.toLowerCase() + '[' + xpathNodePosition(node) + ']'
+        '/' + xpathNameFor(node) + '[' + xpathNodePosition(node) + ']'
       )).join('');
     }
 
     return '//' + chain.slice().reverse().map((node) => (
-      node.localName.toLowerCase() + '[' + xpathNodePosition(node) + ']'
+      xpathNameFor(node) + '[' + xpathNodePosition(node) + ']'
     )).join('/');
   }
 
@@ -1299,28 +1466,373 @@
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
 
-  function getXPATHSync(elements, rawOptions) {
-    const selected = documentOrder(asElements(elements));
-    if (!selected.length) return '';
-    const options = normalizeOptions(rawOptions);
-    const documentNode = selected[0].ownerDocument;
-    for (const element of selected) {
-      if (element.ownerDocument !== documentNode) {
-        throw new Error('elements do not belong to the same document');
+  function xpathNameFor(node) {
+    const rawName = String(node?.localName || '');
+    const namespace = String(node?.namespaceURI || '');
+    const isHtmlDocument = String(node?.ownerDocument?.contentType || '').toLowerCase() === 'text/html';
+    const isHtmlElement = namespace === 'http://www.w3.org/1999/xhtml' && isHtmlDocument;
+    const name = isHtmlElement ? rawName.toLowerCase() : rawName;
+    if (!name) return '*';
+
+    // Unprefixed XPath names work for ordinary HTML elements in an HTML
+    // document, but not for SVG, MathML, custom XML namespaces, or XHTML/XML
+    // documents.  A local-name/namespace pair keeps those expressions valid
+    // without requiring callers to know or register a prefix.
+    if (namespace && !isHtmlElement) {
+      return "*[local-name()=" + xpathLiteral(name)
+        + ' and namespace-uri()=' + xpathLiteral(namespace) + ']';
+    }
+
+    return /^[a-z_][a-z\d_-]*$/i.test(name)
+      ? name
+      : "*[local-name()=" + xpathLiteral(name) + ']';
+  }
+
+  function xpathEvidencePart(item) {
+    if (!item || item.bridge) return null;
+    if (item.type === 'tag') return { kind: 'tag', value: xpathNameFor(item.node), item };
+    if (item.type === 'text') {
+      return { kind: 'predicate', value: '[contains(string(),' + xpathLiteral(item.value) + ')]', item };
+    }
+    if (item.type === 'pos') return {
+      kind: 'predicate',
+      value: '[' + Math.max(1, Number(item.value) || xpathNodePosition(item.node)) + ']',
+      item
+    };
+    if (item.type === 'attribOnly') {
+      return { kind: 'predicate', value: '[@' + item.name + ']', item };
+    }
+    if (!item.type.startsWith('attrib')) return null;
+    const value = xpathLiteral(item.value);
+    if (item.name === 'class') {
+      if (item.type === 'attrib') {
+        return {
+          kind: 'predicate',
+          value: "[contains(concat(' ', normalize-space(@class), ' '), " + xpathLiteral(' ' + item.value + ' ') + ')]',
+          item
+        };
+      }
+      return { kind: 'predicate', value: '[contains(@class,' + value + ')]', item };
+    }
+    if (item.type === 'attrib') return { kind: 'predicate', value: '[@' + item.name + '=' + value + ']', item };
+    if (item.type === 'attribStart') return { kind: 'predicate', value: '[starts-with(@' + item.name + ',' + value + ')]', item };
+    if (item.type === 'attribEnd') {
+      // XPath 1.0 has no ends-with(). The length guard retains exact suffix
+      // semantics without relying on a browser-specific XPath extension.
+      return {
+        kind: 'predicate',
+        value: '[substring(@' + item.name + ', string-length(@' + item.name + ') - string-length(' + value + ') + 1) = ' + value + ']',
+        item
+      };
+    }
+    return { kind: 'predicate', value: '[contains(@' + item.name + ',' + value + ')]', item };
+  }
+
+  function xpathNodeCandidates(evidence, allowedIds = null, tokenOrder = null) {
+    const parts = evidence
+      .filter((item) => !allowedIds || allowedIds.has(item.id))
+      .map(xpathEvidencePart)
+      .filter(Boolean)
+      .sort((left, right) => {
+        const leftOrder = tokenOrder?.get(left.item.id) ?? Number.MAX_SAFE_INTEGER;
+        const rightOrder = tokenOrder?.get(right.item.id) ?? Number.MAX_SAFE_INTEGER;
+        return leftOrder - rightOrder
+          || (left.item.rankCost ?? 0) - (right.item.rankCost ?? 0)
+          || left.item.id.localeCompare(right.item.id);
+      });
+    const tags = parts.filter((part) => part.kind === 'tag');
+    const predicates = parts.filter((part) => part.kind === 'predicate');
+    const candidates = new Map();
+    const add = (test, used) => {
+      if (!test) return;
+      const tokenIds = used.map((part) => part.item.id);
+      const cost = used.reduce((sum, part) => sum + (part.item.rankCost ?? 1), 0);
+      const order = tokenOrder
+        ? Math.min(...tokenIds.map((id) => tokenOrder.get(id) ?? Number.MAX_SAFE_INTEGER))
+        : 0;
+      const previous = candidates.get(test);
+      if (!previous || order < previous.order || (order === previous.order && cost < previous.cost)) {
+        candidates.set(test, { test, tokenIds, cost, order });
+      }
+    };
+
+    for (const tag of tags) add(tag.value, [tag]);
+    for (const predicate of predicates) add('*' + predicate.value, [predicate]);
+    for (const tag of tags.slice(0, 4)) {
+      for (const predicate of predicates.slice(0, 12)) add(tag.value + predicate.value, [tag, predicate]);
+    }
+    // Two complementary semantic attributes often distinguish repeated cards
+    // without falling back to their array position.
+    for (let index = 0; index < Math.min(predicates.length, 8); index += 1) {
+      for (let next = index + 1; next < Math.min(predicates.length, 8); next += 1) {
+        add('*' + predicates[index].value + predicates[next].value, [predicates[index], predicates[next]]);
       }
     }
-    const root = options.root || documentNode;
-    const paths = selected.map((element) => xpathForElement(element, root, options));
-    const selector = [...new Set(paths)].join(' | ');
+
+    // Some repeated cards can only be identified by three or more independent
+    // predicates.  Keep adding the ordered evidence to a candidate chain so
+    // the synthesizer can express an arbitrary conjunction instead of falling
+    // back to a brittle absolute position after the two-predicate cases.
+    // The cap bounds pathological class/attribute token sets while still
+    // covering every normal HTML attribute slot (which is capped at 15).
+    const accumulated = [];
+    const accumulationLimit = Math.min(predicates.length, 24);
+    for (let index = 0; index < accumulationLimit; index += 1) {
+      accumulated.push(predicates[index]);
+      if (accumulated.length < 3) continue;
+      const predicatePath = accumulated.map((part) => part.value).join('');
+      add('*' + predicatePath, accumulated);
+      for (const tag of tags.slice(0, 4)) {
+        add(tag.value + predicatePath, [tag, ...accumulated]);
+      }
+    }
+    return [...candidates.values()]
+      .sort((left, right) => left.order - right.order || left.cost - right.cost || left.test.length - right.test.length || left.test.localeCompare(right.test));
+  }
+
+  function xpathFollowingSibling(test, immediate) {
+    // `following-sibling::span[1]` means "the first following span", not
+    // "the immediately following element is a span".  Start at `*` for the
+    // latter so sibling evidence preserves CSS `+` semantics exactly.
+    return immediate
+      ? '/following-sibling::*[1][self::' + test + ']'
+      : '/following-sibling::' + test;
+  }
+
+  function xpathSiblingLaneCandidates(route, localLevel, allowedIds, allowImplicitWildcard, tokenOrder = null) {
+    const at = (offset) => xpathNodeCandidates(route.evidence.filter((item) => (
+      !item.bridge && item.localLevel === localLevel && item.offset === offset
+    )), allowedIds, tokenOrder);
+    const own = at(0);
+    const endpoint = own.length
+      ? own
+      : allowImplicitWildcard ? [{ test: '*', tokenIds: [], cost: 24, order: Number.MAX_SAFE_INTEGER }] : [];
+    const previous = at(-1).slice(0, 12);
+    const beforePrevious = at(-2).slice(0, 12);
+    const candidates = new Map();
+    const add = (test, used) => {
+      if (!test) return;
+      const tokenIds = used.flatMap((candidate) => candidate.tokenIds || []);
+      const cost = used.reduce((sum, candidate) => sum + (candidate.cost || 0), 0);
+      const order = used.reduce((minimum, candidate) => Math.min(minimum, candidate.order ?? Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+      const prior = candidates.get(test);
+      if (!prior || order < prior.order || (order === prior.order && cost < prior.cost)) {
+        candidates.set(test, { test, tokenIds, cost, order });
+      }
+    };
+
+    endpoint.forEach((candidate) => add(candidate.test, [candidate]));
+    for (const sibling of previous) {
+      for (const target of endpoint) {
+        add(
+          sibling.test + xpathFollowingSibling(target.test, route.isImmediateSiblingStep(localLevel, -1, 0)),
+          [sibling, target]
+        );
+      }
+    }
+    for (const sibling of beforePrevious) {
+      for (const target of endpoint) {
+        add(
+          sibling.test + xpathFollowingSibling(target.test, route.isImmediateSiblingStep(localLevel, -2, 0)),
+          [sibling, target]
+        );
+      }
+      for (const middle of previous) {
+        for (const target of endpoint) {
+          add(
+            sibling.test
+              + xpathFollowingSibling(middle.test, route.isImmediateSiblingStep(localLevel, -2, -1))
+              + xpathFollowingSibling(target.test, route.isImmediateSiblingStep(localLevel, -1, 0)),
+            [sibling, middle, target]
+          );
+        }
+      }
+    }
+    return [...candidates.values()]
+      .sort((left, right) => left.order - right.order || left.cost - right.cost || left.test.length - right.test.length || left.test.localeCompare(right.test));
+  }
+
+  function xpathPrefix(root) {
+    return isElement(root) ? './/' : '//';
+  }
+
+  function sameElements(left, right) {
+    return left.length === right.length && left.every((node, index) => node === right[index]);
+  }
+
+  function xpathStructuralPath(target, root, options) {
+    if (target === root) return '.';
+    const chain = [];
+    for (let current = target; isElement(current); current = current.parentElement) {
+      if (current === root) break;
+      const position = xpathNodePosition(current);
+      const depth = chain.length;
+      const allowTag = callbackAllows(options, 'tag', current.localName, '', depth, 0);
+      const allowPosition = callbackAllows(options, 'pos', current.localName, String(position), depth, 0);
+      if (!allowTag && !allowPosition) return '';
+      const name = allowTag ? xpathNameFor(current) : '*';
+      chain.push(name + (allowPosition ? '[' + position + ']' : ''));
+      if (current === current.ownerDocument?.documentElement) break;
+    }
+    if (!chain.length) return '';
+    const path = chain.reverse().join('/');
+    return isElement(root) ? './' + path : '//' + path;
+  }
+
+  function prepareXPathSynthesis(elements, rawOptions) {
+    const selected = documentOrder(asElements(elements));
+    if (!selected.length) return null;
+    const options = normalizeOptions(rawOptions);
+    const context = createContext(selected, options);
+    if (selected.some((element) => isShadowRoot(element.getRootNode?.()))) {
+      throw new Error('XPath cannot cross a shadow-root boundary; use extended CSS instead');
+    }
     const configured = configuredRoot(rawOptions);
-    if (!selector || !isElement(configured) || configured === configured.ownerDocument?.documentElement) return selector;
-    return selector.split(/\s+\|\s+/).map((path) => (
-      path.startsWith('.') ? path : '.' + path
-    )).join(' | ');
+    const root = isElement(configured) || isDocument(configured)
+      ? configured
+      : selected[0].ownerDocument;
+    const routes = selected.map((element) => new Route(element, context.root, context.options));
+    // XPath plugins receive the same evidence metrics as CSS plugins. This is
+    // especially important when a sorter ranks sharedness or target distance.
+    routes.forEach((route) => decorateEvidence(route, routes));
+    const evidenceById = new Map();
+    for (const route of routes) {
+      for (const evidence of route.evidence) {
+        if (!evidence.bridge && !evidenceById.has(evidence.id)) evidenceById.set(evidence.id, evidence);
+      }
+    }
+    const allEvidence = [...evidenceById.values()]
+      .sort((left, right) => left.rankCost - right.rankCost || left.css.length - right.css.length || left.id.localeCompare(right.id));
+    return { selected, options: context.options, root, routes, allEvidence };
+  }
+
+  function orderedXPathEvidence(prepared, suppliedTokens = null) {
+    if (!Array.isArray(suppliedTokens)) return prepared.allEvidence;
+    const byId = new Map(prepared.allEvidence.map((item) => [item.id, item]));
+    return suppliedTokens
+      .map((token) => byId.get(typeof token === 'string' ? token : token?.id))
+      .filter((item, index, values) => item && values.indexOf(item) === index);
+  }
+
+  function synthesizeXPath(prepared, suppliedTokens = null) {
+    const orderedEvidence = orderedXPathEvidence(prepared, suppliedTokens);
+    const allowed = new Set(orderedEvidence.map((item) => item.id));
+    const tokenSetIsAuthoritative = Array.isArray(suppliedTokens);
+    const tokenOrder = tokenSetIsAuthoritative
+      ? new Map(orderedEvidence.map((item, index) => [item.id, index]))
+      : null;
+    // A non-empty sorter result may intentionally retain only sibling or
+    // ancestor evidence, in which case `*` is a necessary structural tail.
+    // An empty result, however, explicitly suppresses every atom and must not
+    // be bypassed by a hidden absolute XPath fallback.
+    const allowImplicitWildcard = !tokenSetIsAuthoritative || allowed.size > 0;
+    const selectedSet = new Set(prepared.selected);
+    const candidates = new Map();
+    const add = (expression, cost, tokenIds = []) => {
+      if (!expression) return;
+      const order = tokenOrder
+        ? Math.min(...tokenIds.map((id) => tokenOrder.get(id) ?? Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER)
+        : 0;
+      const prior = candidates.get(expression);
+      if (!prior || order < prior.order || (order === prior.order && cost < prior.cost)) {
+        candidates.set(expression, { expression, cost, tokenIds, order });
+      }
+    };
+    const prefix = xpathPrefix(prepared.root);
+
+    for (const route of prepared.routes) {
+      if (route.target === prepared.root) {
+        add('.', 0, []);
+      }
+      const targetEvidence = route.evidence.filter((item) => !item.bridge && item.localLevel === 0 && item.offset === 0);
+      const targetTests = xpathNodeCandidates(targetEvidence, allowed, tokenOrder);
+      const targetOrWildcard = targetTests.length
+        ? targetTests
+        : allowImplicitWildcard ? [{ test: '*', tokenIds: [], cost: 24, order: Number.MAX_SAFE_INTEGER }] : [];
+      const targetLanes = xpathSiblingLaneCandidates(route, 0, allowed, allowImplicitWildcard, tokenOrder);
+      for (const target of targetLanes) add(prefix + target.test, target.cost, target.tokenIds);
+
+      const levels = [...new Set(route.evidence.filter((item) => !item.bridge && item.offset === 0 && item.localLevel > 0).map((item) => item.localLevel))]
+        .sort((left, right) => left - right)
+        .slice(0, 8);
+      for (const level of levels) {
+        const ancestors = xpathSiblingLaneCandidates(route, level, allowed, allowImplicitWildcard, tokenOrder);
+        for (const ancestor of ancestors.slice(0, 16)) {
+          for (const target of targetOrWildcard.slice(0, 18)) {
+            add(prefix + ancestor.test + '//' + target.test, ancestor.cost + target.cost + level * 0.25, [...ancestor.tokenIds, ...target.tokenIds]);
+          }
+        }
+      }
+
+    }
+
+    const usable = [];
+    for (const candidate of candidates.values()) {
+      let matches;
+      try {
+        matches = evaluateXPath(candidate.expression, prepared.root).filter(isElement);
+      } catch {
+        continue;
+      }
+      const unique = documentOrder([...new Set(matches)]);
+      const covered = unique.filter((node) => selectedSet.has(node));
+      if (!covered.length || unique.some((node) => !selectedSet.has(node))) continue;
+      usable.push({ ...candidate, matches: unique, covered });
+    }
+
+    const pending = new Set(prepared.selected);
+    const branches = [];
+    while (pending.size) {
+      const best = usable
+        .filter((candidate) => candidate.covered.some((node) => pending.has(node)))
+        .sort((left, right) => {
+          const leftCoverage = left.covered.filter((node) => pending.has(node)).length;
+          const rightCoverage = right.covered.filter((node) => pending.has(node)).length;
+          return rightCoverage - leftCoverage
+            || left.order - right.order
+            || left.cost - right.cost
+            || left.expression.length - right.expression.length
+            || left.expression.localeCompare(right.expression);
+        })[0];
+      if (!best) {
+        if (tokenSetIsAuthoritative) {
+          throw new Error('Could not derive an XPath selector from the permitted tokens');
+        }
+        const target = [...pending][0];
+        const structural = xpathStructuralPath(target, prepared.root, prepared.options);
+        if (!structural) throw new Error('Could not derive a stable XPath selector for the selected element');
+        const matches = evaluateXPath(structural, prepared.root).filter(isElement);
+        if (!sameElements(matches, [target])) throw new Error('Could not derive a stable XPath selector for the selected element');
+        branches.push(structural);
+        pending.delete(target);
+        continue;
+      }
+      branches.push(best.expression);
+      best.covered.forEach((node) => pending.delete(node));
+      if (branches.length > prepared.selected.length) throw new Error('XPath synthesis did not converge');
+    }
+    return [...new Set(branches)].join(' | ');
+  }
+
+  function getXPATHSync(elements, rawOptions) {
+    const prepared = prepareXPathSynthesis(elements, rawOptions);
+    if (!prepared) return '';
+    if (typeof rawOptions?.tokenSorter !== 'function') return synthesizeXPath(prepared);
+    const supplied = rawOptions.tokenSorter(prepared.allEvidence.map((item) => item.asSorterToken()));
+    if (supplied && typeof supplied.then === 'function') {
+      throw new Error('An asynchronous tokenSorter requires getXPATH()');
+    }
+    return synthesizeXPath(prepared, Array.isArray(supplied) ? supplied : null);
   }
 
   function getXPATH(elements, rawOptions) {
-    return Promise.resolve(getXPATHSync(elements, rawOptions));
+    return Promise.resolve().then(async () => {
+      const prepared = prepareXPathSynthesis(elements, rawOptions);
+      if (!prepared) return '';
+      if (typeof rawOptions?.tokenSorter !== 'function') return synthesizeXPath(prepared);
+      const supplied = await rawOptions.tokenSorter(prepared.allEvidence.map((item) => item.asSorterToken()));
+      return synthesizeXPath(prepared, Array.isArray(supplied) ? supplied : null);
+    });
   }
 
   class SelectorExpression {
@@ -1392,7 +1904,10 @@
 
     select(root = globalThis.document) {
       try {
-        return Promise.resolve(evaluateXPath(this.value, root));
+        // CSS and XCSS selectors are element selectors. Preserve that common
+        // contract for XPath too; raw XPath attribute/text-node queries remain
+        // available through evaluateXPath() for capture-specific handling.
+        return Promise.resolve(evaluateXPath(this.value, root).filter(isElement));
       } catch (error) {
         return Promise.reject(error);
       }
@@ -1421,11 +1936,17 @@
   function interactiveRoot(nodes, configuredRoot) {
     if (configuredRoot) return configuredRoot;
     if (!nodes.length) return null;
+    const intrinsicRoot = nodes[0].getRootNode?.();
+    if (isShadowRoot(intrinsicRoot) && nodes.every((node) => node.getRootNode?.() === intrinsicRoot)) {
+      return intrinsicRoot;
+    }
     let root = nodes[0].ownerDocument.documentElement;
-    for (const candidate of [...root.children]) {
-      if (nodes.every((node) => candidate.contains(node)) && !nodes.includes(candidate)) {
-        root = candidate;
-      }
+    while (true) {
+      const candidate = [...root.children].find((child) => (
+        !nodes.includes(child) && nodes.every((node) => child.contains(node))
+      ));
+      if (!candidate) break;
+      root = candidate;
     }
     return root;
   }
@@ -1482,11 +2003,25 @@
       }
     }
 
+    _interactiveOptions(root = undefined) {
+      // Stateful add/reject prediction is deliberately conservative. Partial
+      // attributes and preceding-sibling lanes are useful for one-shot full
+      // synthesis, but make an interactive selection jump as neighboring DOM
+      // content changes.
+      return {
+        ...this.options,
+        ...(root === undefined ? {} : { root }),
+        partAttrib: false,
+        siblingNodes: false,
+        useText: false
+      };
+    }
+
     _commonCandidates(root) {
       const desired = this.selected;
       if (!desired.length) return [];
       const context = createContext(desired, {
-        ...normalizeOptions(this.options),
+        ...normalizeOptions(this._interactiveOptions(root)),
         root
       });
       const routes = desired.map((node) => new Route(node, root, context.options));
@@ -1506,6 +2041,10 @@
       const selected = this.selected;
       if (!selected.length) throw new Error('empty list of selected');
       const root = interactiveRoot(selected, this.options.root);
+      // Validate the shared document/root relationship before trying friendly
+      // fallbacks. A bad root or cross-document set is a configuration error,
+      // not a reason to silently emit a selector for a different subtree.
+      createContext(selected, { ...normalizeOptions(this._interactiveOptions(root)), root });
       const rejected = new Set(this.rejected);
       let best = null;
       let candidates = [];
@@ -1531,7 +2070,7 @@
       if (!best) {
         let css;
         try {
-          css = await getCSS(selected, { ...this.options, root });
+          css = await getCSS(selected, this._interactiveOptions(root));
         } catch {
           css = selected.map((node) => exactScopedPath(node, root)).join(' , ');
         }
@@ -1575,15 +2114,16 @@
     async set(elements) {
       const desired = asElements(elements);
       if (!desired.length) throw new Error('empty list of selected');
+      const root = interactiveRoot(desired, this.options.root);
+      createContext(desired, { ...normalizeOptions(this._interactiveOptions(root)), root });
       this.reset();
       for (const element of desired) this._selected.add(element);
       this._latestAction = SelectorX.ADDED_SELECTION;
       // A set operation is expected to converge on exactly the supplied set,
       // so use the full synthesizer once and retain any other candidates as
       // explicit rejections for subsequent interactive edits.
-      const root = interactiveRoot(desired, this.options.root);
       try {
-        this._selector = await getCSS(desired, { ...this.options, root });
+        this._selector = await getCSS(desired, this._interactiveOptions(root));
       } catch {
         this._selector = desired.map((node) => exactScopedPath(node, root)).join(' , ');
       }

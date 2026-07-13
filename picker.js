@@ -8,6 +8,10 @@
 
   const MAX_HIGHLIGHTS = 20;
   const MAX_SELECTIONS = 20;
+  // Keep the picker contract aligned with the capture engine.  Field order is
+  // meaningful: it is the order in which values/text modes are applied, so do
+  // not collapse duplicate fields here.
+  const MAX_FIELDS_PER_SELECTION = 256;
   // The quick pass runs while the pointer is moving.  The full pass only runs
   // when an element is committed, so it can spend more work finding a concise
   // semantic path instead of falling back to a brittle chain of nth-childs.
@@ -32,12 +36,59 @@
       .slice(0, maxLength);
   }
 
+  function normalizedFieldType(value) {
+    const type = String(value ?? '').trim().toLowerCase();
+    return type === 'attribute' || type === 'property' || type === 'text' ? type : 'text';
+  }
+
+  function cleanPickerField(value) {
+    const raw = value && typeof value === 'object' ? value : { type: value };
+    let type = String(raw?.type ?? raw?.kind ?? '').trim().toLowerCase();
+    if (type === 'builtin' && String(raw?.name ?? raw?.value ?? '').trim() === 'text') type = 'text';
+    if (!['attribute', 'property', 'text'].includes(type)) return null;
+    if (type === 'text') return { type: 'text' };
+    const name = String(raw?.name ?? raw?.value ?? '').trim();
+    // Attribute names are not JavaScript identifiers: SVG/XML values such as
+    // `xlink:href` (and non-ASCII names) are valid capture fields.  Match the
+    // worker's protocol validation so a field accepted by this editor does not
+    // disappear during monitor normalization.
+    if (!name || name.length > 256 || /[\u0000-\u001F\u007F\s]/.test(name)) return null;
+    if (type === 'attribute' && /["'<>\/=]/.test(name)) return null;
+    return { type, name };
+  }
+
+  function copyPickerFields(value, fallbackToText = true) {
+    const source = Array.isArray(value) ? value : value == null ? [] : [value];
+    const fields = [];
+    for (const item of source.slice(0, MAX_FIELDS_PER_SELECTION)) {
+      const field = cleanPickerField(item);
+      if (field) fields.push(field);
+    }
+    return fields.length || !fallbackToText ? fields : [{ type: 'text' }];
+  }
+
+  function fieldDescription(field) {
+    if (field?.type === 'attribute') return `attribute: ${field.name}`;
+    if (field?.type === 'property') return `property: ${field.name}`;
+    return 'text';
+  }
+
   function snapshotTextFor(element) {
     return cleanSnapshotText(element?.innerText || element?.textContent);
   }
 
+  function isPickerUiElement(element) {
+    const visited = new Set();
+    for (let current = element; current && !visited.has(current); current = current.parentElement || current.getRootNode?.().host || null) {
+      visited.add(current);
+      if (String(current.localName || '').toLowerCase() === 'openstill-picker-root'
+        && current.getAttribute?.('data-openstill-picker-ui') === 'true') return true;
+    }
+    return false;
+  }
+
   function isPageElement(element) {
-    if (!(element instanceof Element) || !element.isConnected) return false;
+    if (!(element instanceof Element) || !element.isConnected || isPickerUiElement(element)) return false;
     let root = element.getRootNode();
     while (root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host) {
       root = root.host.getRootNode();
@@ -99,33 +150,50 @@
     const runtime = globalThis.__openStillSelectorX;
     if (type === 'xpath') {
       if (typeof runtime?.evaluateXPath === 'function') {
-        return Array.from(runtime.evaluateXPath(selector, root)).filter((node) => node instanceof Element);
+        return Array.from(runtime.evaluateXPath(selector, root)).filter(isPageElement);
       }
       const doc = root?.nodeType === Node.DOCUMENT_NODE ? root : root?.ownerDocument;
       if (!doc?.evaluate) return [];
-      const result = doc.evaluate(selector, root, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+      const xpathContext = root?.nodeType === Node.DOCUMENT_NODE
+        ? root.documentElement || root
+        : root;
+      const result = doc.evaluate(
+        selector,
+        xpathContext,
+        (prefix) => prefix === 'xhtml' ? 'http://www.w3.org/1999/xhtml' : null,
+        XPathResult.ORDERED_NODE_ITERATOR_TYPE,
+        null
+      );
       const matches = [];
       for (let node = result.iterateNext(); node; node = result.iterateNext()) {
-        if (node instanceof Element) matches.push(node);
+        if (isPageElement(node)) matches.push(node);
       }
       return matches;
     }
     if (type === 'xcss') {
+      // Reference keeps this serializer mode sticky in the isolated world
+      // after any extended-CSS evaluation.  The worker reads the same flag
+      // when it later serializes the selected capture, so do not reset it for
+      // subsequent CSS/XPath previews.
+      globalThis.__openStillCaptureUsesExtendedCss = true;
       const runtimeQuery = runtime?.querySelectorAll ?? runtime?.queryExtendedCSS;
-      if (typeof runtimeQuery === 'function') return Array.from(runtimeQuery(selector, root));
+      if (typeof runtimeQuery === 'function') return Array.from(runtimeQuery(selector, root)).filter(isPageElement);
     }
-    return Array.from(root.querySelectorAll(selector));
+    return Array.from(root.querySelectorAll(selector)).filter(isPageElement);
   }
 
   function shadowRootFor(element) {
     if (!(element instanceof Element)) return null;
-    try {
-      return element.shadowRoot
-        || globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element)
-        || null;
-    } catch {
-      return element.shadowRoot || null;
-    }
+    const read = (getter) => {
+      try { return getter() || null; } catch { return null; }
+    };
+    const usable = (root) => root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+      && typeof root.querySelectorAll === 'function'
+      ? root
+      : null;
+    return usable(read(() => element.shadowRoot))
+      || usable(read(() => element._shadowRoot))
+      || usable(read(() => globalThis.chrome?.dom?.openOrClosedShadowRoot?.(element)));
   }
 
   function deepestShadowElementAtPoint(element, clientX, clientY) {
@@ -680,6 +748,10 @@
       this.matchElements = [];
       this.host = document.createElement('openstill-picker-root');
       this.host.setAttribute('aria-hidden', 'true');
+      // `aria-hidden` is a valid page-level accessibility state, not an
+      // ownership proof. Use a private extension marker so a site-owned
+      // custom element with the same tag remains selectable and capturable.
+      this.host.setAttribute('data-openstill-picker-ui', 'true');
       this.host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none;';
       this.shadow = this.host.attachShadow({ mode: 'closed' });
       this.render();
@@ -722,9 +794,28 @@
           .selector-row { display: flex; gap: 8px; }
           .selector-row input { flex: 1; }
           .selector-row select { width: 108px; flex: 0 0 108px; }
-          .field-controls { display: grid; grid-template-columns: 1fr 1.35fr; gap: 8px; }
-          .field-controls label { color: #aebed2; }
-          .field-controls [hidden] { display: none; }
+          .field-editor { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+          .field-editor legend { padding: 0; color: #c8d5e6; font-size: 12px; font-weight: 650; }
+          .field-help { margin: -2px 0 0; color: #8fa4bd; font-size: 11px; line-height: 1.4; }
+          .field-status { min-height: 15px; margin: -2px 0 0; color: #ffb1a9; font-size: 11px; line-height: 1.35; }
+          .field-list { display: grid; gap: 6px; max-height: 150px; overflow: auto; }
+          .field-empty { padding: 8px 10px; border: 1px dashed #42546b; border-radius: 8px; color: #aebed2; font-size: 12px; }
+          .field-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto; gap: 6px; align-items: center; padding: 7px; border: 1px solid #32465f; border-radius: 8px; background: #101a29; }
+          .field-index { min-width: 20px; color: #7f95af; font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-align: right; }
+          .field-value { min-width: 0; overflow: hidden; color: #d8e6f6; font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+          .field-row button { width: 28px; height: 28px; color: #c6d4e6; background: #213248; font-size: 14px; line-height: 1; }
+          .field-row button:hover { background: #314760; }
+          .field-row button.remove-field { color: #ffb5ad; }
+          .field-row button:disabled { cursor: not-allowed; opacity: .42; }
+          .field-add { display: grid; grid-template-columns: minmax(110px, .85fr) minmax(0, 1.35fr) auto; gap: 8px; align-items: end; }
+          .field-add label { color: #aebed2; }
+          .field-add [hidden] { display: none; }
+          .field-add-button { min-height: 39px; white-space: nowrap; }
+          .field-suggestions { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; min-height: 0; }
+          .field-suggestions[hidden] { display: none; }
+          .field-suggestion-label { color: #8fa4bd; font-size: 11px; }
+          .field-suggestion { max-width: 100%; padding: 4px 7px; overflow: hidden; color: #b9d4f8; background: #203249; border-radius: 6px; font: 11px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+          .field-suggestion:hover { background: #304866; }
           .validity { padding: 8px 10px; border-radius: 8px; background: #0f1825; color: #aebed2; font-size: 12px; line-height: 1.45; }
           .validity.ok { color: #77edbd; }
           .validity.error { color: #ff9c90; }
@@ -772,10 +863,18 @@
               <label>CSS 선택자
                 <div class="selector-row"><select id="selectorType" aria-label="Selector type"><option value="css">CSS</option><option value="xcss">XCSS (Shadow DOM)</option><option value="xpath">XPath</option></select><input id="selector" autocomplete="off" spellcheck="false" /></div>
               </label>
-              <div class="field-controls" aria-label="추출할 값">
-                <label>추출 값<select id="fieldType" aria-label="추출 값"><option value="text">텍스트</option><option value="attribute">속성</option><option value="property">프로퍼티</option></select></label>
-                <label id="fieldNameLabel">이름<input id="fieldName" autocomplete="off" spellcheck="false" maxlength="80" placeholder="예: href, value"></label>
-              </div>
+              <fieldset class="field-editor" aria-describedby="fieldHelp">
+                <legend>추출할 값</legend>
+                <p class="field-help" id="fieldHelp">필드 순서대로 값을 추출합니다. 텍스트, 여러 속성, 프로퍼티를 함께 추가할 수 있습니다.</p>
+                <div class="field-list" id="fieldList" role="list" aria-label="추출 필드 순서"></div>
+                <p class="field-status" id="fieldStatus" role="status" aria-live="polite"></p>
+                <div class="field-add">
+                  <label>필드 타입<select id="fieldType" aria-label="추가할 필드 타입"><option value="text">텍스트</option><option value="attribute">속성</option><option value="property">프로퍼티</option></select></label>
+                  <label id="fieldNameLabel">이름<input id="fieldName" autocomplete="off" spellcheck="false" maxlength="256" placeholder="예: href, xlink:href, value" aria-describedby="fieldHelp fieldStatus"></label>
+                  <button class="button field-add-button" id="addField" type="button">필드 추가</button>
+                </div>
+                <div class="field-suggestions" id="fieldSuggestions" role="group" aria-label="선택한 요소에서 사용할 수 있는 필드" hidden></div>
+              </fieldset>
               <div class="validity" id="validity">선택자를 확인하는 중입니다.</div>
               <label>표시 이름 <span style="font-weight:500;color:#7e91aa">여러 개면 번호를 붙여 저장</span><input id="name" name="name" maxlength="120" /></label>
               <label>라벨 <span style="font-weight:500;color:#7e91aa">쉼표로 여러 개를 구분</span><input id="labels" name="labels" maxlength="500" placeholder="예: 채용, 가격" /></label>
@@ -809,6 +908,10 @@
       this.fieldTypeInput = this.shadow.querySelector('#fieldType');
       this.fieldNameInput = this.shadow.querySelector('#fieldName');
       this.fieldNameLabel = this.shadow.querySelector('#fieldNameLabel');
+      this.fieldList = this.shadow.querySelector('#fieldList');
+      this.fieldStatus = this.shadow.querySelector('#fieldStatus');
+      this.addFieldButton = this.shadow.querySelector('#addField');
+      this.fieldSuggestions = this.shadow.querySelector('#fieldSuggestions');
       this.nameInput = this.shadow.querySelector('#name');
       this.labelsInput = this.shadow.querySelector('#labels');
       this.scheduleModeInput = this.shadow.querySelector('#scheduleMode');
@@ -821,6 +924,7 @@
       this.saveButton = this.shadow.querySelector('#save');
       this.selectionSummary = this.shadow.querySelector('#selectionSummary');
       this.selectionList = this.shadow.querySelector('#selectionList');
+      this.installScheduleControls();
 
       for (let day = 0; day <= 14; day += 1) {
         const option = document.createElement('option');
@@ -836,6 +940,8 @@
       }
       this.hoursInput.value = '1';
       this.scheduleModeInput.value = 'manual';
+      this.editorFields = [{ type: 'text' }];
+      this.renderFieldEditor();
       this.updateFieldEditorVisibility();
 
       this.closeButton = this.shadow.querySelector('#close');
@@ -850,9 +956,17 @@
       });
       this.fieldTypeInput.addEventListener('change', () => {
         this.updateFieldEditorVisibility();
-        this.validateSelector();
       });
-      this.fieldNameInput.addEventListener('input', () => this.validateSelector());
+      this.fieldNameInput.addEventListener('input', () => this.updateFieldEditorVisibility());
+      this.fieldNameInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          this.addFieldFromEditor();
+        }
+      });
+      this.addFieldButton.addEventListener('click', () => this.addFieldFromEditor());
+      this.fieldList.addEventListener('click', (event) => this.handleFieldListAction(event));
+      this.fieldSuggestions.addEventListener('click', (event) => this.useFieldSuggestion(event));
       this.selectionList.addEventListener('click', (event) => {
         const removeButton = event.target.closest('[data-remove-selection]');
         if (removeButton) {
@@ -864,8 +978,13 @@
           this.activateSelection(Number(selectionButton.dataset.selectionIndex));
         }
       });
-      this.daysInput.addEventListener('change', () => this.updateInterval());
-      this.hoursInput.addEventListener('change', () => this.updateInterval());
+      this.daysInput.addEventListener('change', () => this.syncIntervalSecondsFromFriendlyInputs());
+      this.hoursInput.addEventListener('change', () => this.syncIntervalSecondsFromFriendlyInputs());
+      this.intervalSecondsInput.addEventListener('input', () => this.updateInterval());
+      this.randomMinSecondsInput.addEventListener('input', () => this.updateInterval());
+      this.randomMaxSecondsInput.addEventListener('input', () => this.updateInterval());
+      this.cronExpressionInput.addEventListener('input', () => this.updateInterval());
+      this.cronTimezoneInput.addEventListener('input', () => this.updateInterval());
       this.scheduleModeInput.addEventListener('change', () => this.updateInterval());
       this.form.addEventListener('submit', (event) => {
         event.preventDefault();
@@ -921,6 +1040,11 @@
         return;
       }
       this.hoveredElement = element;
+      if (this.operationForElement(element) === 'noop') {
+        this.clearHighlights();
+        this.tooltip.hidden = true;
+        return;
+      }
       const selector = selectorFor(element, { quick: true });
       if (!selector) {
         this.clearHighlights();
@@ -960,28 +1084,227 @@
     }
 
     updateFieldEditorVisibility() {
-      const needsName = this.fieldTypeInput?.value !== 'text';
+      const type = normalizedFieldType(this.fieldTypeInput?.value);
+      if (this.fieldTypeInput) this.fieldTypeInput.value = type;
+      const needsName = type !== 'text';
       this.fieldNameLabel.hidden = !needsName;
       this.fieldNameInput.disabled = !needsName;
+      this.fieldNameInput.setAttribute('aria-required', String(needsName));
+      this.updateFieldAddButtonState();
+      this.renderFieldSuggestions(type);
+    }
+
+    updateFieldAddButtonState() {
+      if (!this.addFieldButton) return;
+      const atLimit = (this.editorFields?.length ?? 0) >= MAX_FIELDS_PER_SELECTION;
+      this.addFieldButton.disabled = atLimit || this.saving;
+      this.addFieldButton.title = atLimit ? `At most ${MAX_FIELDS_PER_SELECTION} fields can be extracted.` : '';
+    }
+
+    setFieldStatus(message = '') {
+      if (this.fieldStatus) this.fieldStatus.textContent = message;
+    }
+
+    fieldSuggestionNames(type) {
+      if (type === 'text') return [];
+      const names = [];
+      const seen = new Set();
+      const add = (name) => {
+        const field = cleanPickerField({ type, name });
+        if (!field || seen.has(field.name)) return;
+        seen.add(field.name);
+        names.push(field.name);
+      };
+      const selection = this.currentSelection();
+      const selectedElements = selection?.matchedElements?.length
+        ? selection.matchedElements
+        : selection?.elements?.length
+          ? selection.elements
+          : selection?.element ? [selection.element] : [];
+      const elements = selectedElements.filter((element) => element instanceof Element).slice(0, 32);
+      // Keep fields already in this ordered configuration discoverable even if
+      // a repeated selector currently happens not to expose that member.
+      (this.editorFields ?? []).filter((field) => field.type === type).forEach((field) => add(field.name));
+      if (type === 'attribute') {
+        for (const element of elements) {
+          try {
+            const attributeNames = typeof element.getAttributeNames === 'function'
+              ? element.getAttributeNames()
+              : Array.from(element.attributes ?? []).map((attribute) => attribute.name);
+            attributeNames.forEach(add);
+          } catch {
+            // A hostile custom element should not prevent the field editor
+            // from displaying the rest of the selected target's suggestions.
+          }
+        }
+        ['id', 'name', 'class'].forEach(add);
+      } else {
+        const commonProperties = [
+          'innerHTML', 'innerText', 'outerHTML', 'outerText', 'title', 'textContent',
+          'value', 'checked', 'selected', 'selectedIndex', 'href', 'src', 'alt',
+          'ariaLabel', 'id', 'className'
+        ];
+        for (const name of commonProperties) {
+          if (elements.some((element) => {
+            try { return name in element; } catch { return false; }
+          })) add(name);
+        }
+        for (const element of elements) {
+          try { Object.keys(element).slice(0, 32).forEach(add); } catch { /* optional custom properties */ }
+        }
+      }
+      return names.slice(0, 24);
+    }
+
+    renderFieldSuggestions(type = normalizedFieldType(this.fieldTypeInput?.value)) {
+      if (!this.fieldSuggestions) return;
+      const names = this.fieldSuggestionNames(type);
+      this.fieldSuggestions.replaceChildren();
+      this.fieldSuggestions.hidden = !names.length;
+      if (!names.length) return;
+      const label = document.createElement('span');
+      label.className = 'field-suggestion-label';
+      label.textContent = type === 'attribute' ? 'Target attributes:' : 'Target properties:';
+      this.fieldSuggestions.append(label);
+      names.forEach((name) => {
+        const suggestion = document.createElement('button');
+        suggestion.type = 'button';
+        suggestion.className = 'field-suggestion';
+        suggestion.dataset.fieldSuggestion = name;
+        suggestion.setAttribute('aria-label', `Use ${type} ${name}`);
+        suggestion.title = `Use ${type} ${name}`;
+        suggestion.textContent = name;
+        this.fieldSuggestions.append(suggestion);
+      });
+    }
+
+    useFieldSuggestion(event) {
+      const suggestion = event.target?.closest?.('[data-field-suggestion]');
+      if (!suggestion || this.saving || this.fieldNameInput?.disabled) return;
+      this.fieldNameInput.value = suggestion.dataset.fieldSuggestion ?? '';
+      this.setFieldStatus('');
+      this.updateFieldEditorVisibility();
+      this.fieldNameInput.focus();
+    }
+
+    renderFieldEditor() {
+      if (!this.fieldList) return;
+      const fields = Array.isArray(this.editorFields) ? this.editorFields : [];
+      this.fieldList.replaceChildren();
+      if (!fields.length) {
+        const empty = document.createElement('div');
+        empty.className = 'field-empty';
+        empty.setAttribute('role', 'listitem');
+        empty.textContent = 'Add at least one extraction field.';
+        this.fieldList.append(empty);
+        return;
+      }
+      const button = (label, action, index, text, disabled = false, className = '') => {
+        const control = document.createElement('button');
+        control.type = 'button';
+        control.className = className;
+        control.dataset.fieldAction = action;
+        control.dataset.fieldIndex = String(index);
+        control.setAttribute('aria-label', label);
+        control.title = label;
+        control.disabled = disabled || this.saving;
+        control.textContent = text;
+        return control;
+      };
+      fields.forEach((field, index) => {
+        const row = document.createElement('div');
+        row.className = 'field-row';
+        row.setAttribute('role', 'listitem');
+        row.setAttribute('aria-label', `Field ${index + 1}: ${fieldDescription(field)}`);
+        const number = document.createElement('span');
+        number.className = 'field-index';
+        number.setAttribute('aria-hidden', 'true');
+        number.textContent = String(index + 1);
+        const value = document.createElement('span');
+        value.className = 'field-value';
+        value.textContent = fieldDescription(field);
+        row.append(
+          number,
+          value,
+          button(`Move field ${index + 1} up`, 'up', index, '↑', index === 0),
+          button(`Move field ${index + 1} down`, 'down', index, '↓', index === fields.length - 1),
+          button(`Remove field ${index + 1}`, 'remove', index, '×', fields.length === 1, 'remove-field')
+        );
+        this.fieldList.append(row);
+      });
+    }
+
+    commitFieldEditorChange() {
+      this.renderFieldEditor();
+      this.updateFieldEditorVisibility();
+      this.validateSelector();
+    }
+
+    addFieldFromEditor() {
+      if (this.saving || !this.currentSelection()) return;
+      if ((this.editorFields?.length ?? 0) >= MAX_FIELDS_PER_SELECTION) {
+        this.setFieldStatus(`At most ${MAX_FIELDS_PER_SELECTION} fields can be extracted.`);
+        return;
+      }
+      const field = cleanPickerField({
+        type: this.fieldTypeInput?.value,
+        name: this.fieldNameInput?.value
+      });
+      if (!field) {
+        this.setFieldStatus('Enter a valid attribute or property name. Names cannot contain whitespace.');
+        this.fieldNameInput?.focus();
+        return;
+      }
+      if (!Array.isArray(this.editorFields)) this.editorFields = [];
+      this.editorFields.push(field);
+      if (field.type !== 'text' && this.fieldNameInput) this.fieldNameInput.value = '';
+      this.setFieldStatus('');
+      this.commitFieldEditorChange();
+    }
+
+    handleFieldListAction(event) {
+      const control = event.target?.closest?.('[data-field-action]');
+      if (!control || this.saving) return;
+      const index = Number(control.dataset.fieldIndex);
+      const fields = this.editorFields;
+      if (!Number.isInteger(index) || !Array.isArray(fields) || !fields[index]) return;
+      const action = control.dataset.fieldAction;
+      if (action === 'up' && index > 0) {
+        [fields[index - 1], fields[index]] = [fields[index], fields[index - 1]];
+      } else if (action === 'down' && index < fields.length - 1) {
+        [fields[index], fields[index + 1]] = [fields[index + 1], fields[index]];
+      } else if (action === 'remove') {
+        if (fields.length === 1) {
+          this.setFieldStatus('At least one extraction field is required.');
+          return;
+        }
+        fields.splice(index, 1);
+      } else {
+        return;
+      }
+      this.setFieldStatus('');
+      this.commitFieldEditorChange();
     }
 
     fieldsFromEditor() {
-      const type = this.fieldTypeInput?.value === 'attribute'
-        ? 'attribute'
-        : this.fieldTypeInput?.value === 'property' ? 'property' : 'text';
-      if (type === 'text') return [{ type: 'text' }];
-      const name = this.fieldNameInput.value.trim();
-      return /^[A-Za-z_$][\w$-]{0,80}$/.test(name) ? [{ type, name }] : null;
+      const source = Array.isArray(this.editorFields) ? this.editorFields : [];
+      if (!source.length || source.length > MAX_FIELDS_PER_SELECTION) return null;
+      const fields = [];
+      for (const value of source) {
+        const field = cleanPickerField(value);
+        if (!field) return null;
+        fields.push(field);
+      }
+      return fields;
     }
 
     syncFieldEditor(selection) {
-      const fields = Array.isArray(selection?.fields) && selection.fields.length
-        ? selection.fields
-        : [{ type: 'text' }];
-      const nonText = fields.find((field) => field?.type === 'attribute' || field?.type === 'property');
-      const textOnly = fields.every((field) => field?.type === 'text');
-      this.fieldTypeInput.value = textOnly ? 'text' : nonText?.type ?? 'text';
-      this.fieldNameInput.value = textOnly ? '' : nonText?.name ?? '';
+      this.editorFields = copyPickerFields(selection?.fields, true);
+      const lastNamedField = [...this.editorFields].reverse().find((field) => field.type !== 'text');
+      this.fieldTypeInput.value = lastNamedField?.type ?? 'text';
+      this.fieldNameInput.value = '';
+      this.setFieldStatus('');
+      this.renderFieldEditor();
       this.updateFieldEditorVisibility();
     }
 
@@ -1006,16 +1329,31 @@
         return;
       }
 
-      const target = selection.element ?? selection.matchedElements?.[0];
+      // A locator can intentionally represent a repeated set. Converting only
+      // its first node silently narrows CSS/XCSS → XPath (or the reverse) and
+      // changes the monitor's meaning, so synthesize against the complete
+      // currently matched element set.
+      const targets = uniqueElementsInDocumentOrder(
+        selection.matchedElements?.length
+          ? selection.matchedElements
+          : selection.elements?.length
+            ? selection.elements
+            : [selection.element]
+      );
+      const target = targets[0] ?? null;
+      if (!target) {
+        this.selectorTypeInput.value = previousType;
+        return;
+      }
       const runtime = globalThis.__openStillSelectorX;
       let selector = '';
       try {
         if (nextType === 'xpath') {
-          selector = await Promise.resolve(runtime?.getXPATH?.([target], { timeout: 500 }));
+          selector = await Promise.resolve(runtime?.getXPATH?.(targets, { timeout: 500 }));
         } else if (nextType === 'xcss') {
-          selector = await Promise.resolve(runtime?.getExtendedCSS?.([target], { timeout: 500 }));
-        } else if (selectorTypeFor(target) !== 'xcss') {
-          selector = await Promise.resolve(runtime?.getCSS?.([target], { timeout: 500 }));
+          selector = await Promise.resolve(runtime?.getExtendedCSS?.(targets, { timeout: 500 }));
+        } else if (targets.every((element) => selectorTypeFor(element) !== 'xcss')) {
+          selector = await Promise.resolve(runtime?.getCSS?.(targets, { timeout: 500 }));
           if (!selector) selector = selectorFor(target);
         }
       } catch {
@@ -1034,7 +1372,7 @@
         // Keep the existing type and locator when the generated expression is
         // rejected by the browser's native selector/XPath evaluator.
       }
-      if (!matches.length || (target && !matches.includes(target))) {
+      if (!matches.length || targets.some((element) => !matches.includes(element))) {
         this.selectorTypeInput.value = previousType;
         this.message.textContent = '변환한 선택자가 현재 요소와 일치하지 않습니다.';
         return;
@@ -1141,18 +1479,42 @@
     }
 
     operationForElement(element) {
-      const selectionsContaining = (op) => this.selections.some((selection) => (
-        (selection.op === 'exclude' ? 'exclude' : 'include') === op
-        && (selection.matchedElements ?? selection.elements ?? []).some((candidate) => composedContains(candidate, element))
+      const targetsForSelection = (selection) => {
+        const matched = Array.isArray(selection.matchedElements) ? selection.matchedElements : [];
+        if (matched.length) return matched;
+        const visible = Array.isArray(selection.elements) ? selection.elements : [];
+        return visible.length ? visible : selection.element ? [selection.element] : [];
+      };
+      // A selection is an indivisible picker box.  The reference picker does
+      // not let a later click promote that box (or any of its ancestors) into
+      // a second, overlapping selection: it would make the include/exclude
+      // route ambiguous and produce a redundant parent rule.  Walk across a
+      // shadow boundary so closed/open shadow selections get the same guard.
+      const containsExistingSelection = this.selections.some((selection) => (
+        targetsForSelection(selection)
+          .some((candidate) => composedContains(element, candidate))
       ));
-      // Selecting inside an inclusion narrows it. Selecting inside that
-      // exclusion explicitly opens a smaller inclusion again, so the user can
-      // express include → exclude → include without losing the parent route.
-      if (selectionsContaining('exclude')) return 'include';
-      return selectionsContaining('include') ? 'exclude' : 'include';
+      if (containsExistingSelection) return 'noop';
+      // Flip the nearest enclosing selection, not any enclosing selection.
+      // This preserves all alternating levels of an include → exclude →
+      // include route: a fourth click inside the re-included node is exclude.
+      const visited = new Set();
+      for (let current = element; current && !visited.has(current); current = current.parentElement || current.getRootNode?.().host || null) {
+        visited.add(current);
+        const nearest = this.selections.find((selection) => (
+          targetsForSelection(selection).some((candidate) => candidate === current)
+        ));
+        if (nearest) return nearest.op === 'exclude' ? 'include' : 'exclude';
+      }
+      return 'include';
     }
 
     async selectElement(element) {
+      // Match the hover/click behaviour of the reference picker: clicking a
+      // saved target or any ancestor that already contains one is deliberately
+      // inert.  Check before generating a selector, both to avoid needless
+      // work and to avoid turning an existing child route into a parent rule.
+      if (this.operationForElement(element) === 'noop') return;
       let selectorType = selectorTypeFor(element);
       let selector = selectorFor(element);
       // The reference picker degrades to an XPath locator when a semantic CSS
@@ -1188,6 +1550,7 @@
       }
 
       const operation = this.operationForElement(element);
+      if (operation === 'noop') return;
       const existingIndex = this.selections.findIndex((selection) => (
         selection.op === operation
         && (selection.selector === selector
@@ -1270,6 +1633,64 @@
       this.tooltip.style.left = `${left}px`;
     }
 
+    installScheduleControls() {
+      for (const [value, label] of [['random', 'Random interval'], ['cron', 'CRON'], ['live', 'Live']]) {
+        if (![...this.scheduleModeInput.options].some((option) => option.value === value)) {
+          const option = document.createElement('option');
+          option.value = value;
+          option.textContent = label;
+          this.scheduleModeInput.append(option);
+        }
+      }
+      const numberField = (label, value, minimum = 5, maximum = 2_592_000) => {
+        const wrapper = document.createElement('label');
+        const caption = document.createElement('small');
+        caption.textContent = label;
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = String(minimum);
+        input.max = String(maximum);
+        input.step = '1';
+        input.inputMode = 'numeric';
+        input.value = String(value);
+        wrapper.append(caption, input);
+        return { wrapper, input };
+      };
+      const interval = numberField('Exact seconds', 3_600);
+      this.intervalFields.append(interval.wrapper);
+      this.intervalSecondsInput = interval.input;
+
+      this.randomFields = document.createElement('div');
+      this.randomFields.className = 'interval-fields';
+      this.randomFields.hidden = true;
+      const randomMin = numberField('Minimum seconds', 3_600);
+      const randomMax = numberField('Maximum seconds', 7_200);
+      this.randomFields.append(document.createTextNode('Random range'), randomMin.wrapper, randomMax.wrapper);
+      this.intervalFields.after(this.randomFields);
+      this.randomMinSecondsInput = randomMin.input;
+      this.randomMaxSecondsInput = randomMax.input;
+
+      this.cronFields = document.createElement('div');
+      this.cronFields.className = 'interval-fields';
+      this.cronFields.hidden = true;
+      const expression = document.createElement('input');
+      expression.maxLength = 160;
+      expression.placeholder = '0 3 * * *';
+      const timezone = document.createElement('input');
+      timezone.maxLength = 80;
+      timezone.placeholder = 'Asia/Seoul (optional)';
+      const expressionLabel = document.createElement('label');
+      expressionLabel.textContent = 'Cron expression';
+      expressionLabel.append(expression);
+      const timezoneLabel = document.createElement('label');
+      timezoneLabel.textContent = 'Timezone';
+      timezoneLabel.append(timezone);
+      this.cronFields.append(document.createTextNode('Cron schedule'), expressionLabel, timezoneLabel);
+      this.randomFields.after(this.cronFields);
+      this.cronExpressionInput = expression;
+      this.cronTimezoneInput = timezone;
+    }
+
     updateInterval() {
       const scheduleMode = this.selectedScheduleMode();
       const days = Number(this.daysInput.value);
@@ -1292,11 +1713,48 @@
     }
 
     selectedScheduleMode() {
-      return this.scheduleModeInput.value === 'interval' ? 'interval' : 'manual';
+      const mode = this.scheduleModeInput.value;
+      return ['manual', 'interval', 'random', 'cron', 'live'].includes(mode) ? mode : 'manual';
     }
 
     selectedIntervalHours() {
       return Number(this.daysInput.value) * 24 + Number(this.hoursInput.value);
+    }
+
+    scheduleDraft() {
+      const scheduleMode = this.selectedScheduleMode();
+      const intervalSeconds = Number(this.intervalSecondsInput.value || 0);
+      const randomMin = Number(this.randomMinSecondsInput.value || 0);
+      const randomMax = Number(this.randomMaxSecondsInput.value || 0);
+      const validInterval = Number.isInteger(intervalSeconds) && intervalSeconds >= 5 && intervalSeconds <= 2_592_000;
+      const validRandom = Number.isInteger(randomMin) && Number.isInteger(randomMax)
+        && randomMin >= 5 && randomMax <= 2_592_000 && randomMin <= randomMax;
+      const validCron = Boolean(this.cronExpressionInput.value.trim());
+      return { scheduleMode, intervalSeconds, randomMin, randomMax, validInterval, validRandom, validCron };
+    }
+
+    syncIntervalSecondsFromFriendlyInputs() {
+      const seconds = (Number(this.daysInput.value) * 24 + Number(this.hoursInput.value)) * 3_600;
+      this.intervalSecondsInput.value = String(seconds);
+      this.updateInterval();
+    }
+
+    updateInterval() {
+      const draft = this.scheduleDraft();
+      this.intervalFields.hidden = draft.scheduleMode !== 'interval';
+      this.randomFields.hidden = draft.scheduleMode !== 'random';
+      this.cronFields.hidden = draft.scheduleMode !== 'cron';
+      this.intervalSummary.textContent = draft.scheduleMode === 'manual'
+        ? 'Manual checks only.'
+        : draft.scheduleMode === 'live'
+          ? 'Automatically observe matching open pages in real time.'
+          : draft.scheduleMode === 'interval'
+            ? (draft.validInterval ? `Check every ${draft.intervalSeconds} seconds.` : 'Interval must be an integer between 5 seconds and 30 days.')
+            : draft.scheduleMode === 'random'
+              ? (draft.validRandom ? `Check randomly between ${draft.randomMin} and ${draft.randomMax} seconds.` : 'Random bounds must be integers from 5 seconds to 30 days.')
+              : draft.validCron ? 'Use the CRON expression for the next check.' : 'Enter a CRON expression.';
+      this.validateSelector();
+      return draft;
     }
 
     validateSelector() {
@@ -1305,8 +1763,8 @@
       }
       const selector = this.selectorInput.value.trim();
       const selectorType = this.selectedSelectorType();
-      const totalHours = this.selectedIntervalHours();
-      const scheduleMode = this.selectedScheduleMode();
+      const schedule = this.scheduleDraft();
+      const { scheduleMode } = schedule;
       const active = this.currentSelection();
       this.message.textContent = '';
       this.validity.className = 'validity';
@@ -1358,7 +1816,11 @@
         this.validity.replaceChildren(document.createTextNode(message), preview);
         this.validity.classList.add('ok');
         this.renderSelectionList();
-        this.saveButton.disabled = !((scheduleMode === 'manual' || (totalHours >= 1 && totalHours <= 336)) && this.selections.length);
+        const scheduleValid = scheduleMode === 'manual' || scheduleMode === 'live'
+          || (scheduleMode === 'interval' && schedule.validInterval)
+          || (scheduleMode === 'random' && schedule.validRandom)
+          || (scheduleMode === 'cron' && schedule.validCron);
+        this.saveButton.disabled = !(scheduleValid && this.selections.length);
         return true;
       } catch (error) {
         this.validity.textContent = '유효하지 않은 CSS 선택자입니다: ' + error.message;
@@ -1463,12 +1925,28 @@
       if (!this.validateSelector() || !this.validateAllSelections()) {
         return;
       }
-      const totalHours = this.selectedIntervalHours();
-      const scheduleMode = this.selectedScheduleMode();
-      if (scheduleMode === 'interval' && (totalHours < 1 || totalHours > 336)) {
+      const scheduleDraft = this.scheduleDraft();
+      const { scheduleMode, intervalSeconds, randomMin, randomMax, validInterval, validRandom, validCron } = scheduleDraft;
+      if ((scheduleMode === 'interval' && !validInterval)
+        || (scheduleMode === 'random' && !validRandom)
+        || (scheduleMode === 'cron' && !validCron)) {
         this.message.textContent = '간격은 최소 1시간, 최대 14일입니다.';
         return;
       }
+
+      const schedule = scheduleMode === 'interval'
+        ? { type: 'interval', params: { interval: intervalSeconds } }
+        : scheduleMode === 'random'
+          ? { type: 'random', params: { min: randomMin, max: randomMax } }
+          : scheduleMode === 'cron'
+            ? {
+                type: 'cron',
+                params: {
+                  expr: this.cronExpressionInput.value.trim(),
+                  ...(this.cronTimezoneInput.value.trim() ? { tz: this.cronTimezoneInput.value.trim() } : {})
+                }
+              }
+            : { type: scheduleMode, params: {} };
 
       this.saving = true;
       this.saveButton.disabled = true;
@@ -1486,14 +1964,19 @@
           name: this.nameInput.value,
           labels: this.labelsInput.value.split(','),
           scheduleMode,
-          intervalHours: totalHours,
+          schedule,
+          intervalSeconds,
+          intervalHours: intervalSeconds / 3_600,
           items: this.selections.map((selection) => ({
             type: selection.selectorType || 'css',
             expr: selection.selector,
             op: selection.op === 'exclude' ? 'exclude' : 'include',
             fields: Array.isArray(selection.fields) && selection.fields.length
               ? selection.fields
-              : [{ type: 'text' }]
+              : [{ type: 'text' }],
+            // Picker field controls are an explicit per-node extraction mode;
+            // preserve that fact even when the chosen mode is plain text.
+            fieldsSpecified: true
           }))
         });
         if (!response?.ok) {
