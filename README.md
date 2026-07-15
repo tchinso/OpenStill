@@ -59,9 +59,3 @@ OpenStill은 `cookies`, `history`, `webRequest`, `downloads`, `contextMenus`, �
 - 실시간 감시는 사용자가 대시보드에서 연결을 누른, 이미 열려 있는 동일 URL 탭에서만 동작합니다. 탭을 닫거나 페이지를 이동하면 예약/수동 확인은 계속 가능하지만 실시간 관찰은 종료됩니다.
 - 페이지가 계속 변하는 SPA는 로드 뒤 2.5초보다 더 기다릴 수 있지만, 그보다 이르게 추출하지 않습니다.
 - Chrome/확장이 종료되면 웹페이지 확인은 실행되지 않습니다.
-
-## Chrome Web Store 준비
-
-- [STORE_SUBMISSION.md](STORE_SUBMISSION.md)에 광범위 HTTP/HTTPS 권한의 심사용 한국어/영어 사유를 정리했습니다.
-- [PRIVACY.md](PRIVACY.md)를 공개 URL에 게시하고 Store의 Privacy practices를 실제 동작과 동일하게 작성하세요.
-- `./package-release.ps1`는 확장 프로그램 파일만 담은 Store 업로드용 ZIP을 만듭니다.
