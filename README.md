@@ -29,7 +29,7 @@ flowchart LR
 
 ## 로컬 확장 설치
 
-1. [[https://github.com/tchinso/OpenStill/releases/|Releases]]에서 확장프로그램을 다운로드 합니다.
+1. https://github.com/tchinso/OpenStill/releases/ 에서 확장프로그램을 다운로드 합니다.(Source Code.zip)
 2. 적당한 경로에 압축을 풉니다.
 3. Chrome에서 `chrome://extensions`를 엽니다.
 4. **개발자 모드**를 켭니다.
