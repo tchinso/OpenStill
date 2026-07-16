@@ -16,6 +16,7 @@
   const MAX_ATTRIBUTE_NAME_LENGTH = 32;
   const MAX_ATTRIBUTE_VALUE_LENGTH = 96;
   const MAX_PARTIAL_VALUES = 10;
+  const MAX_NEUTRAL_EVIDENCE = 10;
   const IGNORED_ATTRIBUTE_NAMES = new Set([
     'style', 'srcdoc', 'nonce', 'integrity', 'xmlns', 'xmlns:xlink'
   ]);
@@ -362,6 +363,9 @@
         const pseudo = position.index === 1
           ? ':first-child'
           : ':nth-child(' + position.index + ')';
+        // Keep a positional atom self-contained so it can stand on its own.
+        // SelectorDraft._compound() folds its tag with sibling class/tag atoms
+        // instead of concatenating a second tag into the compound selector.
         this._add('pos', tag, String(position.index), escapeIdentifier(tag) + pseudo, step, offset, nodeDetails);
       }
 
@@ -511,13 +515,23 @@
     _compound(items) {
       if (!items.length) return '';
       const order = { tag: 0, attrib: 1, attribOnly: 2, attribStart: 3, attribEnd: 4, attribContain: 5, pos: 6 };
-      return [...items]
+      const sorted = [...items]
         .sort((left, right) => (
           (order[left.type] ?? 9) - (order[right.type] ?? 9)
           || left.css.localeCompare(right.css)
-        ))
-        .map((item) => item.css)
-        .join('');
+        ));
+      const tag = sorted.find((item) => item.type === 'tag');
+      const positions = sorted.filter((item) => item.type === 'pos');
+      const positionTag = positions[0]?.name ? escapeIdentifier(positions[0].name) : '';
+      const baseTag = tag?.css || positionTag;
+      const attributes = sorted
+        .filter((item) => item.type !== 'tag' && item.type !== 'pos')
+        .map((item) => item.css);
+      const pseudos = positions.map((item) => {
+        const prefix = item.name ? escapeIdentifier(item.name) : '';
+        return prefix && item.css.startsWith(prefix) ? item.css.slice(prefix.length) : item.css;
+      });
+      return [baseTag, ...attributes, ...pseudos].join('');
     }
 
     _serialize() {
@@ -844,12 +858,18 @@
     return current;
   }
 
+  function canAccumulateNeutralEvidence(item) {
+    return item.type === 'pos'
+      || (item.semantic && ['attrib', 'attribStart', 'attribEnd', 'attribContain'].includes(item.type));
+  }
+
   function synthesizeBranch(anchor, pending, context) {
     const route = new Route(anchor, context.root, context.options);
     const routes = [...pending].map((node) => new Route(node, context.root, context.options));
     const candidates = orderEvidence(route, routes, context.options);
     let report = null;
     let draft = new SelectorDraft(route);
+    let neutralEvidence = 0;
 
     while (true) {
       let accepted = null;
@@ -862,13 +882,22 @@
         const improves = !report
           || proposal.foreignCount < report.foreignCount
           || (proposal.foreignCount === report.foreignCount && proposal.coveredCount > report.coveredCount);
-        if (!improves) continue;
-        accepted = proposal;
+        const preservesCoverage = report
+          && proposal.foreignCount === report.foreignCount
+          && proposal.coveredCount === report.coveredCount
+          // A neutral atom is only safe when it preserves the exact candidate
+          // set. Equal counts alone could swap one foreign match for another.
+          && includesEvery(proposal.matches, report.matches)
+          && neutralEvidence < MAX_NEUTRAL_EVIDENCE
+          && canAccumulateNeutralEvidence(item);
+        if (!improves && !preservesCoverage) continue;
+        accepted = { report: proposal, neutral: !improves };
         break;
       }
       if (!accepted) break;
-      draft = accepted.draft;
-      report = accepted;
+      draft = accepted.report.draft;
+      report = accepted.report;
+      neutralEvidence = accepted.neutral ? neutralEvidence + 1 : 0;
       if (report.foreignCount === 0) break;
     }
 

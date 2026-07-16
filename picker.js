@@ -12,14 +12,29 @@
   // meaningful: it is the order in which values/text modes are applied, so do
   // not collapse duplicate fields here.
   const MAX_FIELDS_PER_SELECTION = 256;
-  // The quick pass runs while the pointer is moving.  The full pass only runs
-  // when an element is committed, so it can spend more work finding a concise
-  // semantic path instead of falling back to a brittle chain of nth-childs.
+  // A quick pass remains available to programmatic callers. The interactive
+  // picker deliberately does not synthesize selectors while the pointer moves:
+  // that work belongs to the click/commit path, just as it does in Reference.
   const SELECTOR_SEARCH = Object.freeze({
     quick: { queryBudget: 180, beamWidth: 28, maxParts: 4 },
     full: { queryBudget: 2_400, beamWidth: 112, maxParts: 7 }
   });
   const selectorCache = new WeakMap();
+  const UNSAFE_FALLBACK_SELECTOR_ATTRIBUTES = new Set([
+    'href', 'src', 'srcset', 'hasinclude__', 'include__', 'title', 'alt'
+  ]);
+  const GENERATOR_ONLY_EXCLUDED_SELECTOR_ATTRIBUTES = new Set(['aria-label']);
+
+  function allowsFallbackSelectorAttribute(name) {
+    return !UNSAFE_FALLBACK_SELECTOR_ATTRIBUTES.has(String(name ?? '').toLowerCase());
+  }
+
+  function allowsGeneratedSelectorEvidence(name, value) {
+    const normalizedName = String(name ?? '').toLowerCase();
+    return allowsFallbackSelectorAttribute(normalizedName)
+      && !GENERATOR_ONLY_EXCLUDED_SELECTOR_ATTRIBUTES.has(normalizedName)
+      && String(value ?? '').length <= 30;
+  }
 
   function cleanText(value, maxLength = 10_000) {
     return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -295,14 +310,29 @@
 
   function elementChildPosition(element) {
     if (!element.parentElement) return null;
-    return [...element.parentElement.children].indexOf(element) + 1;
+    let position = 1;
+    for (let sibling = element.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+      position += 1;
+    }
+    return position;
   }
 
   function elementTypePosition(element) {
     if (!element.parentElement) return null;
-    return [...element.parentElement.children]
-      .filter((sibling) => sibling.localName === element.localName)
-      .indexOf(element) + 1;
+    let position = 1;
+    for (let sibling = element.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+      if (sibling.localName === element.localName) position += 1;
+    }
+    return position;
+  }
+
+  function elementHint(element) {
+    const tag = String(element?.localName || 'element').toLowerCase();
+    const id = element?.id && isSemanticIdentifier(element.id) ? `#${element.id}` : '';
+    const classes = element?.classList
+      ? [...element.classList].filter(isSemanticClass).slice(0, 2).map((name) => `.${name}`).join('')
+      : '';
+    return `${tag}${id}${classes}`;
   }
 
   function partialClassFragments(className) {
@@ -346,7 +376,7 @@
 
     const attributeNames = new Set([
       'data-testid', 'data-test', 'data-cy', 'data-qa', 'data-id',
-      'name', 'role', 'type', 'for', 'aria-label', 'aria-labelledby', 'title'
+      'name', 'role', 'type', 'for', 'aria-label', 'aria-labelledby'
     ]);
     for (const attribute of element.attributes) {
       if (/^data-[a-z][a-z0-9_-]*$/i.test(attribute.name)) {
@@ -354,6 +384,7 @@
       }
     }
     for (const name of attributeNames) {
+      if (!allowsFallbackSelectorAttribute(name)) continue;
       const value = element.getAttribute(name);
       if (value && isSafeSelectorAttribute(value)) {
         const attribute = '[' + name + "='" + escapeCssString(value) + "']";
@@ -608,9 +639,7 @@
         const selector = typeof selectorGenerator === 'function'
           ? selectorGenerator([element], {
             timeout: 500,
-            filterCallback: (_tokenType, name, value) => ![
-              'href', 'src', 'srcset', 'hasinclude__', 'include__', 'title', 'aria-label', 'alt'
-            ].includes(name) && !(value?.length > 30)
+            filterCallback: (_tokenType, name, value) => allowsGeneratedSelectorEvidence(name, value)
           })
           : '';
         if (typeof selector === 'string' && selector && hasSingleMatch(selector, element, selectorType)) {
@@ -746,6 +775,9 @@
       this.selections = [];
       this.activeSelectionIndex = -1;
       this.matchElements = [];
+      this.hoverFrame = null;
+      this.viewportFrame = null;
+      this.pendingPointerEvent = null;
       this.host = document.createElement('openstill-picker-root');
       this.host.setAttribute('aria-hidden', 'true');
       // `aria-hidden` is a valid page-level accessibility state, not an
@@ -1002,6 +1034,7 @@
       if (this.saving) {
         return;
       }
+      this.cancelScheduledWork();
       this.mode = 'picking';
       this.hoveredElement = null;
       this.form.hidden = true;
@@ -1023,6 +1056,18 @@
     stopPicking() {
       window.removeEventListener('mousemove', this.onPointerMove, true);
       window.removeEventListener('click', this.onClick, true);
+      window.removeEventListener('keydown', this.onKeyDown, true);
+      window.removeEventListener('scroll', this.onViewportChange, true);
+      window.removeEventListener('resize', this.onViewportChange, true);
+      this.cancelScheduledWork();
+    }
+
+    cancelScheduledWork() {
+      if (this.hoverFrame !== null) cancelAnimationFrame(this.hoverFrame);
+      if (this.viewportFrame !== null) cancelAnimationFrame(this.viewportFrame);
+      this.hoverFrame = null;
+      this.viewportFrame = null;
+      this.pendingPointerEvent = null;
     }
 
     elementFromEvent(event) {
@@ -1035,6 +1080,25 @@
     }
 
     onPointerMove(event) {
+      if (this.mode !== 'picking') return;
+      const path = event.composedPath?.() ?? [event.target];
+      this.pendingPointerEvent = {
+        target: event.target,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        composedPath: () => path
+      };
+      if (this.hoverFrame !== null) return;
+      this.hoverFrame = requestAnimationFrame(() => {
+        this.hoverFrame = null;
+        const pointerEvent = this.pendingPointerEvent;
+        this.pendingPointerEvent = null;
+        this.processPointerMove(pointerEvent);
+      });
+    }
+
+    processPointerMove(event) {
+      if (this.mode !== 'picking' || !event) return;
       const element = this.elementFromEvent(event);
       if (!element || element === this.hoveredElement) {
         return;
@@ -1045,17 +1109,15 @@
         this.tooltip.hidden = true;
         return;
       }
-      const selector = selectorFor(element, { quick: true });
-      if (!selector) {
-        this.clearHighlights();
-        return;
-      }
       this.matchElements = [element];
       this.renderHighlights();
-      this.showTooltip(element, selector);
+      this.showTooltip(element);
     }
 
     onClick(event) {
+      if (this.hoverFrame !== null) cancelAnimationFrame(this.hoverFrame);
+      this.hoverFrame = null;
+      this.pendingPointerEvent = null;
       const element = this.elementFromEvent(event);
       if (!element) {
         return;
@@ -1073,10 +1135,12 @@
     }
 
     onViewportChange() {
-      this.renderHighlights();
-      if (this.mode === 'picking' && this.hoveredElement) {
-        this.showTooltip(this.hoveredElement, selectorFor(this.hoveredElement, { quick: true }));
-      }
+      if (this.viewportFrame !== null) return;
+      this.viewportFrame = requestAnimationFrame(() => {
+        this.viewportFrame = null;
+        this.renderHighlights();
+        if (this.mode === 'picking' && this.hoveredElement) this.showTooltip(this.hoveredElement);
+      });
     }
 
     currentSelection() {
@@ -1583,20 +1647,20 @@
     }
 
     renderHighlights() {
-      this.highlightLayer.replaceChildren();
       const drawn = new Set();
+      const boxes = [];
       const draw = (element, classes) => {
         if (!element?.isConnected || drawn.has(element)) return;
         const rect = element.getBoundingClientRect();
         if (!rect.width && !rect.height) return;
-        const box = document.createElement('div');
-        box.className = classes;
-        box.style.left = Math.max(0, rect.left) + 'px';
-        box.style.top = Math.max(0, rect.top) + 'px';
-        box.style.width = Math.max(0, rect.width) + 'px';
-        box.style.height = Math.max(0, rect.height) + 'px';
-        this.highlightLayer.append(box);
         drawn.add(element);
+        boxes.push({
+          classes,
+          left: Math.max(0, rect.left),
+          top: Math.max(0, rect.top),
+          width: Math.max(0, rect.width),
+          height: Math.max(0, rect.height)
+        });
       };
 
       this.selections.forEach((selection, selectionIndex) => {
@@ -1616,15 +1680,27 @@
           draw(element, 'match' + (index === 0 ? ' primary' : ''));
         }
       });
+
+      const fragment = document.createDocumentFragment();
+      for (const boxData of boxes) {
+        const box = document.createElement('div');
+        box.className = boxData.classes;
+        box.style.left = boxData.left + 'px';
+        box.style.top = boxData.top + 'px';
+        box.style.width = boxData.width + 'px';
+        box.style.height = boxData.height + 'px';
+        fragment.append(box);
+      }
+      this.highlightLayer.replaceChildren(fragment);
     }
 
-    showTooltip(element, selector) {
-      if (!selector || !element.isConnected) {
+    showTooltip(element, selector = '') {
+      if (!element?.isConnected) {
         this.tooltip.hidden = true;
         return;
       }
       const rect = element.getBoundingClientRect();
-      const description = `${element.localName.toLowerCase()} · ${selector}`;
+      const description = selector ? `${elementHint(element)} · ${selector}` : elementHint(element);
       this.tooltip.textContent = description;
       this.tooltip.hidden = false;
       const top = Math.min(window.innerHeight - 38, Math.max(8, rect.top - 34));

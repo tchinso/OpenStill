@@ -50,10 +50,9 @@ const MAX_BATCH_CHECKS = 1_000;
 const MAX_CONCURRENT_BATCH_CHECKS = 3;
 const PENDING_PICKER_TTL_MS = 2 * 60 * 60 * 1000;
 const RENDER_LOAD_TIMEOUT_MS = 30_000;
-// Picker interaction deliberately waits for a settled page. Scheduled capture
-// follows the Reference runner's DOMContentLoaded + fixed two-second gate,
-// then applies the monitor's explicit delay.
-const PICKER_READY_DELAY_MS = 2_500;
+// The picker only needs a live DOM to show an element under the cursor. Do not
+// hold the user behind a fixed post-load delay; capture retains its own
+// explicit settling rules.
 const CHECK_EXECUTION_TIMEOUT_MS = 60_000;
 const MIN_CHECK_EXECUTION_TIMEOUT_MS = 10_000;
 const MAX_CHECK_EXECUTION_TIMEOUT_MS = 300_000;
@@ -1672,20 +1671,18 @@ function waitForRenderedTab(tabId) {
   return { promise, cancel };
 }
 
-async function waitForPageLoadAndPickerDelay(tabId) {
+async function waitForPickerDocumentReady(tabId) {
   const execution = await chrome.scripting.executeScript({
     target: { tabId },
-    func: async (delayMilliseconds) => {
-      if (document.readyState !== 'complete') {
-        await new Promise((resolve) => window.addEventListener('load', resolve, { once: true }));
+    func: async () => {
+      if (document.readyState === 'loading') {
+        await new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
       }
-      await new Promise((resolve) => setTimeout(resolve, delayMilliseconds));
-      return document.readyState;
-    },
-    args: [PICKER_READY_DELAY_MS]
+      return Boolean(document.documentElement);
+    }
   });
 
-  if (execution[0]?.result !== 'complete') {
+  if (!execution[0]?.result) {
     throw new Error('페이지가 완전히 로드되기 전에 선택기를 시작할 수 없습니다.');
   }
 }
@@ -4929,10 +4926,9 @@ async function startPicker(tabId, url) {
     await rememberPendingPicker(tabId, normalizedUrl);
   }
   try {
-    // picker.js reads getBoundingClientRect() to position its highlights. Wait
-    // until the document has finished loading, then keep the requested 2.5 s
-    // settling window before asking it for any element coordinates.
-    await waitForPageLoadAndPickerDelay(tabId);
+    // The picker does its first geometry read only after a pointer event, so a
+    // DOM-ready document is sufficient and avoids a guaranteed 2.5 s wait.
+    await waitForPickerDocumentReady(tabId);
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       files: ['selector-engine.js', 'picker.js']

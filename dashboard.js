@@ -3,10 +3,13 @@
   const MAX_HOURS = 14 * 24;
   const MAX_IMPORT_BYTES = 32 * 1024 * 1024;
   const SELECTED_CHECK_CHUNK_SIZE = 6;
+  const MONITOR_PREVIEW_MAX_CHARS = 800;
+  const SEARCH_RENDER_DEBOUNCE_MS = 150;
   const state = { monitors: [], settings: { soundEnabled: true } };
   const filters = { label: '', status: 'all', query: '' };
   const selectedMonitorIds = new Set();
   let toastTimer;
+  let searchRenderTimer = null;
   let batchCheckRunning = false;
   let activeHistoryEntries = [];
   let activeHistoryUrl = '';
@@ -171,6 +174,15 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+
+  // CSS line clamping only limits what is painted; keeping a large snapshot in
+  // every card still makes dashboard construction and updates expensive.
+  function monitorPreviewText(value) {
+    const text = String(value ?? '');
+    return text.length > MONITOR_PREVIEW_MAX_CHARS
+      ? `${text.slice(0, MONITOR_PREVIEW_MAX_CHARS - 1)}…`
+      : text;
   }
 
   function locatorsOf(monitor) {
@@ -588,7 +600,7 @@
     if (monitor.status === 'needs-review' && snapshot) {
       previewText = `마지막 정상 값: ${previewText}`;
     }
-    card.append(element('p', 'snapshot-preview', previewText));
+    card.append(element('p', 'snapshot-preview', monitorPreviewText(previewText)));
 
     const details = element('div', 'tracking-details');
     const rows = [
@@ -702,6 +714,10 @@
   }
 
   function renderMonitors() {
+    if (searchRenderTimer !== null) {
+      clearTimeout(searchRenderTimer);
+      searchRenderTimer = null;
+    }
     const sites = getFilteredSiteGroups();
     const visibleMonitorCount = sites.reduce((count, site) => count + site.pages.reduce(
       (pageCount, page) => pageCount + page.visibleMonitors.length,
@@ -2167,7 +2183,14 @@
     filters.label = button.dataset.label;
     render();
   });
-  elements.searchInput.addEventListener('input', () => { filters.query = elements.searchInput.value; renderMonitors(); });
+  elements.searchInput.addEventListener('input', () => {
+    filters.query = elements.searchInput.value;
+    if (searchRenderTimer !== null) clearTimeout(searchRenderTimer);
+    searchRenderTimer = setTimeout(() => {
+      searchRenderTimer = null;
+      renderMonitors();
+    }, SEARCH_RENDER_DEBOUNCE_MS);
+  });
   elements.statusFilter.addEventListener('change', () => { filters.status = elements.statusFilter.value; renderMonitors(); });
   elements.selectVisible.addEventListener('change', () => setVisibleSelection(elements.selectVisible.checked));
   elements.clearSelection.addEventListener('click', () => {
