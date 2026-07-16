@@ -41,7 +41,7 @@ const MAX_COLLECTION_ITEMS = 10_000;
 // not silently invisible. Presentation code is responsible for clipping what
 // it renders, never the comparison engine.
 const MAX_SNAPSHOT_CHARS = 1_000_000;
-const MAX_CHANGE_HISTORY = 20;
+const MAX_CHANGE_HISTORY = 3;
 const MAX_RUN_HISTORY = 40;
 const PARSE_TIMEOUT_MS = 12_000;
 const SOUND_DEBOUNCE_MS = 3_000;
@@ -1431,7 +1431,15 @@ async function getState() {
       && monitor.nextCheckAt
     );
   });
-  if (needsSchedulePersistence) {
+  const needsHistoryPruning = rawMonitors.some((raw, index) => {
+    const monitor = normalizedMonitors[index];
+    return Boolean(
+      monitor
+      && Array.isArray(raw?.history)
+      && raw.history.length > monitor.history.length
+    );
+  });
+  if (needsSchedulePersistence || needsHistoryPruning) {
     await chrome.storage.local.set({ [MONITORS_KEY]: monitors });
   }
 
@@ -4582,6 +4590,105 @@ async function deleteMonitor(id) {
   return { ok: true };
 }
 
+async function updateMonitorLabels(message) {
+  const mode = message?.mode;
+  if (mode !== 'add' && mode !== 'remove') {
+    return { ok: false, error: '라벨 작업 방식을 확인할 수 없습니다.' };
+  }
+
+  const label = cleanLabels([message?.label])[0];
+  if (!label) {
+    return { ok: false, error: '라벨을 입력해 주세요.' };
+  }
+
+  const requestedIds = batchMonitorIds(message?.ids);
+  if (!requestedIds.length) {
+    return { ok: false, error: '라벨을 변경할 추적을 하나 이상 선택해 주세요.' };
+  }
+
+  const selectedIds = new Set(requestedIds);
+  const labelKey = label.toLocaleLowerCase('ko-KR');
+  const timestamp = nowIso();
+  let found = 0;
+  let updated = 0;
+  let skipped = 0;
+  await mutateMonitors((monitors) => {
+    for (const monitor of monitors) {
+      if (!selectedIds.has(monitor.id)) continue;
+      found += 1;
+      const labels = cleanLabels(monitor.labels);
+      const hasLabel = labels.some((item) => item.toLocaleLowerCase('ko-KR') === labelKey);
+      if ((mode === 'add' && hasLabel) || (mode === 'remove' && !hasLabel)) {
+        skipped += 1;
+        continue;
+      }
+
+      const nextLabels = mode === 'add'
+        ? cleanLabels([...labels, label])
+        : labels.filter((item) => item.toLocaleLowerCase('ko-KR') !== labelKey);
+      if (mode === 'add' && nextLabels.length === labels.length) {
+        // A monitor can keep at most 20 labels. Treat a full label list like
+        // an already-present label: leave the existing metadata untouched.
+        skipped += 1;
+        continue;
+      }
+
+      monitor.labels = nextLabels;
+      monitor.revision = createRevision();
+      monitor.updatedAt = timestamp;
+      updated += 1;
+    }
+  });
+
+  return {
+    ok: true,
+    label,
+    requested: requestedIds.length,
+    found,
+    updated,
+    skipped,
+    missing: requestedIds.length - found
+  };
+}
+
+async function deleteMonitors(message) {
+  const requestedIds = batchMonitorIds(message?.ids);
+  if (!requestedIds.length) {
+    return { ok: false, error: '삭제할 추적을 하나 이상 선택해 주세요.' };
+  }
+
+  const selectedIds = new Set(requestedIds);
+  const existing = (await getMonitors()).filter((monitor) => selectedIds.has(monitor.id));
+  await Promise.all(existing
+    .filter((monitor) => isLiveTracking(monitor))
+    .map((monitor) => stopLiveMonitor({ id: monitor.id }).catch(() => undefined)));
+
+  const deleted = [];
+  await mutateMonitors((monitors) => {
+    const kept = [];
+    for (const monitor of monitors) {
+      if (selectedIds.has(monitor.id)) deleted.push(monitor);
+      else kept.push(monitor);
+    }
+    monitors.splice(0, monitors.length, ...kept);
+  });
+
+  if (!deleted.length) {
+    return { ok: false, error: '선택한 추적을 찾을 수 없습니다.' };
+  }
+  await Promise.all([...new Set(deleted.map((monitor) => monitor.url))]
+    .map((url) => releaseUnusedSitePermission(url)));
+  await reconcileLiveSessions().catch(() => undefined);
+  await refreshBadge();
+  await scheduleNextAlarm();
+  return {
+    ok: true,
+    requested: requestedIds.length,
+    deletedCount: deleted.length,
+    missing: requestedIds.length - deleted.length
+  };
+}
+
 function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) {
   return {
     ...monitor,
@@ -4816,6 +4923,17 @@ async function openMonitorWindow(id) {
   return { ok: true };
 }
 
+async function openMonitorTab(id) {
+  const monitor = (await getMonitors()).find((item) => item.id === id);
+  if (!monitor) {
+    return { ok: false, error: '모니터를 찾을 수 없습니다.' };
+  }
+
+  await chrome.tabs.create({ url: monitor.url, active: true });
+  await acknowledgeMonitor(id);
+  return { ok: true };
+}
+
 async function importMonitors(message) {
   const beforeImport = await getMonitors();
   const sourceMonitors = Array.isArray(message.monitors) ? message.monitors : [];
@@ -4948,6 +5066,8 @@ const messageHandlers = {
   'save-monitor': (message) => saveMonitor(message),
   'set-monitor-enabled': (message) => setMonitorEnabled(message),
   'delete-monitor': (message) => deleteMonitor(message.id),
+  'delete-monitors': (message) => deleteMonitors(message),
+  'update-monitor-labels': (message) => updateMonitorLabels(message),
   'check-monitor': (message) => checkMonitor(message.id),
   'start-live-monitor': (message) => startLiveMonitor(message),
   'stop-live-monitor': (message) => stopLiveMonitor(message),
@@ -4960,6 +5080,7 @@ const messageHandlers = {
   'delete-page': (message) => deletePage(message.url),
   'acknowledge-monitor': (message) => acknowledgeMonitor(message.id),
   'open-monitor-window': (message) => openMonitorWindow(message.id),
+  'open-monitor-tab': (message) => openMonitorTab(message.id),
   'import-monitors': (message) => importMonitors(message),
   'open-dashboard': () => openDashboard(),
   'release-unclaimed-origin': (message, sender) => releaseUnclaimedOrigin(message, sender),

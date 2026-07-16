@@ -20,11 +20,6 @@
     </header>
 
     <main id="top" class="page-shell">
-      <section class="disclosure" aria-label="작동 방식 안내">
-        <span class="disclosure-mark">i</span>
-        <p><strong>권한과 데이터:</strong> 사용자가 선택한 사이트에만 연결하며, URL·선택자·텍스트는 이 브라우저에만 저장됩니다. 정기 확인은 해당 사이트를 비활성 임시 탭에서 렌더링한 뒤 선택 요소를 비교합니다.</p>
-      </section>
-
       <section class="overview" aria-label="현황">
         <article><span id="summaryTotal" class="summary-number">0</span><span class="summary-label">전체 추적</span></article>
         <article><span id="summaryActive" class="summary-number success">0</span><span class="summary-label">추적 중</span></article>
@@ -48,7 +43,11 @@
         <label class="bulk-select-label"><input id="selectVisible" type="checkbox"><span>현재 목록 전체 선택</span></label>
         <span id="selectedCount" class="selected-count">0개 선택</span>
         <button id="checkSelected" class="button secondary" type="button" disabled>선택 항목 확인</button>
+        <button id="invertSelection" class="button secondary" type="button" disabled>선택 반전</button>
         <button id="clearSelection" class="button secondary" type="button" disabled>선택 해제</button>
+        <button id="addLabelSelected" class="button secondary" type="button" disabled>라벨 추가</button>
+        <button id="removeLabelSelected" class="button secondary" type="button" disabled>라벨 제거</button>
+        <button id="deleteSelected" class="button danger" type="button" disabled>페이지 추적 삭제</button>
         <p id="bulkStatus" class="bulk-status" role="status" aria-live="polite"></p>
       </section>
 
@@ -62,6 +61,11 @@
           <div class="monitor-heading"><div><h1 id="listTitle">모든 추적</h1><p id="listDescription">주소 하나와 그 CSS 선택자 목록을 하나의 추적으로 관리합니다.</p></div><span id="visibleCount" class="visible-count"></span></div>
           <div id="monitorList" class="monitor-list"></div>
         </section>
+      </section>
+
+      <section class="disclosure" aria-label="작동 방식 안내">
+        <span class="disclosure-mark">i</span>
+        <p><strong>권한과 데이터:</strong> 사용자가 선택한 사이트에만 연결하며, URL·선택자·텍스트는 이 브라우저에만 저장됩니다. 정기 확인은 해당 사이트를 비활성 임시 탭에서 렌더링한 뒤 선택 요소를 비교합니다.</p>
       </section>
     </main>
 
@@ -111,7 +115,7 @@
       <p id="changeWhen" class="field-help"></p>
       <p class="diff-help"><span class="diff-added">초록색</span>은 추가·수정 후 텍스트, <span class="diff-removed">빨간색</span>은 삭제·수정 전 텍스트입니다.</p>
       <div class="snapshot-grid"><section><h3>이전 텍스트</h3><pre id="previousSnapshot"></pre></section><section><h3>현재 텍스트</h3><pre id="currentSnapshot"></pre></section></div>
-      <div class="dialog-actions"><button id="changeOpenPage" class="button secondary" type="button">작은 창에서 열기</button><button id="acknowledgeButton" class="button primary" type="button">확인 완료</button></div>
+      <div class="dialog-actions"><button id="changeOpenPage" class="button secondary" type="button">작은 창에서 열기</button><button id="changeOpenPageTab" class="button secondary" type="button">새 탭에서 열기</button><button id="acknowledgeButton" class="button primary" type="button">확인 완료</button></div>
     </dialog>
 
     <dialog id="historyDialog" class="dialog history-dialog">

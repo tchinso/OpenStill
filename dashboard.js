@@ -10,7 +10,7 @@
   const selectedMonitorIds = new Set();
   let toastTimer;
   let searchRenderTimer = null;
-  let batchCheckRunning = false;
+  let batchActionRunning = false;
   let activeHistoryEntries = [];
   let activeHistoryUrl = '';
 
@@ -25,7 +25,11 @@
     selectVisible: document.querySelector('#selectVisible'),
     selectedCount: document.querySelector('#selectedCount'),
     checkSelected: document.querySelector('#checkSelected'),
+    invertSelection: document.querySelector('#invertSelection'),
     clearSelection: document.querySelector('#clearSelection'),
+    addLabelSelected: document.querySelector('#addLabelSelected'),
+    removeLabelSelected: document.querySelector('#removeLabelSelected'),
+    deleteSelected: document.querySelector('#deleteSelected'),
     bulkStatus: document.querySelector('#bulkStatus'),
     labelList: document.querySelector('#labelList'),
     labelCount: document.querySelector('#labelCount'),
@@ -83,6 +87,7 @@
     previousSnapshot: document.querySelector('#previousSnapshot'),
     currentSnapshot: document.querySelector('#currentSnapshot'),
     changeOpenPage: document.querySelector('#changeOpenPage'),
+    changeOpenPageTab: document.querySelector('#changeOpenPageTab'),
     acknowledgeButton: document.querySelector('#acknowledgeButton'),
     historyDialog: document.querySelector('#historyDialog'),
     historyTitle: document.querySelector('#historyTitle'),
@@ -498,9 +503,13 @@
     elements.selectedCount.textContent = `${selectedCount}개 선택`;
     elements.selectVisible.checked = Boolean(visibleIds.length) && selectedVisible === visibleIds.length;
     elements.selectVisible.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
-    elements.selectVisible.disabled = batchCheckRunning || !visibleIds.length;
-    elements.checkSelected.disabled = batchCheckRunning || !selectedCount;
-    elements.clearSelection.disabled = batchCheckRunning || !selectedCount;
+    elements.selectVisible.disabled = batchActionRunning || !visibleIds.length;
+    elements.checkSelected.disabled = batchActionRunning || !selectedCount;
+    elements.invertSelection.disabled = batchActionRunning || !visibleIds.length;
+    elements.clearSelection.disabled = batchActionRunning || !selectedCount;
+    elements.addLabelSelected.disabled = batchActionRunning || !selectedCount;
+    elements.removeLabelSelected.disabled = batchActionRunning || !selectedCount;
+    elements.deleteSelected.disabled = batchActionRunning || !selectedCount;
   }
 
   function setVisibleSelection(selected) {
@@ -508,6 +517,15 @@
     ids.forEach((id) => {
       if (selected) selectedMonitorIds.add(id);
       else selectedMonitorIds.delete(id);
+    });
+    renderMonitors();
+  }
+
+  function invertVisibleSelection() {
+    if (batchActionRunning) return;
+    visibleMonitorIds().forEach((id) => {
+      if (selectedMonitorIds.has(id)) selectedMonitorIds.delete(id);
+      else selectedMonitorIds.add(id);
     });
     renderMonitors();
   }
@@ -578,7 +596,7 @@
     selectInput.type = 'checkbox';
     selectInput.dataset.selectMonitor = monitor.id;
     selectInput.checked = selected;
-    selectInput.disabled = batchCheckRunning;
+    selectInput.disabled = batchActionRunning;
     selectInput.setAttribute('aria-label', `“${monitor.name}” 추적 선택`);
     selectLabel.append(selectInput);
     const title = element('div', 'tracking-title');
@@ -629,6 +647,7 @@
     actions.append(
       makeAction('지금 확인', 'check', monitor.id),
       makeAction('작은 창', 'open', monitor.id),
+      makeAction('새 탭', 'open-tab', monitor.id),
       makeAction('편집', 'edit', monitor.id),
       makeAction(monitor.enabled ? '일시정지' : '다시 시작', 'toggle', monitor.id),
       makeAction('삭제', 'delete', monitor.id, 'attention-action')
@@ -1973,7 +1992,7 @@
       return;
     }
 
-    batchCheckRunning = true;
+    batchActionRunning = true;
     let completed = 0;
     let changed = 0;
     let needsReview = 0;
@@ -2003,7 +2022,82 @@
       elements.bulkStatus.textContent = lastError ? `${summary} · ${lastError}` : summary;
       showToast(lastError ? `${summary} (${lastError})` : summary);
     } finally {
-      batchCheckRunning = false;
+      batchActionRunning = false;
+      renderMonitors();
+    }
+  }
+
+  function selectedMonitorIdsForAction() {
+    return [...selectedMonitorIds].filter((id) => Boolean(monitorById(id)));
+  }
+
+  async function actionUpdateSelectedLabels(mode) {
+    const ids = selectedMonitorIdsForAction();
+    if (!ids.length) {
+      elements.bulkStatus.textContent = '라벨을 변경할 추적을 선택해 주세요.';
+      renderSelectionControls();
+      return;
+    }
+
+    const verb = mode === 'add' ? '추가할' : '제거할';
+    const label = window.prompt(`선택한 ${ids.length}개 추적에 ${verb} 라벨을 입력하세요.`);
+    if (label === null) return;
+    if (!label.trim()) {
+      elements.bulkStatus.textContent = '라벨을 입력해 주세요.';
+      return;
+    }
+
+    batchActionRunning = true;
+    elements.bulkStatus.textContent = `선택한 ${ids.length}개 추적의 라벨을 ${mode === 'add' ? '추가' : '제거'}하는 중…`;
+    renderMonitors();
+    try {
+      const response = await send({ type: 'update-monitor-labels', mode, label, ids });
+      if (!response?.ok) throw new Error(response?.error || '라벨을 변경하지 못했습니다.');
+      const summary = `${response.updated ?? 0}개 추적의 라벨을 ${mode === 'add' ? '추가' : '제거'}했습니다.`;
+      const details = [
+        response.skipped ? `${response.skipped}개 건너뜀` : '',
+        response.missing ? `${response.missing}개 찾지 못함` : ''
+      ].filter(Boolean).join(' · ');
+      elements.bulkStatus.textContent = details ? `${summary} ${details}` : summary;
+      showToast(details ? `${summary} ${details}` : summary);
+      await refresh();
+    } catch (error) {
+      const message = error.message || '라벨을 변경하지 못했습니다.';
+      elements.bulkStatus.textContent = message;
+      showToast(message);
+    } finally {
+      batchActionRunning = false;
+      renderMonitors();
+    }
+  }
+
+  async function actionDeleteSelected() {
+    const ids = selectedMonitorIdsForAction();
+    if (!ids.length) {
+      elements.bulkStatus.textContent = '삭제할 추적을 선택해 주세요.';
+      renderSelectionControls();
+      return;
+    }
+    if (!window.confirm(`선택한 ${ids.length}개 페이지 추적을 삭제할까요? 이 작업은 되돌릴 수 없습니다.`)) return;
+
+    batchActionRunning = true;
+    elements.bulkStatus.textContent = `선택한 ${ids.length}개 페이지 추적을 삭제하는 중…`;
+    renderMonitors();
+    try {
+      const response = await send({ type: 'delete-monitors', ids });
+      if (!response?.ok) throw new Error(response?.error || '선택한 추적을 삭제하지 못했습니다.');
+      ids.forEach((id) => selectedMonitorIds.delete(id));
+      const summary = `${response.deletedCount ?? 0}개 페이지 추적을 삭제했습니다.`;
+      const detail = response.missing ? ` ${response.missing}개는 이미 없었습니다.` : '';
+      elements.bulkStatus.textContent = `${summary}${detail}`;
+      showToast(`${summary}${detail}`);
+      await refresh();
+    } catch (error) {
+      const message = error.message || '선택한 추적을 삭제하지 못했습니다.';
+      elements.bulkStatus.textContent = message;
+      showToast(message);
+    } finally {
+      batchActionRunning = false;
       renderMonitors();
     }
   }
@@ -2086,6 +2180,11 @@
       case 'open': {
         const response = await send({ type: 'open-monitor-window', id: monitor.id });
         if (!response?.ok) showToast(response?.error || '작은 창을 열지 못했습니다.');
+        break;
+      }
+      case 'open-tab': {
+        const response = await send({ type: 'open-monitor-tab', id: monitor.id });
+        if (!response?.ok) showToast(response?.error || '새 탭을 열지 못했습니다.');
         break;
       }
       case 'edit':
@@ -2172,7 +2271,7 @@
   elements.monitorList.addEventListener('click', (event) => void handleCardAction(event));
   elements.monitorList.addEventListener('change', (event) => {
     const input = event.target.closest('input[data-select-monitor]');
-    if (!input || batchCheckRunning) return;
+    if (!input || batchActionRunning) return;
     if (input.checked) selectedMonitorIds.add(input.dataset.selectMonitor);
     else selectedMonitorIds.delete(input.dataset.selectMonitor);
     renderMonitors();
@@ -2193,13 +2292,17 @@
   });
   elements.statusFilter.addEventListener('change', () => { filters.status = elements.statusFilter.value; renderMonitors(); });
   elements.selectVisible.addEventListener('change', () => setVisibleSelection(elements.selectVisible.checked));
+  elements.invertSelection.addEventListener('click', invertVisibleSelection);
   elements.clearSelection.addEventListener('click', () => {
-    if (batchCheckRunning) return;
+    if (batchActionRunning) return;
     selectedMonitorIds.clear();
     elements.bulkStatus.textContent = '';
     renderMonitors();
   });
   elements.checkSelected.addEventListener('click', () => void actionCheckSelected());
+  elements.addLabelSelected.addEventListener('click', () => void actionUpdateSelectedLabels('add'));
+  elements.removeLabelSelected.addEventListener('click', () => void actionUpdateSelectedLabels('remove'));
+  elements.deleteSelected.addEventListener('click', () => void actionDeleteSelected());
   elements.soundEnabled.addEventListener('change', async () => {
     await send({ type: 'save-settings', settings: { soundEnabled: elements.soundEnabled.checked } });
     await refresh();
@@ -2230,6 +2333,10 @@
   elements.changeOpenPage.addEventListener('click', async () => {
     const response = await send({ type: 'open-monitor-window', id: elements.changeDialog.dataset.id });
     if (!response?.ok) showToast(response?.error || '작은 창을 열지 못했습니다.');
+  });
+  elements.changeOpenPageTab.addEventListener('click', async () => {
+    const response = await send({ type: 'open-monitor-tab', id: elements.changeDialog.dataset.id });
+    if (!response?.ok) showToast(response?.error || '새 탭을 열지 못했습니다.');
   });
   elements.acknowledgeButton.addEventListener('click', () => void acknowledgeChange());
   elements.historyEntries.addEventListener('click', (event) => {
