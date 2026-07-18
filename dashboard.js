@@ -2221,12 +2221,33 @@
     }
   }
 
+  function exportHistoryEntry(entry, index) {
+    // History is newest first. Keep the latest snapshot for a useful backup,
+    // but retain only the timestamp and structural metadata for older entries.
+    if (index === 0 || !entry || typeof entry !== 'object') return entry;
+    return {
+      kind: entry.kind === 'baseline' ? 'baseline' : 'change',
+      capturedAt: entry.capturedAt ?? entry.snapshot?.capturedAt ?? null,
+      // `exists` lets the importer preserve this intentionally blank history
+      // entry while avoiding an exported copy of its text or HTML payload.
+      snapshot: { exists: entry.snapshot?.exists !== false }
+    };
+  }
+
+  function exportMonitorRecord(monitor) {
+    if (!monitor || typeof monitor !== 'object' || !Array.isArray(monitor.history)) return monitor;
+    return {
+      ...monitor,
+      history: monitor.history.map(exportHistoryEntry)
+    };
+  }
+
   function exportMonitors() {
     const payload = {
       format: 'openstill-export',
       schemaVersion: 3,
       exportedAt: new Date().toISOString(),
-      monitors: state.monitors
+      monitors: state.monitors.map(exportMonitorRecord)
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
