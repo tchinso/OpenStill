@@ -1,7 +1,9 @@
 (() => {
   const MIN_HOURS = 1;
   const MAX_HOURS = 14 * 24;
-  const MAX_IMPORT_BYTES = 32 * 1024 * 1024;
+  const MAX_IMPORT_BYTES = 64 * 1024 * 1024;
+  const BULK_TRANSFER_THRESHOLD = 200;
+  const BULK_TRANSFER_CHUNK_SIZE = 100;
   const SELECTED_CHECK_CHUNK_SIZE = 6;
   const MONITOR_PREVIEW_MAX_CHARS = 800;
   const SEARCH_RENDER_DEBOUNCE_MS = 150;
@@ -9,8 +11,10 @@
   const filters = { label: '', status: 'all', query: '' };
   const selectedMonitorIds = new Set();
   let toastTimer;
+  let transferProgressTimer;
   let searchRenderTimer = null;
   let batchActionRunning = false;
+  let transferRunning = false;
   let activeHistoryEntries = [];
   let activeHistoryUrl = '';
 
@@ -20,6 +24,10 @@
     exportButton: document.querySelector('#exportButton'),
     importButton: document.querySelector('#importButton'),
     importInput: document.querySelector('#importInput'),
+    transferProgress: document.querySelector('#transferProgress'),
+    transferProgressLabel: document.querySelector('#transferProgressLabel'),
+    transferProgressBar: document.querySelector('#transferProgressBar'),
+    transferProgressValue: document.querySelector('#transferProgressValue'),
     searchInput: document.querySelector('#searchInput'),
     statusFilter: document.querySelector('#statusFilter'),
     selectVisible: document.querySelector('#selectVisible'),
@@ -776,6 +784,56 @@
     elements.toast.textContent = text;
     elements.toast.classList.add('show');
     toastTimer = setTimeout(() => elements.toast.classList.remove('show'), 4_200);
+  }
+
+  function formatTransferCount(value) {
+    return Number(value).toLocaleString('ko-KR');
+  }
+
+  function showsTransferProgress(total) {
+    return total >= BULK_TRANSFER_THRESHOLD;
+  }
+
+  function updateTransferProgress(label, completed, total) {
+    if (!showsTransferProgress(total)) return;
+    elements.transferProgress.hidden = false;
+    elements.transferProgressLabel.textContent = label;
+    elements.transferProgressBar.max = Math.max(total, 1);
+    elements.transferProgressBar.value = Math.min(completed, total);
+    elements.transferProgressValue.textContent = `${formatTransferCount(completed)} / ${formatTransferCount(total)}`;
+  }
+
+  function beginTransfer(label, total) {
+    clearTimeout(transferProgressTimer);
+    transferRunning = true;
+    elements.exportButton.disabled = true;
+    elements.importButton.disabled = true;
+    elements.importInput.disabled = true;
+    if (showsTransferProgress(total)) updateTransferProgress(label, 0, total);
+    else elements.transferProgress.hidden = true;
+  }
+
+  function finishTransfer(label, completed, total) {
+    transferRunning = false;
+    elements.exportButton.disabled = false;
+    elements.importButton.disabled = false;
+    elements.importInput.disabled = false;
+    if (!showsTransferProgress(total)) {
+      elements.transferProgress.hidden = true;
+      return;
+    }
+    updateTransferProgress(label, completed, total);
+    transferProgressTimer = setTimeout(() => {
+      elements.transferProgress.hidden = true;
+    }, 4_200);
+  }
+
+  function transferChunkSize(total) {
+    return total >= BULK_TRANSFER_THRESHOLD ? BULK_TRANSFER_CHUNK_SIZE : Math.max(total, 1);
+  }
+
+  function yieldToBrowser() {
+    return new Promise((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
   }
 
   function monitorById(id) {
@@ -2242,20 +2300,47 @@
     };
   }
 
-  function exportMonitors() {
-    const payload = {
-      format: 'openstill-export',
-      schemaVersion: 3,
-      exportedAt: new Date().toISOString(),
-      monitors: state.monitors.map(exportMonitorRecord)
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `openstill-export-${new Date().toISOString().slice(0, 10)}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+  async function exportMonitors() {
+    if (transferRunning) return;
+    const total = state.monitors.length;
+    let completed = 0;
+    beginTransfer('내보내는 중', total);
+    try {
+      // Serialise a modest number of records at once. This keeps a large
+      // snapshot backup from blocking dashboard painting for one long task.
+      if (showsTransferProgress(total)) await yieldToBrowser();
+      const exportedAt = new Date().toISOString();
+      const parts = [JSON.stringify({
+        format: 'openstill-export',
+        schemaVersion: 3,
+        exportedAt
+      }).slice(0, -1), ',"monitors":['];
+      const chunkSize = transferChunkSize(total);
+      for (let start = 0; start < total; start += chunkSize) {
+        const end = Math.min(start + chunkSize, total);
+        const records = [];
+        for (let index = start; index < end; index += 1) {
+          records.push(JSON.stringify(exportMonitorRecord(state.monitors[index])));
+        }
+        if (start) parts.push(',');
+        parts.push(records.join(','));
+        completed = end;
+        updateTransferProgress('내보내는 중', completed, total);
+        if (end < total && showsTransferProgress(total)) await yieldToBrowser();
+      }
+      parts.push(']}');
+      const blob = new Blob(parts, { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `openstill-export-${exportedAt.slice(0, 10)}.json`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      finishTransfer('내보내기 완료', total, total);
+    } catch (error) {
+      finishTransfer('내보내기 실패', completed, total);
+      showToast(error.message || '내보내지 못했습니다.');
+    }
   }
 
   function importMonitorRecords(payload) {
@@ -2273,16 +2358,52 @@
 
   async function importMonitors(file) {
     if (!file) return;
+    if (transferRunning) return;
+    // Reading a 64 MB file is asynchronous. Reserve the transfer before its
+    // record count is known so a second picker selection cannot overlap it.
+    transferRunning = true;
+    let total = 0;
+    let completed = 0;
+    let transferStarted = false;
     try {
-      if (file.size > MAX_IMPORT_BYTES) throw new Error('32 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
+      if (file.size > MAX_IMPORT_BYTES) throw new Error('64 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
       const parsed = JSON.parse(await file.text());
       const monitors = importMonitorRecords(parsed);
       if (!monitors) throw new Error('OpenStill 또는 Reference 내보내기 파일 형식이 아닙니다.');
-      const response = await send({ type: 'import-monitors', monitors, mode: 'merge' });
-      if (!response?.ok) throw new Error(response?.error || '불러오지 못했습니다.');
-      showToast(`${response.imported}개를 불러왔습니다.${response.rejected ? ` ${response.rejected}개는 유효하지 않거나 최대 100개 제한을 넘어 제외했습니다.` : ''}${response.disabledForPermission ? ` ${response.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}`);
+      total = monitors.length;
+      beginTransfer('불러오는 중', total);
+      transferStarted = true;
+      if (showsTransferProgress(total)) await yieldToBrowser();
+
+      const summary = { imported: 0, rejected: 0, disabledForPermission: 0 };
+      const chunkSize = transferChunkSize(total);
+      for (let start = 0; start < total; start += chunkSize) {
+        const end = Math.min(start + chunkSize, total);
+        const response = await send({
+          type: 'import-monitors',
+          monitors: monitors.slice(start, end),
+          mode: 'merge',
+          deferFinalization: true
+        });
+        if (!response?.ok) throw new Error(response?.error || '불러오지 못했습니다.');
+        summary.imported += response.imported || 0;
+        summary.rejected += response.rejected || 0;
+        summary.disabledForPermission += response.disabledForPermission || 0;
+        completed = end;
+        updateTransferProgress('불러오는 중', completed, total);
+        if (end < total && showsTransferProgress(total)) await yieldToBrowser();
+      }
+      if (total) {
+        const finalized = await send({ type: 'finalize-import' });
+        if (!finalized?.ok) throw new Error(finalized?.error || '불러온 추적을 준비하지 못했습니다.');
+      }
+      finishTransfer('불러오기 완료', total, total);
+      transferStarted = false;
+      showToast(`${summary.imported}개를 불러왔습니다.${summary.rejected ? ` ${summary.rejected}개는 유효하지 않거나 최대 3,000개 제한을 넘어 제외했습니다.` : ''}${summary.disabledForPermission ? ` ${summary.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}`);
       await refresh();
     } catch (error) {
+      if (transferStarted) finishTransfer('불러오기 실패', completed, total);
+      else transferRunning = false;
       showToast(error.message || '불러오지 못했습니다.');
     } finally {
       elements.importInput.value = '';
@@ -2329,7 +2450,7 @@
     await refresh();
   });
   elements.batchUrlButton.addEventListener('click', openBatchUrlDialog);
-  elements.exportButton.addEventListener('click', exportMonitors);
+  elements.exportButton.addEventListener('click', () => void exportMonitors());
   elements.importButton.addEventListener('click', () => elements.importInput.click());
   elements.importInput.addEventListener('change', () => void importMonitors(elements.importInput.files?.[0]));
   installAdvancedScheduleControls();

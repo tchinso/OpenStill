@@ -16,6 +16,11 @@
         <button id="exportButton" class="button secondary" type="button">내보내기</button>
         <button id="importButton" class="button secondary" type="button">불러오기</button>
         <input id="importInput" type="file" accept="application/json,.json" hidden>
+        <div id="transferProgress" class="transfer-progress" role="status" aria-live="polite" hidden>
+          <span id="transferProgressLabel"></span>
+          <progress id="transferProgressBar" max="1" value="0"></progress>
+          <span id="transferProgressValue"></span>
+        </div>
       </div>
     </header>
 

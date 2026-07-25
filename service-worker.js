@@ -33,7 +33,7 @@ const SCHEDULE_MODES = new Set([
 ]);
 // unlimitedStorage prevents a few large snapshots from blocking a legitimate
 // import of hundreds of user-configured trackers.
-const MAX_MONITORS = 1_000;
+const MAX_MONITORS = 3_000;
 const MAX_SELECTORS_PER_MONITOR = 20;
 const MAX_COLLECTION_ITEMS = 10_000;
 // Storage is explicitly unlimited. Keep the canonical comparison payload much
@@ -5014,11 +5014,21 @@ async function importMonitors(message) {
     return { ok: true, imported, rejected, disabledForPermission };
   });
 
+  if (!message.deferFinalization) {
+    await finalizeImportedMonitors(beforeImport);
+  }
+  return result;
+}
+
+// Dashboard imports can arrive in small messages so structured cloning and
+// validation never monopolise the dashboard or the MV3 worker. Keep the
+// expensive global follow-up work for the final message in that sequence.
+async function finalizeImportedMonitors(beforeImport = []) {
   await reconcileLiveSessions().catch(() => undefined);
   await refreshBadge();
   await scheduleNextAlarm();
   await Promise.all(beforeImport.map((monitor) => releaseUnusedSitePermission(monitor.url)));
-  return result;
+  return { ok: true };
 }
 
 async function openDashboard() {
@@ -5082,6 +5092,7 @@ const messageHandlers = {
   'open-monitor-window': (message) => openMonitorWindow(message.id),
   'open-monitor-tab': (message) => openMonitorTab(message.id),
   'import-monitors': (message) => importMonitors(message),
+  'finalize-import': () => finalizeImportedMonitors(),
   'open-dashboard': () => openDashboard(),
   'release-unclaimed-origin': (message, sender) => releaseUnclaimedOrigin(message, sender),
   'save-settings': async (message) => ({ ok: true, settings: await updateSettings(message.settings) })
