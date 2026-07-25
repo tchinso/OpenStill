@@ -29,7 +29,8 @@ $extensionFiles = @(
   'popup.js',
   'dashboard.html',
   'dashboard.css',
-  'dashboard.js'
+  'dashboard.js',
+  'import-worker.js'
 )
 
 foreach ($relativePath in $extensionFiles) {

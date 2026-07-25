@@ -38,20 +38,12 @@
   }
 
   async function renderState() {
-    const response = await send({ type: 'get-state' });
-    const monitors = response?.monitors ?? [];
-    const changed = monitors.filter((monitor) => monitor.unread);
-    const needsAttention = (monitor) => (monitor.enabled || monitor.status === 'permission-needed')
-      && ['needs-review', 'error', 'permission-needed'].includes(monitor.status);
-    const attention = monitors.filter(needsAttention);
-    monitorCount.textContent = String(monitors.filter((monitor) => monitor.enabled).length);
-    changedCount.textContent = String(changed.length);
-    attentionCount.textContent = String(attention.length);
+    const response = await send({ type: 'get-popup-state' });
+    const items = response?.recent ?? [];
+    monitorCount.textContent = String(response?.activeCount ?? 0);
+    changedCount.textContent = String(response?.changedCount ?? 0);
+    attentionCount.textContent = String(response?.attentionCount ?? 0);
     recentList.replaceChildren();
-
-    const items = [...changed, ...attention.filter((monitor) => !monitor.unread), ...monitors.filter((monitor) => !monitor.unread && !needsAttention(monitor))]
-      .sort((left, right) => Date.parse(right.lastChangedAt ?? right.lastReviewAt ?? right.updatedAt) - Date.parse(left.lastChangedAt ?? left.lastReviewAt ?? left.updatedAt))
-      .slice(0, 3);
 
     if (!items.length) {
       const empty = document.createElement('div');

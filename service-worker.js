@@ -33,7 +33,7 @@ const SCHEDULE_MODES = new Set([
 ]);
 // unlimitedStorage prevents a few large snapshots from blocking a legitimate
 // import of hundreds of user-configured trackers.
-const MAX_MONITORS = 3_000;
+const MAX_MONITORS = 5_000;
 const MAX_SELECTORS_PER_MONITOR = 20;
 const MAX_COLLECTION_ITEMS = 10_000;
 // Storage is explicitly unlimited. Keep the canonical comparison payload much
@@ -48,6 +48,16 @@ const SOUND_DEBOUNCE_MS = 3_000;
 const MAX_CHECKS_PER_SWEEP = 6;
 const MAX_BATCH_CHECKS = 1_000;
 const MAX_CONCURRENT_BATCH_CHECKS = 3;
+const DASHBOARD_LOAD_PAGE_SIZE = 100;
+const MAX_DASHBOARD_LOAD_PAGE_SIZE = 199;
+const DASHBOARD_SESSION_TTL_MS = 2 * 60 * 1000;
+const IMPORT_SESSION_TTL_MS = 5 * 60 * 1000;
+// Export parts reserve 64 KiB below 32 MiB, plus a further 64 KiB for the
+// v4 file envelope. Large individual monitor records are transferred to the
+// dashboard as smaller JSON-string fragments instead of imposing a backup-
+// size cap on the monitor itself.
+const MAX_EXPORT_DIRECT_RECORD_BYTES = (32 * 1024 * 1024) - (128 * 1024);
+const EXPORT_RECORD_FRAGMENT_CHARS = 3 * 1024 * 1024;
 const PENDING_PICKER_TTL_MS = 2 * 60 * 60 * 1000;
 const RENDER_LOAD_TIMEOUT_MS = 30_000;
 // The picker only needs a live DOM to show an element under the cursor. Do not
@@ -88,6 +98,9 @@ let precisionScheduleTimer = null;
 const liveSessions = new Map();
 const liveDirtyByMonitor = new Map();
 let liveOwnershipQueue = Promise.resolve();
+const dashboardLoadSessions = new Map();
+const exportSessions = new Map();
+const importSessions = new Map();
 
 function cleanText(value, maxLength = MAX_SNAPSHOT_CHARS) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -112,6 +125,25 @@ function cleanSnapshotHtml(value, maxLength = MAX_SNAPSHOT_CHARS) {
     .replace(/\u0000/g, '')
     .trim()
     .slice(0, maxLength);
+}
+
+function utf8ByteLength(value) {
+  let length = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) length += 1;
+    else if (code <= 0x7ff) length += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        length += 4;
+        index += 1;
+      } else {
+        length += 3;
+      }
+    } else length += 3;
+  }
+  return length;
 }
 
 // A compact deterministic fingerprint lets the monitor detect a change beyond
@@ -1447,6 +1479,236 @@ async function getState() {
     monitors,
     settings: normalizeSettings(stored[SETTINGS_KEY])
   };
+}
+
+function dashboardSnapshotPreview(snapshot) {
+  if (!snapshot) return null;
+  return {
+    exists: Boolean(snapshot.exists),
+    matchCount: Number.isInteger(snapshot.matchCount) ? snapshot.matchCount : 0,
+    text: cleanSnapshotText(snapshot.text, 800),
+    capturedAt: asIso(snapshot.capturedAt, null)
+  };
+}
+
+// The dashboard only needs configuration and a short preview for its cards.
+// Keeping snapshot/history payloads out of the list response avoids Chrome's
+// 64 MiB extension-message ceiling for large local backups.
+function dashboardMonitorSummary(monitor) {
+  return {
+    id: monitor.id,
+    revision: monitor.revision,
+    name: monitor.name,
+    url: monitor.url,
+    pageTitle: monitor.pageTitle,
+    locators: monitor.locators,
+    selectors: monitor.selectors,
+    tracking: monitor.tracking,
+    labels: monitor.labels,
+    schedule: monitor.schedule,
+    scheduleMode: monitor.scheduleMode,
+    intervalHours: monitor.intervalHours,
+    intervalSeconds: monitor.intervalSeconds,
+    enabled: monitor.enabled,
+    createdAt: monitor.createdAt,
+    updatedAt: monitor.updatedAt,
+    lastCheckedAt: monitor.lastCheckedAt,
+    lastChangedAt: monitor.lastChangedAt,
+    nextCheckAt: monitor.nextCheckAt,
+    lastReviewAt: monitor.lastReviewAt,
+    lastViewedAt: monitor.lastViewedAt,
+    lastError: monitor.lastError,
+    status: monitor.status,
+    unread: monitor.unread,
+    snapshot: dashboardSnapshotPreview(monitor.snapshot),
+    historyCount: monitor.history.length,
+    runCount: monitor.runs.length,
+    hasErrorEvidence: Boolean(monitor.lastErrorSnapshot?.evidenceHtml)
+  };
+}
+
+function pruneTransientSessions() {
+  const now = Date.now();
+  for (const sessions of [dashboardLoadSessions, exportSessions, importSessions]) {
+    for (const [id, session] of sessions) {
+      if (session.expiresAt <= now) sessions.delete(id);
+    }
+  }
+}
+
+async function startDashboardLoad() {
+  pruneTransientSessions();
+  const state = await getState();
+  const id = createId();
+  dashboardLoadSessions.set(id, {
+    monitors: state.monitors,
+    settings: state.settings,
+    expiresAt: Date.now() + DASHBOARD_SESSION_TTL_MS
+  });
+  return { ok: true, id, total: state.monitors.length, settings: state.settings };
+}
+
+function getDashboardLoadPage(message) {
+  pruneTransientSessions();
+  const session = dashboardLoadSessions.get(message?.id);
+  if (!session) return { ok: false, reason: 'expired', error: '대시보드 데이터를 다시 불러와 주세요.' };
+  session.expiresAt = Date.now() + DASHBOARD_SESSION_TTL_MS;
+  const offset = Math.max(0, Math.floor(Number(message?.offset) || 0));
+  const requestedPageSize = Math.floor(Number(message?.pageSize) || DASHBOARD_LOAD_PAGE_SIZE);
+  const pageSize = Math.min(MAX_DASHBOARD_LOAD_PAGE_SIZE, Math.max(1, requestedPageSize));
+  const monitors = session.monitors
+    .slice(offset, offset + pageSize)
+    .map(dashboardMonitorSummary);
+  return {
+    ok: true,
+    monitors,
+    offset,
+    total: session.monitors.length,
+    done: offset + monitors.length >= session.monitors.length
+  };
+}
+
+function finishDashboardLoad(message) {
+  dashboardLoadSessions.delete(message?.id);
+  return { ok: true };
+}
+
+async function getMonitorDetail(id) {
+  const monitor = (await getMonitors()).find((item) => item.id === id);
+  if (!monitor) return { ok: false, error: '모니터를 찾을 수 없습니다.' };
+  return { ok: true, monitor };
+}
+
+async function getPopupState() {
+  const monitors = await getMonitors();
+  const needsAttention = (monitor) => (monitor.enabled || monitor.status === 'permission-needed')
+    && ['needs-review', 'error', 'permission-needed'].includes(monitor.status);
+  const changed = monitors.filter((monitor) => monitor.unread);
+  const attention = monitors.filter(needsAttention);
+  const recent = [...changed, ...attention.filter((monitor) => !monitor.unread), ...monitors.filter((monitor) => (
+    !monitor.unread && !needsAttention(monitor)
+  ))]
+    .sort((left, right) => Date.parse(right.lastChangedAt ?? right.lastReviewAt ?? right.updatedAt)
+      - Date.parse(left.lastChangedAt ?? left.lastReviewAt ?? left.updatedAt))
+    .slice(0, 3)
+    .map((monitor) => ({
+      id: monitor.id,
+      name: monitor.name,
+      url: monitor.url,
+      status: monitor.status,
+      unread: monitor.unread,
+      lastChangedAt: monitor.lastChangedAt
+    }));
+  return {
+    ok: true,
+    activeCount: monitors.filter((monitor) => monitor.enabled).length,
+    changedCount: changed.length,
+    attentionCount: attention.length,
+    recent
+  };
+}
+
+async function startExportSession() {
+  pruneTransientSessions();
+  const monitors = await getMonitors();
+  const id = createId();
+  exportSessions.set(id, {
+    monitors,
+    serializedRecords: new Map(),
+    expiresAt: Date.now() + DASHBOARD_SESSION_TTL_MS
+  });
+  return { ok: true, id, total: monitors.length };
+}
+
+function exportHistoryEntryForTransfer(entry, index) {
+  if (index === 0 || !entry || typeof entry !== 'object') return entry;
+  return {
+    kind: entry.kind === 'baseline' ? 'baseline' : 'change',
+    capturedAt: entry.capturedAt ?? entry.snapshot?.capturedAt ?? null,
+    snapshot: { exists: entry.snapshot?.exists !== false }
+  };
+}
+
+function exportMonitorRecordForTransfer(monitor) {
+  if (!monitor || typeof monitor !== 'object' || !Array.isArray(monitor.history)) return monitor;
+  return {
+    ...monitor,
+    history: monitor.history.map(exportHistoryEntryForTransfer)
+  };
+}
+
+function serializedExportRecord(monitor) {
+  return JSON.stringify(exportMonitorRecordForTransfer(monitor));
+}
+
+function exportFragmentRecordForSession(session, index) {
+  if (session.serializedRecords.has(index)) return session.serializedRecords.get(index);
+  const record = serializedExportRecord(session.monitors[index]);
+  session.serializedRecords.set(index, record);
+  return record;
+}
+
+function getExportSessionAndIndex(message) {
+  pruneTransientSessions();
+  const session = exportSessions.get(message?.id);
+  const index = Math.floor(Number(message?.index));
+  if (!session) return { error: { ok: false, reason: 'expired', error: '내보내기 데이터를 다시 준비해 주세요.' } };
+  if (!Number.isInteger(index) || index < 0 || index >= session.monitors.length) {
+    return { error: { ok: false, error: '내보낼 추적을 찾을 수 없습니다.' } };
+  }
+  session.expiresAt = Date.now() + DASHBOARD_SESSION_TTL_MS;
+  return { session, index };
+}
+
+function getExportMonitor(message) {
+  const target = getExportSessionAndIndex(message);
+  if (target.error) return target.error;
+  const record = serializedExportRecord(target.session.monitors[target.index]);
+  if (utf8ByteLength(record) < MAX_EXPORT_DIRECT_RECORD_BYTES) {
+    return { ok: true, record };
+  }
+  target.session.serializedRecords.set(target.index, record);
+  return {
+    ok: true,
+    fragmented: true,
+    recordId: `${message.id}:${target.index}`,
+    fragmentCount: Math.ceil(record.length / EXPORT_RECORD_FRAGMENT_CHARS)
+  };
+}
+
+function getExportMonitorFragment(message) {
+  const target = getExportSessionAndIndex(message);
+  if (target.error) return target.error;
+  const fragmentIndex = Math.floor(Number(message?.fragmentIndex));
+  const record = exportFragmentRecordForSession(target.session, target.index);
+  const fragmentCount = Math.ceil(record.length / EXPORT_RECORD_FRAGMENT_CHARS);
+  if (!Number.isInteger(fragmentIndex) || fragmentIndex < 0 || fragmentIndex >= fragmentCount) {
+    return { ok: false, error: '내보낼 추적 조각을 찾을 수 없습니다.' };
+  }
+  const start = fragmentIndex * EXPORT_RECORD_FRAGMENT_CHARS;
+  const response = {
+    ok: true,
+    payload: record.slice(start, start + EXPORT_RECORD_FRAGMENT_CHARS),
+    fragmentIndex,
+    fragmentCount
+  };
+  if (fragmentIndex === fragmentCount - 1) target.session.serializedRecords.delete(target.index);
+  return response;
+}
+
+function finishExportSession(message) {
+  const session = exportSessions.get(message?.id);
+  if (session?.serializedRecords) session.serializedRecords.clear();
+  exportSessions.delete(message?.id);
+  return { ok: true };
+}
+
+function touchExportSession(message) {
+  pruneTransientSessions();
+  const session = exportSessions.get(message?.id);
+  if (!session) return { ok: false, reason: 'expired', error: '내보내기 작업이 만료되었습니다. 다시 시도해 주세요.' };
+  session.expiresAt = Date.now() + DASHBOARD_SESSION_TTL_MS;
+  return { ok: true };
 }
 
 async function getMonitors() {
@@ -4934,6 +5196,260 @@ async function openMonitorTab(id) {
   return { ok: true };
 }
 
+async function startImportSession(message) {
+  pruneTransientSessions();
+  const mode = message?.mode === 'replace' ? 'replace' : 'merge';
+  const existingCount = mode === 'merge' ? (await getMonitors()).length : 0;
+  const id = createId();
+  importSessions.set(id, {
+    mode,
+    sourceCount: 0,
+    remainingCapacity: Math.max(0, MAX_MONITORS - existingCount),
+    prepared: [],
+    usedIds: new Set(),
+    fragmentRecords: new Map(),
+    discardedFragmentRecordIds: new Set(),
+    rejected: 0,
+    disabledForPermission: 0,
+    expiresAt: Date.now() + IMPORT_SESSION_TTL_MS
+  });
+  return { ok: true, id };
+}
+
+async function prepareImportSessionMonitor(session, raw) {
+  const result = { prepared: 0, rejected: 0, disabledForPermission: 0 };
+  if (session.sourceCount >= MAX_MONITORS) {
+    session.rejected += 1;
+    result.rejected = 1;
+    return result;
+  }
+  session.sourceCount += 1;
+  if (session.prepared.length >= session.remainingCapacity) {
+    session.rejected += 1;
+    result.rejected = 1;
+    return result;
+  }
+  if (!raw || typeof raw !== 'object') {
+    session.rejected += 1;
+    result.rejected = 1;
+    return result;
+  }
+
+  const monitor = normalizeMonitor(raw);
+  if (!monitor) {
+    session.rejected += 1;
+    result.rejected = 1;
+    return result;
+  }
+  try {
+    await validateLocatorList(monitor.locators);
+  } catch {
+    session.rejected += 1;
+    result.rejected = 1;
+    return result;
+  }
+
+  while (session.usedIds.has(monitor.id)) {
+    monitor.id = createId();
+  }
+  session.usedIds.add(monitor.id);
+  monitor.revision = createRevision();
+  if (!monitor.snapshot && monitor.status === 'ok') {
+    monitor.status = 'needs-baseline';
+  }
+  if (monitor.enabled && !await hasSitePermission(monitor.url)) {
+    monitor.enabled = false;
+    monitor.status = 'permission-needed';
+    monitor.lastError = '가져온 추적에는 사이트 접근 권한이 필요합니다.';
+    session.disabledForPermission += 1;
+    result.disabledForPermission = 1;
+  } else if (!monitor.enabled && monitor.status === 'permission-needed') {
+    monitor.status = statusForStoredSnapshot(monitor.snapshot, monitor.tracking);
+    monitor.lastError = null;
+  }
+  session.prepared.push(monitor);
+  result.prepared = 1;
+  return result;
+}
+
+async function appendImportSession(message) {
+  pruneTransientSessions();
+  const session = importSessions.get(message?.id);
+  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
+  const sourceMonitors = Array.isArray(message?.monitors) ? message.monitors : [];
+  const summary = { prepared: 0, rejected: 0, disabledForPermission: 0 };
+
+  for (const raw of sourceMonitors) {
+    const result = await prepareImportSessionMonitor(session, raw);
+    summary.prepared += result.prepared;
+    summary.rejected += result.rejected;
+    summary.disabledForPermission += result.disabledForPermission;
+  }
+
+  session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
+  return { ok: true, ...summary };
+}
+
+function normalizedImportFragment(raw) {
+  if (!raw || typeof raw !== 'object' || typeof raw.recordId !== 'string' || !raw.recordId
+    || !Number.isSafeInteger(raw.fragmentIndex) || raw.fragmentIndex < 0
+    || !Number.isSafeInteger(raw.fragmentCount) || raw.fragmentCount <= 0
+    || raw.fragmentIndex >= raw.fragmentCount || typeof raw.payload !== 'string') {
+    return null;
+  }
+  return raw;
+}
+
+function appendImportFragments(message) {
+  pruneTransientSessions();
+  const session = importSessions.get(message?.id);
+  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
+  const sourceFragments = Array.isArray(message?.fragments) ? message.fragments : [];
+  if (session.prepared.length >= session.remainingCapacity) {
+    session.rejected += sourceFragments.length;
+    session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
+    return { ok: true, received: 0, rejected: sourceFragments.length };
+  }
+  let received = 0;
+  let rejected = 0;
+
+  for (const raw of sourceFragments) {
+    const fragment = normalizedImportFragment(raw);
+    if (!fragment) {
+      session.rejected += 1;
+      rejected += 1;
+      continue;
+    }
+    let record = session.fragmentRecords.get(fragment.recordId);
+    if (!record) {
+      if (session.prepared.length + session.fragmentRecords.size >= session.remainingCapacity) {
+        if (!session.discardedFragmentRecordIds.has(fragment.recordId)) {
+          session.discardedFragmentRecordIds.add(fragment.recordId);
+          session.rejected += 1;
+          rejected += 1;
+        }
+        continue;
+      }
+      record = { fragmentCount: fragment.fragmentCount, pieces: new Map(), invalid: false };
+      session.fragmentRecords.set(fragment.recordId, record);
+    }
+    if (record.fragmentCount !== fragment.fragmentCount) {
+      record.invalid = true;
+      continue;
+    }
+    const existing = record.pieces.get(fragment.fragmentIndex);
+    if (existing !== undefined && existing !== fragment.payload) {
+      record.invalid = true;
+      continue;
+    }
+    record.pieces.set(fragment.fragmentIndex, fragment.payload);
+    received += 1;
+  }
+
+  session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
+  return { ok: true, received, rejected };
+}
+
+function touchImportSession(message) {
+  pruneTransientSessions();
+  const session = importSessions.get(message?.id);
+  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
+  session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
+  return { ok: true };
+}
+
+async function prepareFragmentedImportRecords(session) {
+  for (const [recordId, record] of session.fragmentRecords) {
+    // Release each payload before normalizing it so only the remaining
+    // fragmented records occupy session memory.
+    session.fragmentRecords.delete(recordId);
+    if (record.invalid || record.pieces.size !== record.fragmentCount) {
+      session.rejected += 1;
+      continue;
+    }
+    const pieces = [];
+    let complete = true;
+    for (let index = 0; index < record.fragmentCount; index += 1) {
+      const payload = record.pieces.get(index);
+      if (payload === undefined) {
+        complete = false;
+        break;
+      }
+      pieces.push(payload);
+    }
+    if (!complete) {
+      session.rejected += 1;
+      continue;
+    }
+    try {
+      await prepareImportSessionMonitor(session, JSON.parse(pieces.join('')));
+    } catch {
+      session.rejected += 1;
+    }
+  }
+  session.fragmentRecords.clear();
+}
+
+async function finishImportSession(message) {
+  pruneTransientSessions();
+  const session = importSessions.get(message?.id);
+  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
+  importSessions.delete(message.id);
+  const beforeImport = session.mode === 'replace' ? await getMonitors() : [];
+  let imported = 0;
+  try {
+    await prepareFragmentedImportRecords(session);
+    let rejected = session.rejected;
+    const result = await mutateMonitors((monitors) => {
+      if (session.mode === 'replace') {
+        monitors.splice(0, monitors.length);
+      }
+      const usedMonitorIds = new Set(monitors.map((monitor) => monitor.id));
+      for (const preparedMonitor of session.prepared) {
+        const monitor = {
+          ...preparedMonitor,
+          selectors: [...preparedMonitor.selectors],
+          locators: preparedMonitor.locators.map((locator) => ({
+            ...locator,
+            framePath: locator.framePath.map((part) => ({ ...part })),
+            fields: locator.fields.map((field) => ({ ...field }))
+          }))
+        };
+        while (usedMonitorIds.has(monitor.id)) {
+          monitor.id = createId();
+        }
+        if (monitors.length < MAX_MONITORS) {
+          monitors.push(monitor);
+          usedMonitorIds.add(monitor.id);
+          imported += 1;
+        } else {
+          rejected += 1;
+        }
+      }
+      return { ok: true, imported, rejected, disabledForPermission: session.disabledForPermission };
+    });
+    await finalizeImportedMonitors(beforeImport);
+    return result;
+  } finally {
+    session.prepared.length = 0;
+    session.usedIds.clear();
+    session.fragmentRecords.clear();
+    session.discardedFragmentRecordIds.clear();
+  }
+}
+
+function abortImportSession(message) {
+  const session = importSessions.get(message?.id);
+  if (session) {
+    session.prepared.length = 0;
+    session.usedIds.clear();
+    session.fragmentRecords.clear();
+    session.discardedFragmentRecordIds.clear();
+  }
+  importSessions.delete(message?.id);
+  return { ok: true };
+}
+
 async function importMonitors(message) {
   const beforeImport = await getMonitors();
   const sourceMonitors = Array.isArray(message.monitors) ? message.monitors : [];
@@ -4987,6 +5503,7 @@ async function importMonitors(message) {
     if (message.mode === 'replace') {
       monitors.splice(0, monitors.length);
     }
+    const usedMonitorIds = new Set(monitors.map((monitor) => monitor.id));
 
     for (const preparedMonitor of prepared) {
       const monitor = {
@@ -5000,12 +5517,13 @@ async function importMonitors(message) {
       };
       // Importing is additive in merge mode. URLs are intentionally not a
       // uniqueness key; only the persistent monitor id must be unique.
-      while (monitors.some((item) => item.id === monitor.id)) {
+      while (usedMonitorIds.has(monitor.id)) {
         monitor.id = createId();
       }
 
       if (monitors.length < MAX_MONITORS) {
         monitors.push(monitor);
+        usedMonitorIds.add(monitor.id);
         imported += 1;
       } else {
         rejected += 1;
@@ -5070,6 +5588,16 @@ async function startPicker(tabId, url) {
 
 const messageHandlers = {
   'get-state': async () => ({ ok: true, ...(await getState()) }),
+  'start-dashboard-load': () => startDashboardLoad(),
+  'get-dashboard-load-page': (message) => getDashboardLoadPage(message),
+  'finish-dashboard-load': (message) => finishDashboardLoad(message),
+  'get-monitor-detail': (message) => getMonitorDetail(message.id),
+  'get-popup-state': () => getPopupState(),
+  'start-export-session': () => startExportSession(),
+  'get-export-monitor': (message) => getExportMonitor(message),
+  'get-export-monitor-fragment': (message) => getExportMonitorFragment(message),
+  'touch-export-session': (message) => touchExportSession(message),
+  'finish-export-session': (message) => finishExportSession(message),
   'start-picker': (message) => startPicker(message.tabId, message.url),
   'create-monitor': (message, sender) => createMonitor(message, sender),
   'create-monitors': (message, sender) => createMonitors(message, sender),
@@ -5092,6 +5620,12 @@ const messageHandlers = {
   'open-monitor-window': (message) => openMonitorWindow(message.id),
   'open-monitor-tab': (message) => openMonitorTab(message.id),
   'import-monitors': (message) => importMonitors(message),
+  'start-import-session': (message) => startImportSession(message),
+  'append-import-session': (message) => appendImportSession(message),
+  'append-import-fragments': (message) => appendImportFragments(message),
+  'touch-import-session': (message) => touchImportSession(message),
+  'finish-import-session': (message) => finishImportSession(message),
+  'abort-import-session': (message) => abortImportSession(message),
   'finalize-import': () => finalizeImportedMonitors(),
   'open-dashboard': () => openDashboard(),
   'release-unclaimed-origin': (message, sender) => releaseUnclaimedOrigin(message, sender),

@@ -1,9 +1,17 @@
 (() => {
   const MIN_HOURS = 1;
   const MAX_HOURS = 14 * 24;
-  const MAX_IMPORT_BYTES = 64 * 1024 * 1024;
+  // Keep a small buffer below the requested 32 MiB split point. It leaves
+  // room for the runtime-message envelope while every generated JSON part is
+  // valid JSON and remains strictly below 32 MiB.
+  const EXPORT_FILE_SPLIT_BYTES = 32 * 1024 * 1024;
+  const EXPORT_FILE_HEADROOM_BYTES = 64 * 1024;
+  const MAX_EXPORT_FILE_BYTES = EXPORT_FILE_SPLIT_BYTES - EXPORT_FILE_HEADROOM_BYTES;
+  const MAX_IMPORT_MESSAGE_BYTES = MAX_EXPORT_FILE_BYTES;
+  const IMPORT_RECORD_FRAGMENT_CHARS = 3 * 1024 * 1024;
   const BULK_TRANSFER_THRESHOLD = 200;
   const BULK_TRANSFER_CHUNK_SIZE = 100;
+  const DASHBOARD_RENDER_CHUNK_SIZE = 50;
   const SELECTED_CHECK_CHUNK_SIZE = 6;
   const MONITOR_PREVIEW_MAX_CHARS = 800;
   const SEARCH_RENDER_DEBOUNCE_MS = 150;
@@ -15,8 +23,14 @@
   let searchRenderTimer = null;
   let batchActionRunning = false;
   let transferRunning = false;
+  let dashboardLoading = false;
+  let monitorRenderGeneration = 0;
   let activeHistoryEntries = [];
   let activeHistoryUrl = '';
+  const exportDownloadUrls = new Map();
+  let refreshQueued = false;
+  let refreshPending = false;
+  let refreshQueueTimer = null;
 
   const elements = {
     soundEnabled: document.querySelector('#soundEnabled'),
@@ -526,7 +540,7 @@
       if (selected) selectedMonitorIds.add(id);
       else selectedMonitorIds.delete(id);
     });
-    renderMonitors();
+    void renderMonitorList();
   }
 
   function invertVisibleSelection() {
@@ -535,7 +549,7 @@
       if (selectedMonitorIds.has(id)) selectedMonitorIds.delete(id);
       else selectedMonitorIds.add(id);
     });
-    renderMonitors();
+    void renderMonitorList();
   }
 
   function renderOverview() {
@@ -648,8 +662,8 @@
 
     const actions = element('div', 'card-actions');
     if (monitor.unread) actions.append(makeAction('변경 내용', 'change', monitor.id, 'attention-action'));
-    if (monitor.lastErrorSnapshot?.evidenceHtml) actions.append(makeAction('선택 실패 화면', 'evidence', monitor.id, 'attention-action'));
-    if (monitor.history?.length || monitor.runs?.length) actions.append(makeAction('기록', 'history', monitor.id));
+    if (monitor.hasErrorEvidence) actions.append(makeAction('선택 실패 화면', 'evidence', monitor.id, 'attention-action'));
+    if (monitor.historyCount || monitor.runCount) actions.append(makeAction('기록', 'history', monitor.id));
     if (monitor.tracking?.live) actions.append(makeAction('실시간 연결', 'live', monitor.id));
     if (monitor.status === 'permission-needed') actions.append(makeAction('추적 시작', 'grant', monitor.id, 'attention-action'));
     actions.append(
@@ -664,7 +678,7 @@
     return card;
   }
 
-  function pageCard(page) {
+  function pageCardShell(page) {
     const pageElement = element('section', 'page-card');
     const top = element('div', 'page-top');
     const heading = element('div', 'page-title');
@@ -694,12 +708,17 @@
     pageElement.append(actions);
 
     const tracks = element('div', 'tracking-list');
-    page.visibleMonitors.forEach((monitor) => tracks.append(monitorCard(monitor)));
     pageElement.append(tracks);
+    return { pageElement, tracks };
+  }
+
+  function pageCard(page) {
+    const { pageElement, tracks } = pageCardShell(page);
+    page.visibleMonitors.forEach((monitor) => tracks.append(monitorCard(monitor)));
     return pageElement;
   }
 
-  function siteCard(site) {
+  function siteCardShell(site) {
     const card = element('article', 'site-group');
     const top = element('div', 'site-heading');
     const title = element('div');
@@ -716,8 +735,13 @@
     card.append(top);
 
     const pages = element('div', 'site-pages');
-    site.pages.forEach((page) => pages.append(pageCard(page)));
     card.append(pages);
+    return { card, pages };
+  }
+
+  function siteCard(site) {
+    const { card, pages } = siteCardShell(site);
+    site.pages.forEach((page) => pages.append(pageCard(page)));
     return card;
   }
 
@@ -741,6 +765,7 @@
   }
 
   function renderMonitors() {
+    monitorRenderGeneration += 1;
     if (searchRenderTimer !== null) {
       clearTimeout(searchRenderTimer);
       searchRenderTimer = null;
@@ -765,18 +790,138 @@
     sites.forEach((site) => elements.monitorList.append(siteCard(site)));
   }
 
+  async function renderMonitorsProgressively(total = state.monitors.length) {
+    const generation = ++monitorRenderGeneration;
+    if (searchRenderTimer !== null) {
+      clearTimeout(searchRenderTimer);
+      searchRenderTimer = null;
+    }
+    const sites = getFilteredSiteGroups();
+    const visibleMonitorCount = sites.reduce((count, site) => count + site.pages.reduce(
+      (pageCount, page) => pageCount + page.visibleMonitors.length,
+      0
+    ), 0);
+    updateListHeading(sites, visibleMonitorCount);
+    renderSelectionControls(sites);
+    elements.monitorList.replaceChildren();
+    if (!sites.length) {
+      const empty = element('div', 'empty-state');
+      const title = element('strong', '', state.monitors.length ? '조건에 맞는 추적이 없습니다.' : '아직 등록된 추적이 없습니다.');
+      empty.append(title, document.createTextNode(state.monitors.length
+        ? '검색어, 라벨, 상태 필터를 바꿔 보세요.'
+        : '추적할 웹페이지에서 브라우저 도구 모음의 OpenStill 버튼을 눌러 CSS 요소를 선택하세요.'));
+      elements.monitorList.append(empty);
+      return;
+    }
+
+    const pendingNodes = document.createDocumentFragment();
+    let rendered = 0;
+    updateDashboardRenderProgress(0, total);
+    for (const site of sites) {
+      if (generation !== monitorRenderGeneration) return;
+      const { card, pages } = siteCardShell(site);
+      pendingNodes.append(card);
+      for (const page of site.pages) {
+        const { pageElement, tracks } = pageCardShell(page);
+        pages.append(pageElement);
+        for (const monitor of page.visibleMonitors) {
+          tracks.append(monitorCard(monitor));
+          rendered += 1;
+          if (rendered % DASHBOARD_RENDER_CHUNK_SIZE === 0) {
+            elements.monitorList.append(pendingNodes);
+            updateDashboardRenderProgress(Math.min(rendered, total), total);
+            await yieldToBrowser();
+            if (generation !== monitorRenderGeneration) return;
+          }
+        }
+      }
+    }
+    if (generation !== monitorRenderGeneration) return;
+    elements.monitorList.append(pendingNodes);
+    updateDashboardRenderProgress(total, total);
+  }
+
+  function renderMonitorList() {
+    if (state.monitors.length >= BULK_TRANSFER_THRESHOLD) {
+      return renderMonitorsProgressively(state.monitors.length);
+    }
+    renderMonitors();
+    return Promise.resolve();
+  }
+
   function render() {
     renderOverview();
     renderLabels();
-    renderMonitors();
+    return renderMonitorList();
   }
 
   async function refresh() {
-    const response = await send({ type: 'get-state' });
-    if (!response?.ok) throw new Error(response?.error || '저장된 데이터를 불러오지 못했습니다.');
-    state.monitors = response.monitors ?? [];
-    state.settings = response.settings ?? { soundEnabled: true };
-    render();
+    if (dashboardLoading) return;
+    if (refreshQueueTimer !== null) {
+      clearTimeout(refreshQueueTimer);
+      refreshQueueTimer = null;
+      refreshQueued = false;
+      refreshPending = false;
+    }
+    dashboardLoading = true;
+    let loadTotal = 0;
+    let loadFinished = false;
+    beginDashboardLoadProgress();
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const started = await send({ type: 'start-dashboard-load' });
+        if (!started?.ok) throw new Error(started?.error || '저장된 데이터를 불러오지 못했습니다.');
+        const loadId = started.id;
+        const total = started.total || 0;
+        loadTotal = total;
+        startDashboardLoadProgress(total);
+        const monitors = [];
+        let expired = false;
+        try {
+          for (let offset = 0; offset < total;) {
+            const page = await send({
+              type: 'get-dashboard-load-page',
+              id: loadId,
+              offset,
+              pageSize: total >= BULK_TRANSFER_THRESHOLD ? BULK_TRANSFER_CHUNK_SIZE : Math.max(total, 1)
+            });
+            if (!page?.ok) {
+              if (page?.reason === 'expired') {
+                expired = true;
+                break;
+              }
+              throw new Error(page?.error || '대시보드 데이터를 불러오지 못했습니다.');
+            }
+            monitors.push(...(page.monitors ?? []));
+            offset += (page.monitors ?? []).length;
+            updateDashboardLoadProgress(offset, total);
+            if (!page.done && (page.monitors ?? []).length) await yieldToBrowser();
+            if (!page.done && !(page.monitors ?? []).length) {
+              throw new Error('대시보드 데이터를 계속 불러올 수 없습니다.');
+            }
+          }
+        } finally {
+          await send({ type: 'finish-dashboard-load', id: loadId }).catch(() => undefined);
+        }
+        if (expired) continue;
+        state.monitors = monitors;
+        state.settings = started.settings ?? { soundEnabled: true };
+        await render();
+        finishDashboardLoadProgress(total);
+        loadFinished = true;
+        return;
+      }
+      throw new Error('대시보드 로드가 만료되어 다시 시도하지 못했습니다.');
+    } finally {
+      dashboardLoading = false;
+      if (!loadFinished) finishDashboardLoadProgress(loadTotal, true);
+      if (!transferRunning) {
+        elements.exportButton.disabled = false;
+        elements.importButton.disabled = false;
+        elements.importInput.disabled = false;
+      }
+      flushQueuedDashboardRefresh();
+    }
   }
 
   function showToast(text) {
@@ -788,6 +933,30 @@
 
   function formatTransferCount(value) {
     return Number(value).toLocaleString('ko-KR');
+  }
+
+  function formatByteSize(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  // The item count is unknown until JSON is decoded. Show byte-level feedback
+  // for that stage; the regular item-count bar still starts at 200 records.
+  function updateImportFileProgress(label, loaded, total, parsing = false) {
+    clearTimeout(transferProgressTimer);
+    elements.transferProgress.hidden = false;
+    elements.transferProgressLabel.textContent = label;
+    if (parsing || !total) {
+      elements.transferProgressBar.removeAttribute('value');
+      elements.transferProgressValue.textContent = parsing ? 'JSON 해석 중' : '';
+      return;
+    }
+    elements.transferProgressBar.max = total;
+    elements.transferProgressBar.value = Math.min(Math.max(0, loaded), total);
+    elements.transferProgressValue.textContent = `${formatByteSize(loaded)} / ${formatByteSize(total)}`;
   }
 
   function showsTransferProgress(total) {
@@ -803,13 +972,13 @@
     elements.transferProgressValue.textContent = `${formatTransferCount(completed)} / ${formatTransferCount(total)}`;
   }
 
-  function beginTransfer(label, total) {
+  function beginTransfer(label, total, completed = 0) {
     clearTimeout(transferProgressTimer);
     transferRunning = true;
     elements.exportButton.disabled = true;
     elements.importButton.disabled = true;
     elements.importInput.disabled = true;
-    if (showsTransferProgress(total)) updateTransferProgress(label, 0, total);
+    if (showsTransferProgress(total)) updateTransferProgress(label, completed, total);
     else elements.transferProgress.hidden = true;
   }
 
@@ -820,16 +989,69 @@
     elements.importInput.disabled = false;
     if (!showsTransferProgress(total)) {
       elements.transferProgress.hidden = true;
+    } else {
+      updateTransferProgress(label, completed, total);
+      transferProgressTimer = setTimeout(() => {
+        elements.transferProgress.hidden = true;
+      }, 4_200);
+    }
+    flushQueuedDashboardRefresh();
+  }
+
+  function beginDashboardLoadProgress() {
+    clearTimeout(transferProgressTimer);
+    elements.exportButton.disabled = true;
+    elements.importButton.disabled = true;
+    elements.importInput.disabled = true;
+    elements.transferProgress.hidden = true;
+  }
+
+  function startDashboardLoadProgress(total) {
+    if (!showsTransferProgress(total)) return;
+    updateTransferProgress('대시보드 불러오는 중', 0, total);
+  }
+
+  function updateDashboardLoadProgress(completed, total) {
+    if (!showsTransferProgress(total)) return;
+    updateTransferProgress('대시보드 불러오는 중', completed, total);
+  }
+
+  function updateDashboardRenderProgress(completed, total) {
+    if (!dashboardLoading || !showsTransferProgress(total)) return;
+    updateTransferProgress('대시보드 목록 표시 중', completed, total);
+  }
+
+  function finishDashboardLoadProgress(total, failed = false) {
+    if (showsTransferProgress(total)) {
+      updateTransferProgress(failed ? '대시보드 불러오기 실패' : '대시보드 준비 완료', total, total);
+      transferProgressTimer = setTimeout(() => {
+        elements.transferProgress.hidden = true;
+      }, 4_200);
       return;
     }
-    updateTransferProgress(label, completed, total);
-    transferProgressTimer = setTimeout(() => {
-      elements.transferProgress.hidden = true;
-    }, 4_200);
+    elements.transferProgress.hidden = true;
   }
 
   function transferChunkSize(total) {
     return total >= BULK_TRANSFER_THRESHOLD ? BULK_TRANSFER_CHUNK_SIZE : Math.max(total, 1);
+  }
+
+  function nextImportChunk(monitors, start, maxItems = BULK_TRANSFER_CHUNK_SIZE) {
+    let end = start;
+    let byteLength = 256; // Envelope fields added by chrome.runtime.sendMessage.
+    while (end < monitors.length && end - start < maxItems) {
+      const record = JSON.stringify(monitors[end]);
+      const recordBytes = utf8ByteLength(record) + (end > start ? 1 : 0);
+      if (byteLength + recordBytes > MAX_IMPORT_MESSAGE_BYTES) {
+        if (end === start) {
+          throw new Error('불러오기 전송 데이터 조각이 32 MB 안전 범위를 넘습니다.');
+        }
+        break;
+      }
+      byteLength += recordBytes;
+      end += 1;
+    }
+    return { end, monitors: monitors.slice(start, end) };
   }
 
   function yieldToBrowser() {
@@ -838,6 +1060,14 @@
 
   function monitorById(id) {
     return state.monitors.find((monitor) => monitor.id === id);
+  }
+
+  async function loadMonitorDetail(id) {
+    const response = await send({ type: 'get-monitor-detail', id });
+    if (!response?.ok || !response.monitor) {
+      throw new Error(response?.error || '추적 세부 정보를 불러오지 못했습니다.');
+    }
+    return response.monitor;
   }
 
   function pageByUrl(url) {
@@ -2056,7 +2286,7 @@
     let needsReview = 0;
     let failed = 0;
     let lastError = '';
-    renderMonitors();
+    void renderMonitorList();
 
     try {
       for (let start = 0; start < ids.length; start += SELECTED_CHECK_CHUNK_SIZE) {
@@ -2081,7 +2311,7 @@
       showToast(lastError ? `${summary} (${lastError})` : summary);
     } finally {
       batchActionRunning = false;
-      renderMonitors();
+      void renderMonitorList();
     }
   }
 
@@ -2107,7 +2337,7 @@
 
     batchActionRunning = true;
     elements.bulkStatus.textContent = `선택한 ${ids.length}개 추적의 라벨을 ${mode === 'add' ? '추가' : '제거'}하는 중…`;
-    renderMonitors();
+    void renderMonitorList();
     try {
       const response = await send({ type: 'update-monitor-labels', mode, label, ids });
       if (!response?.ok) throw new Error(response?.error || '라벨을 변경하지 못했습니다.');
@@ -2125,7 +2355,7 @@
       showToast(message);
     } finally {
       batchActionRunning = false;
-      renderMonitors();
+      void renderMonitorList();
     }
   }
 
@@ -2140,7 +2370,7 @@
 
     batchActionRunning = true;
     elements.bulkStatus.textContent = `선택한 ${ids.length}개 페이지 추적을 삭제하는 중…`;
-    renderMonitors();
+    void renderMonitorList();
     try {
       const response = await send({ type: 'delete-monitors', ids });
       if (!response?.ok) throw new Error(response?.error || '선택한 추적을 삭제하지 못했습니다.');
@@ -2156,7 +2386,7 @@
       showToast(message);
     } finally {
       batchActionRunning = false;
-      renderMonitors();
+      void renderMonitorList();
     }
   }
 
@@ -2208,14 +2438,21 @@
     if (!monitor) return;
     switch (button.dataset.action) {
       case 'change':
-        openChange(monitor);
-        break;
       case 'history':
-        openHistory(monitor);
+      case 'evidence': {
+        button.disabled = true;
+        try {
+          const detail = await loadMonitorDetail(monitor.id);
+          if (button.dataset.action === 'change') openChange(detail);
+          else if (button.dataset.action === 'history') openHistory(detail);
+          else openEvidence(detail);
+        } catch (error) {
+          showToast(error.message || '추적 세부 정보를 불러오지 못했습니다.');
+        } finally {
+          button.disabled = false;
+        }
         break;
-      case 'evidence':
-        openEvidence(monitor);
-        break;
+      }
       case 'live': {
         button.disabled = true;
         try {
@@ -2279,133 +2516,410 @@
     }
   }
 
-  function exportHistoryEntry(entry, index) {
-    // History is newest first. Keep the latest snapshot for a useful backup,
-    // but retain only the timestamp and structural metadata for older entries.
-    if (index === 0 || !entry || typeof entry !== 'object') return entry;
+  // Unlike TextEncoder.encode(), this calculates the UTF-8 byte length without
+  // allocating a second byte array as large as an export record.
+  function utf8ByteLength(value) {
+    let length = 0;
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      if (code <= 0x7f) length += 1;
+      else if (code <= 0x7ff) length += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+        const next = value.charCodeAt(index + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          length += 4;
+          index += 1;
+        } else {
+          length += 3;
+        }
+      } else length += 3;
+    }
+    return length;
+  }
+
+  function createExportPart(exportedAt, exportId, partNumber) {
+    const prefix = `${JSON.stringify({
+      format: 'openstill-export',
+      schemaVersion: 4,
+      exportedAt,
+      exportId,
+      part: partNumber
+    }).slice(0, -1)},"monitors":[`;
+    const divider = '],"fragments":[';
+    const suffix = ']}';
     return {
-      kind: entry.kind === 'baseline' ? 'baseline' : 'change',
-      capturedAt: entry.capturedAt ?? entry.snapshot?.capturedAt ?? null,
-      // `exists` lets the importer preserve this intentionally blank history
-      // entry while avoiding an exported copy of its text or HTML payload.
-      snapshot: { exists: entry.snapshot?.exists !== false }
+      monitorParts: [prefix],
+      fragmentParts: [],
+      divider,
+      suffix,
+      byteLength: utf8ByteLength(prefix) + utf8ByteLength(divider) + utf8ByteLength(suffix),
+      monitorCount: 0,
+      fragmentCount: 0
     };
   }
 
-  function exportMonitorRecord(monitor) {
-    if (!monitor || typeof monitor !== 'object' || !Array.isArray(monitor.history)) return monitor;
-    return {
-      ...monitor,
-      history: monitor.history.map(exportHistoryEntry)
-    };
+  function hasExportPartData(part) {
+    return part.monitorCount > 0 || part.fragmentCount > 0;
+  }
+
+  function canAppendExportPartValue(part, partsKey, countKey, value) {
+    const delimiterBytes = part[countKey] ? 1 : 0;
+    return part.byteLength + delimiterBytes + utf8ByteLength(value) < MAX_EXPORT_FILE_BYTES;
+  }
+
+  function appendExportPartValue(part, partsKey, countKey, value) {
+    const delimiter = part[countKey] ? ',' : '';
+    part[partsKey].push(delimiter, value);
+    part.byteLength += utf8ByteLength(delimiter) + utf8ByteLength(value);
+    part[countKey] += 1;
+  }
+
+  function exportPartBlobParts(part) {
+    return [...part.monitorParts, part.divider, ...part.fragmentParts, part.suffix];
+  }
+
+  function settleExportDownload(downloadId, state) {
+    const pending = exportDownloadUrls.get(downloadId);
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    URL.revokeObjectURL(pending.url);
+    exportDownloadUrls.delete(downloadId);
+    if (state === 'complete') {
+      pending.resolve?.();
+    } else {
+      pending.reject?.(new Error(`“${pending.filename}” 다운로드가 중단되었습니다.`));
+    }
+  }
+
+  function waitForExportDownload(downloadId, url, filename) {
+    if (!chrome.downloads?.onChanged) {
+      window.setTimeout(() => URL.revokeObjectURL(url), 10 * 60 * 1_000);
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        const pending = exportDownloadUrls.get(downloadId);
+        if (!pending) return;
+        clearTimeout(pending.timeoutId);
+        URL.revokeObjectURL(pending.url);
+        exportDownloadUrls.delete(downloadId);
+        reject(new Error(`“${filename}” 다운로드 완료를 확인하지 못했습니다.`));
+      }, 10 * 60 * 1_000);
+      exportDownloadUrls.set(downloadId, { url, filename, resolve, reject, timeoutId });
+    });
+  }
+
+  async function downloadExportPart(part, exportedAt, partNumber) {
+    const blob = new Blob(exportPartBlobParts(part), { type: 'application/json' });
+    if (blob.size >= MAX_EXPORT_FILE_BYTES) {
+      throw new Error('내보내기 파일 한도를 넘는 데이터 묶음을 만들었습니다.');
+    }
+    const url = URL.createObjectURL(blob);
+    const filename = `openstill-export-${exportedAt.slice(0, 10)}-part-${String(partNumber).padStart(3, '0')}.json`;
+    if (chrome.downloads?.download) {
+      try {
+        const downloadId = await chrome.downloads.download({ url, filename, conflictAction: 'uniquify', saveAs: false });
+        const completed = waitForExportDownload(downloadId, url, filename);
+        if (chrome.downloads.search) {
+          try {
+            const [download] = await chrome.downloads.search({ id: downloadId });
+            if (download?.state === 'complete' || download?.state === 'interrupted') {
+              settleExportDownload(downloadId, download.state);
+            }
+          } catch {
+            // onChanged remains the normal completion signal.
+          }
+        }
+        await completed;
+      } catch (error) {
+        URL.revokeObjectURL(url);
+        throw error;
+      }
+    } else {
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+    }
+    if (!chrome.downloads?.download) window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   }
 
   async function exportMonitors() {
-    if (transferRunning) return;
-    const total = state.monitors.length;
+    if (transferRunning || dashboardLoading) return;
+    let total = state.monitors.length;
     let completed = 0;
+    let exportSessionId = '';
+    let exportKeepaliveTimer = null;
     beginTransfer('내보내는 중', total);
     try {
+      const started = await send({ type: 'start-export-session' });
+      if (!started?.ok) throw new Error(started?.error || '내보낼 데이터를 준비하지 못했습니다.');
+      exportSessionId = started.id;
+      exportKeepaliveTimer = window.setInterval(() => {
+        if (!exportSessionId) return;
+        void send({ type: 'touch-export-session', id: exportSessionId }).catch(() => undefined);
+      }, 20_000);
+      total = started.total || 0;
+      updateTransferProgress('내보내는 중', 0, total);
       // Serialise a modest number of records at once. This keeps a large
       // snapshot backup from blocking dashboard painting for one long task.
       if (showsTransferProgress(total)) await yieldToBrowser();
       const exportedAt = new Date().toISOString();
-      const parts = [JSON.stringify({
-        format: 'openstill-export',
-        schemaVersion: 3,
-        exportedAt
-      }).slice(0, -1), ',"monitors":['];
+      const exportId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      let partNumber = 1;
+      let part = createExportPart(exportedAt, exportId, partNumber);
+      const flushExportPart = async () => {
+        if (!hasExportPartData(part)) return;
+        await downloadExportPart(part, exportedAt, partNumber);
+        partNumber += 1;
+        part = createExportPart(exportedAt, exportId, partNumber);
+      };
+      const appendExportPartValueSafely = async (partsKey, countKey, value) => {
+        if (!canAppendExportPartValue(part, partsKey, countKey, value) && hasExportPartData(part)) {
+          await flushExportPart();
+        }
+        if (!canAppendExportPartValue(part, partsKey, countKey, value)) {
+          throw new Error('내보낼 데이터 조각이 32 MB 파일 분할 기준을 넘습니다.');
+        }
+        appendExportPartValue(part, partsKey, countKey, value);
+      };
       const chunkSize = transferChunkSize(total);
       for (let start = 0; start < total; start += chunkSize) {
         const end = Math.min(start + chunkSize, total);
-        const records = [];
         for (let index = start; index < end; index += 1) {
-          records.push(JSON.stringify(exportMonitorRecord(state.monitors[index])));
+          const response = await send({ type: 'get-export-monitor', id: exportSessionId, index });
+          if (!response?.ok) {
+            throw new Error(response?.error || '내보낼 추적을 불러오지 못했습니다.');
+          }
+          if (response.fragmented) {
+            if (typeof response.recordId !== 'string' || !Number.isInteger(response.fragmentCount) || response.fragmentCount < 1) {
+              throw new Error('내보낼 큰 추적 데이터를 나누지 못했습니다.');
+            }
+            for (let fragmentIndex = 0; fragmentIndex < response.fragmentCount; fragmentIndex += 1) {
+              const fragmentResponse = await send({
+                type: 'get-export-monitor-fragment',
+                id: exportSessionId,
+                index,
+                fragmentIndex
+              });
+              if (!fragmentResponse?.ok || typeof fragmentResponse.payload !== 'string') {
+                throw new Error(fragmentResponse?.error || '내보낼 추적 조각을 불러오지 못했습니다.');
+              }
+              const fragment = JSON.stringify({
+                recordId: response.recordId,
+                fragmentIndex,
+                fragmentCount: response.fragmentCount,
+                payload: fragmentResponse.payload
+              });
+              await appendExportPartValueSafely('fragmentParts', 'fragmentCount', fragment);
+              if (showsTransferProgress(total)) await yieldToBrowser();
+            }
+          } else if (typeof response.record === 'string') {
+            await appendExportPartValueSafely('monitorParts', 'monitorCount', response.record);
+          } else {
+            throw new Error('내보낼 추적 데이터를 읽지 못했습니다.');
+          }
         }
-        if (start) parts.push(',');
-        parts.push(records.join(','));
         completed = end;
         updateTransferProgress('내보내는 중', completed, total);
         if (end < total && showsTransferProgress(total)) await yieldToBrowser();
       }
-      parts.push(']}');
-      const blob = new Blob(parts, { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `openstill-export-${exportedAt.slice(0, 10)}.json`;
-      anchor.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      await downloadExportPart(part, exportedAt, partNumber);
       finishTransfer('내보내기 완료', total, total);
+      showToast(partNumber > 1
+        ? `${partNumber}개의 JSON 파일을 저장했습니다.`
+        : 'JSON 파일을 저장했습니다.');
     } catch (error) {
       finishTransfer('내보내기 실패', completed, total);
       showToast(error.message || '내보내지 못했습니다.');
+    } finally {
+      if (exportKeepaliveTimer !== null) window.clearInterval(exportKeepaliveTimer);
+      if (exportSessionId) await send({ type: 'finish-export-session', id: exportSessionId }).catch(() => undefined);
     }
   }
 
-  function importMonitorRecords(payload) {
+  function importMonitorPayload(payload) {
     if (payload?.format === 'openstill-export' && [2, 3].includes(payload?.schemaVersion) && Array.isArray(payload?.monitors)) {
-      return payload.monitors;
+      return { monitors: payload.monitors, fragments: [] };
+    }
+    if (payload?.format === 'openstill-export' && payload?.schemaVersion === 4
+      && Array.isArray(payload?.monitors) && Array.isArray(payload?.fragments)) {
+      return { monitors: payload.monitors, fragments: payload.fragments };
     }
     // Reference Chrome backups are either the bare sieve array or a wrapper
     // with `sieves`. Keep the records intact; the worker performs the typed
     // selector/schedule conversion and rejects unsupported data sources.
-    if (Array.isArray(payload)) return payload;
-    if (Array.isArray(payload?.sieves)) return payload.sieves;
-    if (Array.isArray(payload?.sieve_backup)) return payload.sieve_backup;
+    if (Array.isArray(payload)) return { monitors: payload, fragments: [] };
+    if (Array.isArray(payload?.sieves)) return { monitors: payload.sieves, fragments: [] };
+    if (Array.isArray(payload?.sieve_backup)) return { monitors: payload.sieve_backup, fragments: [] };
     return null;
   }
 
-  async function importMonitors(file) {
-    if (!file) return;
-    if (transferRunning) return;
-    // Reading a 64 MB file is asynchronous. Reserve the transfer before its
+  function parseImportFile(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(chrome.runtime.getURL('import-worker.js'));
+      const finish = () => worker.terminate();
+      worker.addEventListener('message', (event) => {
+        const message = event.data;
+        if (message?.type === 'read-progress' || message?.type === 'parsing') {
+          onProgress?.(message);
+        } else if (message?.type === 'parsed') {
+          finish();
+          resolve(message.payload);
+        } else if (message?.type === 'error') {
+          finish();
+          reject(new Error(message.error || 'JSON 파일을 읽지 못했습니다.'));
+        }
+      }, { once: false });
+      worker.addEventListener('error', () => {
+        finish();
+        reject(new Error('JSON 파일을 해석하지 못했습니다.'));
+      }, { once: true });
+      worker.postMessage({ type: 'parse', file });
+    });
+  }
+
+  async function splitLargeImportMonitors(monitors, fileIndex) {
+    const directMonitors = [];
+    const fragments = [];
+    const importId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${fileIndex}`;
+    for (let monitorIndex = 0; monitorIndex < monitors.length; monitorIndex += 1) {
+      const monitor = monitors[monitorIndex];
+      const record = JSON.stringify(monitor);
+      // Reserve the message envelope as well as the 32 MiB part buffer. A
+      // large legacy/Reference record is represented in the same v4 fragment
+      // form as a record that crossed the export-file boundary.
+      if (utf8ByteLength(record) + 1_024 < MAX_IMPORT_MESSAGE_BYTES) {
+        directMonitors.push(monitor);
+      } else {
+        const fragmentCount = Math.ceil(record.length / IMPORT_RECORD_FRAGMENT_CHARS);
+        for (let fragmentIndex = 0; fragmentIndex < fragmentCount; fragmentIndex += 1) {
+          const start = fragmentIndex * IMPORT_RECORD_FRAGMENT_CHARS;
+          fragments.push({
+            recordId: `${importId}:${monitorIndex}`,
+            fragmentIndex,
+            fragmentCount,
+            payload: record.slice(start, start + IMPORT_RECORD_FRAGMENT_CHARS)
+          });
+        }
+      }
+      if (monitors.length >= BULK_TRANSFER_THRESHOLD && (monitorIndex + 1) % BULK_TRANSFER_CHUNK_SIZE === 0) {
+        await yieldToBrowser();
+      }
+    }
+    return { monitors: directMonitors, fragments };
+  }
+
+  async function importMonitors(fileList) {
+    const files = [...(fileList ?? [])];
+    if (!files.length) return;
+    if (transferRunning || dashboardLoading) return;
+    // Reading a large file is asynchronous. Reserve the transfer before its
     // record count is known so a second picker selection cannot overlap it.
     transferRunning = true;
+    beginTransfer('불러오기 준비 중', 0);
     let total = 0;
     let completed = 0;
+    let processedUnits = 0;
     let transferStarted = false;
+    let importSessionId = '';
+    let importKeepaliveTimer = null;
+    const summary = { imported: 0, rejected: 0, disabledForPermission: 0 };
     try {
-      if (file.size > MAX_IMPORT_BYTES) throw new Error('64 MB보다 작은 JSON 파일만 불러올 수 있습니다.');
-      const parsed = JSON.parse(await file.text());
-      const monitors = importMonitorRecords(parsed);
-      if (!monitors) throw new Error('OpenStill 또는 Reference 내보내기 파일 형식이 아닙니다.');
-      total = monitors.length;
-      beginTransfer('불러오는 중', total);
-      transferStarted = true;
-      if (showsTransferProgress(total)) await yieldToBrowser();
-
-      const summary = { imported: 0, rejected: 0, disabledForPermission: 0 };
-      const chunkSize = transferChunkSize(total);
-      for (let start = 0; start < total; start += chunkSize) {
-        const end = Math.min(start + chunkSize, total);
-        const response = await send({
-          type: 'import-monitors',
-          monitors: monitors.slice(start, end),
-          mode: 'merge',
-          deferFinalization: true
+      for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+        const file = files[fileIndex];
+        const parsingLabel = files.length > 1
+          ? `불러오기 파일 분석 중 (${fileIndex + 1}/${files.length})`
+          : '불러오기 파일 분석 중';
+        updateImportFileProgress(parsingLabel, 0, file.size || 0);
+        const parsed = await parseImportFile(file, (progress) => {
+          if (progress?.type === 'read-progress') {
+            updateImportFileProgress(parsingLabel, progress.loaded || 0, progress.total || file.size || 0);
+          } else if (progress?.type === 'parsing') {
+            updateImportFileProgress(parsingLabel, 0, 0, true);
+          }
         });
-        if (!response?.ok) throw new Error(response?.error || '불러오지 못했습니다.');
-        summary.imported += response.imported || 0;
-        summary.rejected += response.rejected || 0;
-        summary.disabledForPermission += response.disabledForPermission || 0;
-        completed = end;
-        updateTransferProgress('불러오는 중', completed, total);
-        if (end < total && showsTransferProgress(total)) await yieldToBrowser();
+        const importedPayload = importMonitorPayload(parsed);
+        if (!importedPayload) {
+          throw new Error(`“${file.name || '선택한 파일'}”은(는) OpenStill 또는 Reference 내보내기 파일 형식이 아닙니다.`);
+        }
+        updateImportFileProgress('불러오기 데이터 준비 중', 0, 0, true);
+        const splitPayload = await splitLargeImportMonitors(importedPayload.monitors, fileIndex);
+        const monitors = splitPayload.monitors;
+        const fragments = [...importedPayload.fragments, ...splitPayload.fragments];
+        if (!importSessionId) {
+          const started = await send({ type: 'start-import-session', mode: 'merge' });
+          if (!started?.ok || !started.id) {
+            throw new Error(started?.error || '불러오기 작업을 준비하지 못했습니다.');
+          }
+          importSessionId = started.id;
+          importKeepaliveTimer = window.setInterval(() => {
+            if (!importSessionId) return;
+            void send({ type: 'touch-import-session', id: importSessionId }).catch(() => undefined);
+          }, 20_000);
+        }
+        const fileTotal = monitors.length + fragments.length;
+        total = processedUnits + fileTotal;
+        completed = processedUnits;
+        const label = files.length > 1
+          ? `불러오는 중 (${fileIndex + 1}/${files.length})`
+          : '불러오는 중';
+        beginTransfer(label, total, completed);
+        transferStarted = true;
+        if (showsTransferProgress(total)) await yieldToBrowser();
+        const chunkSize = transferChunkSize(total);
+
+        for (let start = 0; start < monitors.length;) {
+          const chunk = nextImportChunk(monitors, start, chunkSize);
+          const { end } = chunk;
+          const response = await send({
+            type: 'append-import-session',
+            id: importSessionId,
+            monitors: chunk.monitors,
+          });
+          if (!response?.ok) throw new Error(response?.error || '불러오지 못했습니다.');
+          completed = processedUnits + end;
+          updateTransferProgress(label, completed, total);
+          if (end < monitors.length && showsTransferProgress(total)) await yieldToBrowser();
+          start = end;
+        }
+        for (let start = 0; start < fragments.length;) {
+          const chunk = nextImportChunk(fragments, start, chunkSize);
+          const { end } = chunk;
+          const response = await send({
+            type: 'append-import-fragments',
+            id: importSessionId,
+            fragments: chunk.monitors,
+          });
+          if (!response?.ok) throw new Error(response?.error || '큰 추적 데이터를 불러오지 못했습니다.');
+          completed = processedUnits + monitors.length + end;
+          updateTransferProgress(label, completed, total);
+          if (end < fragments.length && showsTransferProgress(total)) await yieldToBrowser();
+          start = end;
+        }
+        processedUnits += fileTotal;
+        completed = processedUnits;
+        total = processedUnits;
       }
-      if (total) {
-        const finalized = await send({ type: 'finalize-import' });
+      if (importSessionId) {
+        const finalized = await send({ type: 'finish-import-session', id: importSessionId });
         if (!finalized?.ok) throw new Error(finalized?.error || '불러온 추적을 준비하지 못했습니다.');
+        summary.imported = finalized.imported || 0;
+        summary.rejected = finalized.rejected || 0;
+        summary.disabledForPermission = finalized.disabledForPermission || 0;
+        importSessionId = '';
       }
-      finishTransfer('불러오기 완료', total, total);
+      finishTransfer('불러오기 완료', completed, total);
       transferStarted = false;
-      showToast(`${summary.imported}개를 불러왔습니다.${summary.rejected ? ` ${summary.rejected}개는 유효하지 않거나 최대 3,000개 제한을 넘어 제외했습니다.` : ''}${summary.disabledForPermission ? ` ${summary.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}`);
-      await refresh();
+      showToast(`${summary.imported}개를 불러왔습니다.${summary.rejected ? ` ${summary.rejected}개는 유효하지 않거나 최대 5,000개 제한을 넘어 제외했습니다.` : ''}${summary.disabledForPermission ? ` ${summary.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}`);
+      queueDashboardRefresh();
     } catch (error) {
+      if (importSessionId) await send({ type: 'abort-import-session', id: importSessionId }).catch(() => undefined);
       if (transferStarted) finishTransfer('불러오기 실패', completed, total);
-      else transferRunning = false;
+      else finishTransfer('불러오기 실패', 0, 0);
       showToast(error.message || '불러오지 못했습니다.');
     } finally {
+      if (importKeepaliveTimer !== null) window.clearInterval(importKeepaliveTimer);
       elements.importInput.value = '';
     }
   }
@@ -2416,30 +2930,30 @@
     if (!input || batchActionRunning) return;
     if (input.checked) selectedMonitorIds.add(input.dataset.selectMonitor);
     else selectedMonitorIds.delete(input.dataset.selectMonitor);
-    renderMonitors();
+    void renderMonitorList();
   });
   elements.labelList.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-label]');
     if (!button) return;
     filters.label = button.dataset.label;
-    render();
+    void render();
   });
   elements.searchInput.addEventListener('input', () => {
     filters.query = elements.searchInput.value;
     if (searchRenderTimer !== null) clearTimeout(searchRenderTimer);
     searchRenderTimer = setTimeout(() => {
       searchRenderTimer = null;
-      renderMonitors();
+      void renderMonitorList();
     }, SEARCH_RENDER_DEBOUNCE_MS);
   });
-  elements.statusFilter.addEventListener('change', () => { filters.status = elements.statusFilter.value; renderMonitors(); });
+  elements.statusFilter.addEventListener('change', () => { filters.status = elements.statusFilter.value; void renderMonitorList(); });
   elements.selectVisible.addEventListener('change', () => setVisibleSelection(elements.selectVisible.checked));
   elements.invertSelection.addEventListener('click', invertVisibleSelection);
   elements.clearSelection.addEventListener('click', () => {
     if (batchActionRunning) return;
     selectedMonitorIds.clear();
     elements.bulkStatus.textContent = '';
-    renderMonitors();
+    void renderMonitorList();
   });
   elements.checkSelected.addEventListener('click', () => void actionCheckSelected());
   elements.addLabelSelected.addEventListener('click', () => void actionUpdateSelectedLabels('add'));
@@ -2452,7 +2966,7 @@
   elements.batchUrlButton.addEventListener('click', openBatchUrlDialog);
   elements.exportButton.addEventListener('click', () => void exportMonitors());
   elements.importButton.addEventListener('click', () => elements.importInput.click());
-  elements.importInput.addEventListener('change', () => void importMonitors(elements.importInput.files?.[0]));
+  elements.importInput.addEventListener('change', () => void importMonitors(elements.importInput.files));
   installAdvancedScheduleControls();
   elements.editDays.addEventListener('change', syncIntervalSecondsFromFriendlyInputs);
   elements.editHours.addEventListener('change', syncIntervalSecondsFromFriendlyInputs);
@@ -2485,14 +2999,38 @@
     const button = event.target.closest('button[data-history-index]');
     if (button) renderHistoryEntry(Number(button.dataset.historyIndex));
   });
+  if (chrome.downloads?.onChanged) {
+    chrome.downloads.onChanged.addListener((delta) => {
+      if (!delta.state || !['complete', 'interrupted'].includes(delta.state.current)) return;
+      settleExportDownload(delta.id, delta.state.current);
+    });
+  }
 
-  let refreshQueued = false;
-  chrome.storage.onChanged.addListener(() => {
-    if (!refreshQueued) {
-      refreshQueued = true;
-      setTimeout(() => { refreshQueued = false; void refresh(); }, 100);
+  function queueDashboardRefresh() {
+    if (transferRunning || dashboardLoading) {
+      refreshPending = true;
+      return;
     }
-  });
+    if (refreshQueued) return;
+    refreshQueued = true;
+    refreshQueueTimer = setTimeout(() => {
+      refreshQueueTimer = null;
+      refreshQueued = false;
+      if (transferRunning || dashboardLoading) {
+        refreshPending = true;
+        return;
+      }
+      void refresh();
+    }, 100);
+  }
+
+  function flushQueuedDashboardRefresh() {
+    if (!refreshPending || transferRunning || dashboardLoading) return;
+    refreshPending = false;
+    queueDashboardRefresh();
+  }
+
+  chrome.storage.onChanged.addListener(queueDashboardRefresh);
 
   populateIntervalSelects();
   void refresh().catch((error) => showToast(error.message || '데이터를 불러오지 못했습니다.'));

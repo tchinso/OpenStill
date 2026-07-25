@@ -21,6 +21,7 @@ OpenStill은 사용자가 지정한 웹페이지와 typed locator(CSS, XCSS, XPa
 | `offscreen` | 선택자 문법 검증과 알림음 | 서비스 워커에서 지원하지 않는 DOM 검증과 로컬 오디오 재생을 처리합니다. |
 | `webNavigation` | 저장된 iframe locator의 frame ID 확인 | 사용자가 선택한 하위 프레임에만 해당 locator를 실행하고, 새로고침 후에도 URL 기반 frame 경로로 다시 찾아 접근 불가 프레임을 변경으로 오인하지 않기 위해 필요합니다. |
 | `tabs` | 사용자가 요청한 실시간 감시 연결 | 사용자가 이미 열어 둔 저장 URL 탭만 찾아 MutationObserver 기반 감시를 연결합니다. 관련 없는 탭의 콘텐츠를 읽지 않습니다. |
+| `downloads` | 사용자가 요청한 분할 JSON 백업 저장 | 내보내기 버튼을 눌렀을 때만 각 JSON 파일을 저장하고, 그 확장이 만든 파일의 완료·실패 상태만 확인합니다. 기존 다운로드 목록은 조회·저장하지 않습니다. |
 | required HTTP/HTTPS host permissions (`http://*/*`, `https://*/*`) | 수백 개 임의 도메인의 가져오기·예약 확인 | 사용자가 가져오거나 저장한 URL을 도메인별 추가 권한 대화상자 없이 예약 실행하기 위해 필요합니다. |
 
 ## 광범위 호스트 권한 사유
@@ -41,7 +42,8 @@ OpenStill은 사용자가 선택한 수백 개의 임의 도메인 추적을 가
 
 ## 요청하지 않는 항목과 구현 제한
 
-- `cookies`, `history`, `webRequest`, `downloads`, `contextMenus`, 정적 content script
+- `cookies`, `history`, `webRequest`, `contextMenus`, 정적 content script
+- 기존 다운로드 목록의 조회·저장(`downloads`는 사용자가 요청한 백업 파일 저장과 해당 파일 상태 확인에만 사용)
 - 원격 호스팅 JavaScript/Wasm, `eval`, 원격에서 받은 코드의 실행
 - 로그인·페이월·CAPTCHA 우회, 자동 사이트 발견, 관련 없는 탭의 검사
 
