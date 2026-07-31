@@ -34,7 +34,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .summary-number.warning { color: var(--orange); }
 .summary-number.muted { color: #b9c8da; }
 .summary-label { color: var(--muted); font-size: clamp(15px, 1.7vw, 22px); font-weight: 700; letter-spacing: -.04em; white-space: nowrap; }
-.toolbar { display: grid; grid-template-columns: minmax(220px, 360px) 170px 1fr; align-items: center; gap: 11px; margin-bottom: 16px; }
+.toolbar { display: grid; grid-template-columns: minmax(220px, 360px) 150px 170px 110px 1fr; align-items: center; gap: 11px; margin-bottom: 16px; }
 .search { display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid #334963; border-radius: 9px; background: #152132; color: #89a1bc; }
 .search input { width: 100%; padding: 9px 0; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 12px; }
 select, input:not([type="checkbox"]):not([type="file"]), textarea { border: 1px solid #3b506b; border-radius: 8px; outline: 0; color: var(--text); background: #111c2b; }

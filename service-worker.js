@@ -4981,6 +4981,24 @@ function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) 
   };
 }
 
+function moveMonitorToSiteHost(monitor, url, timestamp) {
+  // A host migration changes only where the existing monitor is fetched. Its
+  // baseline, change snapshots, run log, read state, and timestamps remain the
+  // user's historical record and must continue into the next comparison.
+  return {
+    ...monitor,
+    revision: createRevision(),
+    url,
+    locators: monitor.locators.map((locator) => ({
+      ...locator,
+      framePath: locator.framePath.map((part) => ({ ...part })),
+      fields: locator.fields.map((field) => ({ ...field }))
+    })),
+    selectors: [...monitor.selectors],
+    updatedAt: timestamp
+  };
+}
+
 async function reusePageUrl(message, { copy = false } = {}) {
   const sourceUrl = normalizeUrl(message.sourceUrl);
   const targetUrl = normalizeUrl(message.targetUrl);
@@ -5103,7 +5121,7 @@ async function replaceSiteHost(message) {
     for (let index = 0; index < monitors.length; index += 1) {
       const replacement = replacementsById.get(monitors[index].id);
       if (replacement) {
-        monitors[index] = resetMonitorForPageUrl(monitors[index], replacement.targetUrl, timestamp);
+        monitors[index] = moveMonitorToSiteHost(monitors[index], replacement.targetUrl, timestamp);
       }
     }
     return {

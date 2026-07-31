@@ -17,6 +17,10 @@
   const SEARCH_RENDER_DEBOUNCE_MS = 150;
   const state = { monitors: [], settings: { soundEnabled: true } };
   const filters = { label: '', status: 'all', query: '' };
+  const sorting = { field: 'lastViewedAt', direction: 'desc' };
+  const SORT_FIELDS = new Set(['lastViewedAt', 'lastCheckedAt', 'lastChangedAt', 'name']);
+  const SORT_DIRECTIONS = new Set(['asc', 'desc']);
+  const SORT_PREFERENCE_KEY = 'openstill-dashboard-sort';
   const selectedMonitorIds = new Set();
   let toastTimer;
   let transferProgressTimer;
@@ -44,6 +48,8 @@
     transferProgressValue: document.querySelector('#transferProgressValue'),
     searchInput: document.querySelector('#searchInput'),
     statusFilter: document.querySelector('#statusFilter'),
+    sortField: document.querySelector('#sortField'),
+    sortDirection: document.querySelector('#sortDirection'),
     selectVisible: document.querySelector('#selectVisible'),
     selectedCount: document.querySelector('#selectedCount'),
     checkSelected: document.querySelector('#checkSelected'),
@@ -121,6 +127,16 @@
     historyCurrentSnapshot: document.querySelector('#historyCurrentSnapshot'),
     toast: document.querySelector('#toast')
   };
+
+  try {
+    const savedSorting = JSON.parse(localStorage.getItem(SORT_PREFERENCE_KEY) || 'null');
+    if (SORT_FIELDS.has(savedSorting?.field)) sorting.field = savedSorting.field;
+    if (SORT_DIRECTIONS.has(savedSorting?.direction)) sorting.direction = savedSorting.direction;
+  } catch {
+    // A corrupt or unavailable preference must never prevent the dashboard from loading.
+  }
+  elements.sortField.value = sorting.field;
+  elements.sortDirection.value = sorting.direction;
 
   function installAdvancedScheduleControls() {
     const mode = elements.editScheduleMode;
@@ -338,10 +354,6 @@
     return new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium', timeStyle: 'short' }).format(timestamp);
   }
 
-  function timestampOf(monitor) {
-    return Date.parse(monitor.lastChangedAt ?? monitor.lastReviewAt ?? monitor.updatedAt ?? 0) || 0;
-  }
-
   function hostname(url) {
     try { return new URL(url).hostname; } catch { return url; }
   }
@@ -431,9 +443,30 @@
   }
 
   function compareMonitors(left, right) {
-    if (left.unread !== right.unread) return left.unread ? -1 : 1;
-    if (needsAttention(left) !== needsAttention(right)) return needsAttention(left) ? -1 : 1;
-    return timestampOf(right) - timestampOf(left);
+    const direction = sorting.direction === 'asc' ? 1 : -1;
+    let compared = 0;
+    if (sorting.field === 'name') {
+      compared = String(left.name ?? '').localeCompare(String(right.name ?? ''), 'ko-KR', {
+        numeric: true,
+        sensitivity: 'base'
+      });
+    } else {
+      const leftTimestamp = Date.parse(left[sorting.field] ?? '');
+      const rightTimestamp = Date.parse(right[sorting.field] ?? '');
+      const leftExists = Number.isFinite(leftTimestamp);
+      const rightExists = Number.isFinite(rightTimestamp);
+      // "아직 없음" records remain at the bottom in both directions so that
+      // choosing ascending order does not bury real activity below empty data.
+      if (leftExists !== rightExists) return leftExists ? -1 : 1;
+      if (leftExists) compared = leftTimestamp - rightTimestamp;
+    }
+    if (compared) return compared * direction;
+    const byName = String(left.name ?? '').localeCompare(String(right.name ?? ''), 'ko-KR', {
+      numeric: true,
+      sensitivity: 'base'
+    });
+    if (byName) return byName;
+    return String(left.id ?? '').localeCompare(String(right.id ?? ''));
   }
 
   function monitorMatchesFilters(monitor) {
@@ -468,40 +501,40 @@
       page.monitors.push(monitor);
     }
 
-    return [...sites.values()]
-      .map((site) => ({
-        ...site,
-        pages: [...site.pagesByUrl.values()].sort((left, right) => {
-          const leftTime = Math.max(...left.monitors.map(timestampOf));
-          const rightTime = Math.max(...right.monitors.map(timestampOf));
-          return rightTime - leftTime;
-        })
-      }))
-      .sort((left, right) => {
-        const leftUnread = left.allMonitors.some((monitor) => monitor.unread);
-        const rightUnread = right.allMonitors.some((monitor) => monitor.unread);
-        if (leftUnread !== rightUnread) return leftUnread ? -1 : 1;
-        const leftAttention = left.allMonitors.some(needsAttention);
-        const rightAttention = right.allMonitors.some(needsAttention);
-        if (leftAttention !== rightAttention) return leftAttention ? -1 : 1;
-        const leftTime = Math.max(...left.allMonitors.map(timestampOf));
-        const rightTime = Math.max(...right.allMonitors.map(timestampOf));
-        return rightTime - leftTime;
-      });
+    return [...sites.values()].map((site) => ({
+      ...site,
+      pages: [...site.pagesByUrl.values()]
+    }));
   }
 
   function getFilteredSiteGroups() {
     return groupMonitorsBySite(state.monitors)
       .map((site) => {
         const pages = site.pages
-          .map((page) => ({
-            ...page,
-            visibleMonitors: page.monitors.filter(monitorMatchesFilters).sort(compareMonitors)
-          }))
-          .filter((page) => page.visibleMonitors.length);
-        return { ...site, pages };
+          .map((page) => {
+            const visibleMonitors = page.monitors.filter(monitorMatchesFilters).sort(compareMonitors);
+            return {
+              ...page,
+              visibleMonitors,
+              sortMonitor: visibleMonitors[0] ?? null
+            };
+          })
+          .filter((page) => page.visibleMonitors.length)
+          .sort((left, right) => (
+            compareMonitors(left.sortMonitor, right.sortMonitor)
+            || left.url.localeCompare(right.url)
+          ));
+        return {
+          ...site,
+          pages,
+          sortMonitor: pages[0]?.sortMonitor ?? null
+        };
       })
-      .filter((site) => site.pages.length);
+      .filter((site) => site.pages.length)
+      .sort((left, right) => (
+        compareMonitors(left.sortMonitor, right.sortMonitor)
+        || left.origin.localeCompare(right.origin)
+      ));
   }
 
   function visibleMonitorIds(sites = getFilteredSiteGroups()) {
@@ -646,6 +679,7 @@
     const rows = [
       ['선택', `${selectorsOf(monitor).length}개`],
       ['확인 방식', formatSchedule(monitor)],
+      ['마지막 읽음', formatDate(monitor.lastViewedAt)],
       ['마지막 확인', formatDate(monitor.lastCheckedAt)],
       ['마지막 변경', formatDate(monitor.lastChangedAt)]
     ];
@@ -1375,7 +1409,7 @@
         return;
       }
       elements.batchUrlDialog.close();
-      showToast(`${response.count}개 추적 페이지의 사이트 주소를 변경했습니다. 다음 확인에서 새 기준값을 저장합니다.`);
+      showToast(`${response.count}개 추적 페이지의 사이트 주소를 변경했습니다. 기존 기록을 유지한 채 다음 결과를 비교합니다.`);
       await refresh();
     } catch (error) {
       elements.batchUrlMessage.textContent = error.message || '주소를 일괄 변경하지 못했습니다.';
@@ -1659,17 +1693,40 @@
   function snapshotNodeSimilarity(before, after) {
     if (!before || !after || before.type !== after.type) return 0;
     if (snapshotFingerprint(before) === snapshotFingerprint(after)) return 12;
-    if (before.type === 'text') return 0.25 + wordOverlap(before.text, after.text) * 3;
-    if (before.type === 'code') return 0.5 + wordOverlap(before.text, after.text) * 3;
-    if (before.type === 'comment') return 0.5 + wordOverlap(before.text, after.text) * 3;
+    if (before.type === 'text' || before.type === 'code' || before.type === 'comment') {
+      const overlap = wordOverlap(before.text, after.text);
+      return overlap ? 0.5 + overlap * 4 : 0;
+    }
     if (before.type === 'resource') return before.resource === after.resource ? 1 : 0;
     if (before.type === 'root' || before.type === 'template') {
       return 1.5 + wordOverlap(visibleSnapshotText(before), visibleSnapshotText(after)) * 2;
     }
     if (before.tagName !== after.tagName) return 0;
-    let score = 1.5 + wordOverlap(visibleSnapshotText(before), visibleSnapshotText(after)) * 2;
-    if (before.attributes.href && before.attributes.href === after.attributes.href) score += 1;
+    const beforeText = visibleSnapshotText(before);
+    const afterText = visibleSnapshotText(after);
+    const overlap = wordOverlap(beforeText, afterText);
+    const sharedLink = Boolean(
+      (before.attributes.href && before.attributes.href === after.attributes.href)
+      || (before.attributes.src && before.attributes.src === after.attributes.src)
+    );
+    // Repeated rows must be aligned by their content rather than merely by a
+    // shared tag name. Otherwise inserting E before A/B/C pairs every old row
+    // with its new positional neighbour and paints the entire list as changed.
+    if (beforeText && afterText && beforeText === afterText) return 10 + (sharedLink ? 1 : 0);
+    if (!beforeText && !afterText) return 1.5 + (sharedLink ? 1 : 0);
+    if (!overlap && !sharedLink) return 0;
+    let score = 1.5 + overlap * 4;
+    if (sharedLink) score += 2;
     return score;
+  }
+
+  function sameSnapshotAlignmentAnchor(before, after) {
+    if (!before || !after || before.type !== after.type) return false;
+    if (snapshotFingerprint(before) === snapshotFingerprint(after)) return true;
+    if (before.type === 'element' && before.tagName !== after.tagName) return false;
+    const beforeText = visibleSnapshotText(before);
+    const afterText = visibleSnapshotText(after);
+    return Boolean(beforeText && beforeText === afterText);
   }
 
   function greedySnapshotAlignment(beforeChildren, afterChildren) {
@@ -1681,16 +1738,16 @@
     while (beforeIndex < beforeChildren.length && afterIndex < afterChildren.length) {
       const before = beforeChildren[beforeIndex];
       const after = afterChildren[afterIndex];
-      if (snapshotFingerprint(before) === snapshotFingerprint(after) || snapshotNodeSimilarity(before, after) >= 1) {
+      if (sameSnapshotAlignmentAnchor(before, after) || snapshotNodeSimilarity(before, after) >= 1) {
         operations.push({ type: 'pair', before, after });
         beforeIndex += 1;
         afterIndex += 1;
         continue;
       }
       const matchingAfter = afterChildren.slice(afterIndex + 1, afterIndex + 1 + lookAhead)
-        .findIndex((candidate) => snapshotFingerprint(candidate) === snapshotFingerprint(before));
+        .findIndex((candidate) => sameSnapshotAlignmentAnchor(before, candidate));
       const matchingBefore = beforeChildren.slice(beforeIndex + 1, beforeIndex + 1 + lookAhead)
-        .findIndex((candidate) => snapshotFingerprint(candidate) === snapshotFingerprint(after));
+        .findIndex((candidate) => sameSnapshotAlignmentAnchor(candidate, after));
       if (matchingAfter >= 0 && (matchingBefore < 0 || matchingAfter <= matchingBefore)) {
         operations.push({ type: 'added', after });
         afterIndex += 1;
@@ -1827,6 +1884,28 @@
     return text.match(/\s+|[\p{L}\p{N}_]+|[^\s]/gu) ?? [];
   }
 
+  function buildSnapshotTextDiff(beforeText, afterText) {
+    const hasLineStructure = String(beforeText).includes('\n') || String(afterText).includes('\n');
+    const operations = buildDiffOperations(
+      hasLineStructure ? String(beforeText).split('\n') : tokenize(beforeText),
+      hasLineStructure ? String(afterText).split('\n') : tokenize(afterText),
+      hasLineStructure ? 60_000 : 40_000
+    );
+    const forSide = (excludedType) => {
+      const visible = operations
+        .filter((operation) => operation.type !== excludedType)
+        .map((operation) => ({ ...operation }));
+      if (!hasLineStructure) return visible;
+      visible.forEach((operation) => { operation.value += '\n'; });
+      if (visible.length) visible[visible.length - 1].value = visible[visible.length - 1].value.slice(0, -1);
+      return visible;
+    };
+    return {
+      beforeOperations: forSide('added'),
+      afterOperations: forSide('removed')
+    };
+  }
+
   function stateForSnapshotNode(states, node) {
     let state = states.get(node);
     if (!state) {
@@ -1867,23 +1946,23 @@
     }
     if (before.type === 'text' && after.type === 'text') {
       if (before.text === after.text) return;
-      const operations = buildDiffOperations(tokenize(before.text), tokenize(after.text), 40_000);
-      stateForSnapshotNode(beforeStates, before).textOperations = operations.filter((operation) => operation.type !== 'added');
-      stateForSnapshotNode(afterStates, after).textOperations = operations.filter((operation) => operation.type !== 'removed');
+      const diff = buildSnapshotTextDiff(before.text, after.text);
+      stateForSnapshotNode(beforeStates, before).textOperations = diff.beforeOperations;
+      stateForSnapshotNode(afterStates, after).textOperations = diff.afterOperations;
       return;
     }
     if (before.type === 'code' && after.type === 'code') {
       if (before.text === after.text) return;
-      const operations = buildDiffOperations(tokenize(before.text), tokenize(after.text), 40_000);
-      stateForSnapshotNode(beforeStates, before).textOperations = operations.filter((operation) => operation.type !== 'added');
-      stateForSnapshotNode(afterStates, after).textOperations = operations.filter((operation) => operation.type !== 'removed');
+      const diff = buildSnapshotTextDiff(before.text, after.text);
+      stateForSnapshotNode(beforeStates, before).textOperations = diff.beforeOperations;
+      stateForSnapshotNode(afterStates, after).textOperations = diff.afterOperations;
       return;
     }
     if (before.type === 'comment' && after.type === 'comment') {
       if (before.text === after.text) return;
-      const operations = buildDiffOperations(tokenize(before.text), tokenize(after.text), 40_000);
-      stateForSnapshotNode(beforeStates, before).textOperations = operations.filter((operation) => operation.type !== 'added');
-      stateForSnapshotNode(afterStates, after).textOperations = operations.filter((operation) => operation.type !== 'removed');
+      const diff = buildSnapshotTextDiff(before.text, after.text);
+      stateForSnapshotNode(beforeStates, before).textOperations = diff.beforeOperations;
+      stateForSnapshotNode(afterStates, after).textOperations = diff.afterOperations;
       return;
     }
     if (!canCompareSnapshotContainers(before, after)) {
@@ -2947,6 +3026,18 @@
     }, SEARCH_RENDER_DEBOUNCE_MS);
   });
   elements.statusFilter.addEventListener('change', () => { filters.status = elements.statusFilter.value; void renderMonitorList(); });
+  const updateSorting = () => {
+    sorting.field = SORT_FIELDS.has(elements.sortField.value) ? elements.sortField.value : 'lastViewedAt';
+    sorting.direction = SORT_DIRECTIONS.has(elements.sortDirection.value) ? elements.sortDirection.value : 'desc';
+    try {
+      localStorage.setItem(SORT_PREFERENCE_KEY, JSON.stringify(sorting));
+    } catch {
+      // Sorting remains fully functional for this session without persistence.
+    }
+    void renderMonitorList();
+  };
+  elements.sortField.addEventListener('change', updateSorting);
+  elements.sortDirection.addEventListener('change', updateSorting);
   elements.selectVisible.addEventListener('change', () => setVisibleSelection(elements.selectVisible.checked));
   elements.invertSelection.addEventListener('click', invertVisibleSelection);
   elements.clearSelection.addEventListener('click', () => {
