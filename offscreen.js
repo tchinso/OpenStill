@@ -122,6 +122,19 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === 'validate-locator-list') {
+      const locators = Array.isArray(message.locators) ? message.locators : [];
+      for (const locator of locators) {
+        const result = inspectHtml('', locator?.expr, locator?.type);
+        if (!result.ok) {
+          sendResponse(result);
+          return;
+        }
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (message?.type === 'parse-monitor-html') {
       sendResponse(inspectHtml(message.html, message.selector, message.selectorType));
       return;

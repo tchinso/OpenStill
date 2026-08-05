@@ -1,4 +1,6 @@
 (() => {
+  const backupIntegrity = globalThis.OpenStillBackupIntegrity;
+  if (!backupIntegrity) throw new Error('백업 무결성 모듈을 불러오지 못했습니다.');
   const MIN_HOURS = 1;
   const MAX_HOURS = 14 * 24;
   // Keep a small buffer below the requested 32 MiB split point. It leaves
@@ -6,15 +8,18 @@
   // valid JSON and remains strictly below 32 MiB.
   const EXPORT_FILE_SPLIT_BYTES = 32 * 1024 * 1024;
   const EXPORT_FILE_HEADROOM_BYTES = 64 * 1024;
+  const EXPORT_INTEGRITY_METADATA_RESERVE_BYTES = 1_024;
   const MAX_EXPORT_FILE_BYTES = EXPORT_FILE_SPLIT_BYTES - EXPORT_FILE_HEADROOM_BYTES;
   const MAX_IMPORT_MESSAGE_BYTES = MAX_EXPORT_FILE_BYTES;
   const IMPORT_RECORD_FRAGMENT_CHARS = 3 * 1024 * 1024;
   const BULK_TRANSFER_THRESHOLD = 200;
   const BULK_TRANSFER_CHUNK_SIZE = 100;
+  const TRANSFER_YIELD_BYTE_BUDGET = 4 * 1024 * 1024;
   const DASHBOARD_RENDER_CHUNK_SIZE = 50;
   const SELECTED_CHECK_CHUNK_SIZE = 6;
   const MONITOR_PREVIEW_MAX_CHARS = 800;
   const SEARCH_RENDER_DEBOUNCE_MS = 150;
+  const dateTimeFormatter = new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium', timeStyle: 'short' });
   const state = { monitors: [], settings: { soundEnabled: true } };
   const filters = { label: '', status: 'all', query: '' };
   const sorting = { field: 'lastViewedAt', direction: 'desc' };
@@ -32,6 +37,7 @@
   let activeHistoryEntries = [];
   let activeHistoryUrl = '';
   const exportDownloadUrls = new Map();
+  const importRecordByteLengths = new WeakMap();
   let refreshQueued = false;
   let refreshPending = false;
   let refreshQueueTimer = null;
@@ -351,7 +357,7 @@
   function formatDate(iso) {
     const timestamp = Date.parse(iso ?? '');
     if (!Number.isFinite(timestamp)) return '아직 없음';
-    return new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium', timeStyle: 'short' }).format(timestamp);
+    return dateTimeFormatter.format(timestamp);
   }
 
   function hostname(url) {
@@ -1070,12 +1076,14 @@
     return total >= BULK_TRANSFER_THRESHOLD ? BULK_TRANSFER_CHUNK_SIZE : Math.max(total, 1);
   }
 
-  function nextImportChunk(monitors, start, maxItems = BULK_TRANSFER_CHUNK_SIZE) {
+  async function nextImportChunk(monitors, start, maxItems = BULK_TRANSFER_CHUNK_SIZE) {
     let end = start;
     let byteLength = 256; // Envelope fields added by chrome.runtime.sendMessage.
     while (end < monitors.length && end - start < maxItems) {
-      const record = JSON.stringify(monitors[end]);
-      const recordBytes = utf8ByteLength(record) + (end > start ? 1 : 0);
+      const item = monitors[end];
+      const cachedBytes = item && typeof item === 'object' ? importRecordByteLengths.get(item) : undefined;
+      const recordBytes = (cachedBytes ?? await utf8ByteLengthYielding(JSON.stringify(item)))
+        + (end > start ? 1 : 0);
       if (byteLength + recordBytes > MAX_IMPORT_MESSAGE_BYTES) {
         if (end === start) {
           throw new Error('불러오기 전송 데이터 조각이 32 MB 안전 범위를 넘습니다.');
@@ -1089,7 +1097,46 @@
   }
 
   function yieldToBrowser() {
-    return new Promise((resolve) => window.requestAnimationFrame(() => window.setTimeout(resolve, 0)));
+    return new Promise((resolve) => {
+      let settled = false;
+      let frameId = null;
+      let fallbackId = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (frameId !== null) window.cancelAnimationFrame(frameId);
+        if (fallbackId !== null) window.clearTimeout(fallbackId);
+        resolve();
+      };
+      // requestAnimationFrame may stop entirely in a hidden dashboard tab.
+      // The timer keeps a long import/export moving (and its SW session alive)
+      // when the user switches tabs midway through a backup.
+      fallbackId = window.setTimeout(finish, 100);
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        window.clearTimeout(fallbackId);
+        fallbackId = null;
+        window.setTimeout(finish, 0);
+      });
+    });
+  }
+
+  async function utf8ByteLengthYielding(value, chunkChars = 1024 * 1024) {
+    if (value.length <= chunkChars) return utf8ByteLength(value);
+    let bytes = 0;
+    for (let start = 0; start < value.length;) {
+      let end = Math.min(value.length, start + chunkChars);
+      const last = value.charCodeAt(end - 1);
+      const next = value.charCodeAt(end);
+      if (end < value.length && last >= 0xd800 && last <= 0xdbff
+        && next >= 0xdc00 && next <= 0xdfff) {
+        end = end - start > 1 ? end - 1 : end + 1;
+      }
+      bytes += utf8ByteLength(value.slice(start, end));
+      start = end;
+      if (start < value.length) await yieldToBrowser();
+    }
+    return bytes;
   }
 
   function monitorById(id) {
@@ -2631,7 +2678,15 @@
       fragmentParts: [],
       divider,
       suffix,
-      byteLength: utf8ByteLength(prefix) + utf8ByteLength(divider) + utf8ByteLength(suffix),
+      exportedAt,
+      exportId,
+      partNumber,
+      integrityState: backupIntegrity.createChecksumState(),
+      // The final prefix contains counts, the checksum, and completion
+      // metadata. Reserve more than its maximum practical size so the exact
+      // Blob remains below the same 32 MiB safety boundary.
+      byteLength: utf8ByteLength(prefix) + utf8ByteLength(divider) + utf8ByteLength(suffix)
+        + EXPORT_INTEGRITY_METADATA_RESERVE_BYTES,
       monitorCount: 0,
       fragmentCount: 0
     };
@@ -2641,20 +2696,41 @@
     return part.monitorCount > 0 || part.fragmentCount > 0;
   }
 
-  function canAppendExportPartValue(part, partsKey, countKey, value) {
+  function canAppendExportPartValue(part, countKey, valueBytes) {
     const delimiterBytes = part[countKey] ? 1 : 0;
-    return part.byteLength + delimiterBytes + utf8ByteLength(value) < MAX_EXPORT_FILE_BYTES;
+    return part.byteLength + delimiterBytes + valueBytes < MAX_EXPORT_FILE_BYTES;
   }
 
-  function appendExportPartValue(part, partsKey, countKey, value) {
+  async function appendExportPartValue(part, partsKey, countKey, value, valueBytes) {
     const delimiter = part[countKey] ? ',' : '';
     part[partsKey].push(delimiter, value);
-    part.byteLength += utf8ByteLength(delimiter) + utf8ByteLength(value);
+    part.byteLength += utf8ByteLength(delimiter) + valueBytes;
     part[countKey] += 1;
+    await backupIntegrity.appendSerializedRecordChunked(
+      part.integrityState,
+      partsKey === 'fragmentParts' ? 'fragment' : 'monitor',
+      value,
+      yieldToBrowser
+    );
   }
 
-  function exportPartBlobParts(part) {
-    return [...part.monitorParts, part.divider, ...part.fragmentParts, part.suffix];
+  function exportPartBlobParts(part, finalPart, totalMonitors) {
+    const prefix = `${JSON.stringify({
+      format: 'openstill-export',
+      schemaVersion: 4,
+      exportedAt: part.exportedAt,
+      exportId: part.exportId,
+      part: part.partNumber,
+      integrityRequired: true,
+      integrity: backupIntegrity.createIntegrityMetadata(part.integrityState, {
+        monitorCount: part.monitorCount,
+        fragmentCount: part.fragmentCount,
+        finalPart,
+        totalParts: part.partNumber,
+        totalMonitors
+      })
+    }).slice(0, -1)},"monitors":[`;
+    return [prefix, ...part.monitorParts.slice(1), part.divider, ...part.fragmentParts, part.suffix];
   }
 
   function settleExportDownload(downloadId, state) {
@@ -2688,8 +2764,8 @@
     });
   }
 
-  async function downloadExportPart(part, exportedAt, partNumber) {
-    const blob = new Blob(exportPartBlobParts(part), { type: 'application/json' });
+  async function downloadExportPart(part, exportedAt, partNumber, finalPart, totalMonitors) {
+    const blob = new Blob(exportPartBlobParts(part, finalPart, totalMonitors), { type: 'application/json' });
     if (blob.size >= MAX_EXPORT_FILE_BYTES) {
       throw new Error('내보내기 파일 한도를 넘는 데이터 묶음을 만들었습니다.');
     }
@@ -2749,20 +2825,23 @@
       let part = createExportPart(exportedAt, exportId, partNumber);
       const flushExportPart = async () => {
         if (!hasExportPartData(part)) return;
-        await downloadExportPart(part, exportedAt, partNumber);
+        await downloadExportPart(part, exportedAt, partNumber, false, total);
         partNumber += 1;
         part = createExportPart(exportedAt, exportId, partNumber);
       };
       const appendExportPartValueSafely = async (partsKey, countKey, value) => {
-        if (!canAppendExportPartValue(part, partsKey, countKey, value) && hasExportPartData(part)) {
+        const valueBytes = await utf8ByteLengthYielding(value);
+        if (!canAppendExportPartValue(part, countKey, valueBytes) && hasExportPartData(part)) {
           await flushExportPart();
         }
-        if (!canAppendExportPartValue(part, partsKey, countKey, value)) {
+        if (!canAppendExportPartValue(part, countKey, valueBytes)) {
           throw new Error('내보낼 데이터 조각이 32 MB 파일 분할 기준을 넘습니다.');
         }
-        appendExportPartValue(part, partsKey, countKey, value);
+        await appendExportPartValue(part, partsKey, countKey, value, valueBytes);
+        return valueBytes;
       };
       const chunkSize = transferChunkSize(total);
+      let bytesSinceYield = 0;
       for (let start = 0; start < total; start += chunkSize) {
         const end = Math.min(start + chunkSize, total);
         for (let index = start; index < end; index += 1) {
@@ -2790,11 +2869,20 @@
                 fragmentCount: response.fragmentCount,
                 payload: fragmentResponse.payload
               });
-              await appendExportPartValueSafely('fragmentParts', 'fragmentCount', fragment);
-              if (showsTransferProgress(total)) await yieldToBrowser();
+              const fragmentBytes = await appendExportPartValueSafely('fragmentParts', 'fragmentCount', fragment);
+              bytesSinceYield += fragmentBytes;
+              if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET) {
+                await yieldToBrowser();
+                bytesSinceYield = 0;
+              }
             }
           } else if (typeof response.record === 'string') {
-            await appendExportPartValueSafely('monitorParts', 'monitorCount', response.record);
+            const recordBytes = await appendExportPartValueSafely('monitorParts', 'monitorCount', response.record);
+            bytesSinceYield += recordBytes;
+            if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET) {
+              await yieldToBrowser();
+              bytesSinceYield = 0;
+            }
           } else {
             throw new Error('내보낼 추적 데이터를 읽지 못했습니다.');
           }
@@ -2803,7 +2891,7 @@
         updateTransferProgress('내보내는 중', completed, total);
         if (end < total && showsTransferProgress(total)) await yieldToBrowser();
       }
-      await downloadExportPart(part, exportedAt, partNumber);
+      await downloadExportPart(part, exportedAt, partNumber, true, total);
       finishTransfer('내보내기 완료', total, total);
       showToast(partNumber > 1
         ? `${partNumber}개의 JSON 파일을 저장했습니다.`
@@ -2844,7 +2932,7 @@
           onProgress?.(message);
         } else if (message?.type === 'parsed') {
           finish();
-          resolve(message.payload);
+          resolve({ payload: message.payload, backupPart: message.backupPart ?? null });
         } else if (message?.type === 'error') {
           finish();
           reject(new Error(message.error || 'JSON 파일을 읽지 못했습니다.'));
@@ -2862,13 +2950,17 @@
     const directMonitors = [];
     const fragments = [];
     const importId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${fileIndex}`;
+    let bytesSinceYield = 0;
     for (let monitorIndex = 0; monitorIndex < monitors.length; monitorIndex += 1) {
       const monitor = monitors[monitorIndex];
       const record = JSON.stringify(monitor);
+      const recordBytes = await utf8ByteLengthYielding(record);
+      if (monitor && typeof monitor === 'object') importRecordByteLengths.set(monitor, recordBytes);
+      bytesSinceYield += recordBytes;
       // Reserve the message envelope as well as the 32 MiB part buffer. A
       // large legacy/Reference record is represented in the same v4 fragment
       // form as a record that crossed the export-file boundary.
-      if (utf8ByteLength(record) + 1_024 < MAX_IMPORT_MESSAGE_BYTES) {
+      if (recordBytes + 1_024 < MAX_IMPORT_MESSAGE_BYTES) {
         directMonitors.push(monitor);
       } else {
         const fragmentCount = Math.ceil(record.length / IMPORT_RECORD_FRAGMENT_CHARS);
@@ -2882,8 +2974,10 @@
           });
         }
       }
-      if (monitors.length >= BULK_TRANSFER_THRESHOLD && (monitorIndex + 1) % BULK_TRANSFER_CHUNK_SIZE === 0) {
+      if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET
+        || (monitors.length >= BULK_TRANSFER_THRESHOLD && (monitorIndex + 1) % BULK_TRANSFER_CHUNK_SIZE === 0)) {
         await yieldToBrowser();
+        bytesSinceYield = 0;
       }
     }
     return { monitors: directMonitors, fragments };
@@ -2903,6 +2997,8 @@
     let transferStarted = false;
     let importSessionId = '';
     let importKeepaliveTimer = null;
+    const backupParts = [];
+    let allFilesVerified = true;
     const summary = { imported: 0, rejected: 0, disabledForPermission: 0 };
     try {
       for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
@@ -2911,17 +3007,23 @@
           ? `불러오기 파일 분석 중 (${fileIndex + 1}/${files.length})`
           : '불러오기 파일 분석 중';
         updateImportFileProgress(parsingLabel, 0, file.size || 0);
-        const parsed = await parseImportFile(file, (progress) => {
+        const parsedFile = await parseImportFile(file, (progress) => {
           if (progress?.type === 'read-progress') {
             updateImportFileProgress(parsingLabel, progress.loaded || 0, progress.total || file.size || 0);
           } else if (progress?.type === 'parsing') {
             updateImportFileProgress(parsingLabel, 0, 0, true);
           }
         });
+        const parsed = parsedFile.payload;
         const importedPayload = importMonitorPayload(parsed);
         if (!importedPayload) {
           throw new Error(`“${file.name || '선택한 파일'}”은(는) OpenStill 또는 Reference 내보내기 파일 형식이 아닙니다.`);
         }
+        const backupPart = parsedFile.backupPart
+          ? { ...parsedFile.backupPart, sourceName: file.name || `part ${fileIndex + 1}` }
+          : null;
+        if (backupPart) backupParts.push(backupPart);
+        if (!backupPart?.verified) allFilesVerified = false;
         updateImportFileProgress('불러오기 데이터 준비 중', 0, 0, true);
         const splitPayload = await splitLargeImportMonitors(importedPayload.monitors, fileIndex);
         const monitors = splitPayload.monitors;
@@ -2949,7 +3051,7 @@
         const chunkSize = transferChunkSize(total);
 
         for (let start = 0; start < monitors.length;) {
-          const chunk = nextImportChunk(monitors, start, chunkSize);
+          const chunk = await nextImportChunk(monitors, start, chunkSize);
           const { end } = chunk;
           const response = await send({
             type: 'append-import-session',
@@ -2963,7 +3065,7 @@
           start = end;
         }
         for (let start = 0; start < fragments.length;) {
-          const chunk = nextImportChunk(fragments, start, chunkSize);
+          const chunk = await nextImportChunk(fragments, start, chunkSize);
           const { end } = chunk;
           const response = await send({
             type: 'append-import-fragments',
@@ -2980,8 +3082,19 @@
         completed = processedUnits;
         total = processedUnits;
       }
+      const selectionValidation = backupIntegrity.validateBackupPartSelection(backupParts, {
+        totalFiles: files.length
+      });
+      if (!selectionValidation.ok) {
+        throw new Error(selectionValidation.error || '백업 part 구성을 확인하지 못했습니다.');
+      }
+      let finalized = null;
       if (importSessionId) {
-        const finalized = await send({ type: 'finish-import-session', id: importSessionId });
+        finalized = await send({
+          type: 'finish-import-session',
+          id: importSessionId,
+          requireAllValid: allFilesVerified
+        });
         if (!finalized?.ok) throw new Error(finalized?.error || '불러온 추적을 준비하지 못했습니다.');
         summary.imported = finalized.imported || 0;
         summary.rejected = finalized.rejected || 0;
@@ -2990,7 +3103,7 @@
       }
       finishTransfer('불러오기 완료', completed, total);
       transferStarted = false;
-      showToast(`${summary.imported}개를 불러왔습니다.${summary.rejected ? ` ${summary.rejected}개는 유효하지 않거나 최대 5,000개 제한을 넘어 제외했습니다.` : ''}${summary.disabledForPermission ? ` ${summary.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}`);
+      showToast(`${summary.imported}개를 불러왔습니다.${summary.rejected ? ` ${summary.rejected}개는 유효하지 않거나 최대 5,000개 제한을 넘어 제외했습니다.` : ''}${summary.disabledForPermission ? ` ${summary.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}${finalized?.finalizationWarnings ? ' 데이터 저장은 완료됐으며, 후속 상태 갱신은 다음 실행 때 다시 처리됩니다.' : ''}`);
       queueDashboardRefresh();
     } catch (error) {
       if (importSessionId) await send({ type: 'abort-import-session', id: importSessionId }).catch(() => undefined);

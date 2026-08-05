@@ -1,6 +1,5 @@
 /References
 /dist
-/tests
 *.sqlite3
 *-wal
 *-shm

@@ -50,6 +50,7 @@ const MAX_BATCH_CHECKS = 1_000;
 const MAX_CONCURRENT_BATCH_CHECKS = 3;
 const DASHBOARD_LOAD_PAGE_SIZE = 100;
 const MAX_DASHBOARD_LOAD_PAGE_SIZE = 199;
+const MAX_DASHBOARD_LOAD_PAGE_BYTES = 8 * 1024 * 1024;
 const DASHBOARD_SESSION_TTL_MS = 2 * 60 * 1000;
 const IMPORT_SESSION_TTL_MS = 5 * 60 * 1000;
 // Export parts reserve 64 KiB below 32 MiB, plus a further 64 KiB for the
@@ -1449,31 +1450,6 @@ async function getState() {
   const rawMonitors = Array.isArray(stored[MONITORS_KEY]) ? stored[MONITORS_KEY] : [];
   const normalizedMonitors = rawMonitors.map(normalizeMonitor);
   const monitors = normalizedMonitors.filter(Boolean);
-  // A pre-descriptor/imported automatic monitor can legitimately have no
-  // durable nextCheckAt. Normalize it once and persist the calculated value.
-  // Without this, every service-worker wake recalculates "now + 1 second",
-  // so a due sweep observes it just before due forever.
-  const needsSchedulePersistence = rawMonitors.some((raw, index) => {
-    const monitor = normalizedMonitors[index];
-    return Boolean(
-      monitor
-      && monitor.enabled
-      && isAutomaticSchedule(monitor)
-      && !asIso(raw?.nextCheckAt, null)
-      && monitor.nextCheckAt
-    );
-  });
-  const needsHistoryPruning = rawMonitors.some((raw, index) => {
-    const monitor = normalizedMonitors[index];
-    return Boolean(
-      monitor
-      && Array.isArray(raw?.history)
-      && raw.history.length > monitor.history.length
-    );
-  });
-  if (needsSchedulePersistence || needsHistoryPruning) {
-    await chrome.storage.local.set({ [MONITORS_KEY]: monitors });
-  }
 
   return {
     monitors,
@@ -1556,9 +1532,16 @@ function getDashboardLoadPage(message) {
   const offset = Math.max(0, Math.floor(Number(message?.offset) || 0));
   const requestedPageSize = Math.floor(Number(message?.pageSize) || DASHBOARD_LOAD_PAGE_SIZE);
   const pageSize = Math.min(MAX_DASHBOARD_LOAD_PAGE_SIZE, Math.max(1, requestedPageSize));
-  const monitors = session.monitors
-    .slice(offset, offset + pageSize)
-    .map(dashboardMonitorSummary);
+  const monitors = [];
+  let responseBytes = 256;
+  const end = Math.min(session.monitors.length, offset + pageSize);
+  for (let index = offset; index < end; index += 1) {
+    const summary = dashboardMonitorSummary(session.monitors[index]);
+    const summaryBytes = utf8ByteLength(JSON.stringify(summary)) + (monitors.length ? 1 : 0);
+    if (monitors.length && responseBytes + summaryBytes > MAX_DASHBOARD_LOAD_PAGE_BYTES) break;
+    monitors.push(summary);
+    responseBytes += summaryBytes;
+  }
   return {
     ok: true,
     monitors,
@@ -1610,7 +1593,7 @@ async function getPopupState() {
 
 async function startExportSession() {
   pruneTransientSessions();
-  const monitors = await getMonitors();
+  const monitors = await readMonitorsForExport();
   const id = createId();
   exportSessions.set(id, {
     monitors,
@@ -1888,10 +1871,6 @@ async function parseMonitoredHtml(html, selector, selectorType = 'css') {
     text: cleanText(result.text),
     capturedAt: nowIso()
   };
-}
-
-async function validateSelectorSyntax(selector, selectorType = 'css') {
-  await parseMonitoredHtml('', selector, selectorType);
 }
 
 function waitForRenderedTab(tabId) {
@@ -4560,9 +4539,16 @@ function pickerItemsFromMessage(message, defaultFrameId = 0) {
 }
 
 async function validateLocatorList(locators) {
-  for (const locator of locators) {
-    await validateSelectorSyntax(locator.expr, locator.type);
-  }
+  await ensureOffscreenDocument();
+  const result = await timeout(
+    chrome.runtime.sendMessage({
+      type: 'validate-locator-list',
+      locators: locators.map((locator) => ({ expr: locator.expr, type: locator.type }))
+    }),
+    PARSE_TIMEOUT_MS,
+    '선택자 목록을 분석하는 데 시간이 너무 오래 걸렸습니다.'
+  );
+  if (!result?.ok) throw new Error(result?.error || '선택자 분석 결과를 받지 못했습니다.');
 }
 
 async function createMonitors(message, sender) {
@@ -4981,6 +4967,53 @@ function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) 
   };
 }
 
+function readMonitorsForExport() {
+  // Make snapshot acquisition part of the same queue as writes. The exported
+  // array is therefore wholly before or wholly after an overlapping mutation,
+  // never a stale normalization write racing a newer commit.
+  const operation = storageQueue.catch(() => undefined).then(() => getMonitors());
+  storageQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+function persistNormalizedMonitorRepairs() {
+  const operation = storageQueue.catch(() => undefined).then(async () => {
+    const stored = await chrome.storage.local.get(MONITORS_KEY);
+    const rawMonitors = Array.isArray(stored[MONITORS_KEY]) ? stored[MONITORS_KEY] : [];
+    const normalizedMonitors = rawMonitors.map(normalizeMonitor);
+    const monitors = normalizedMonitors.filter(Boolean);
+    // A pre-descriptor/imported automatic monitor can legitimately have no
+    // durable nextCheckAt. Normalize it once in the write queue so a concurrent
+    // import or edit cannot be overwritten by an older read snapshot.
+    const needsSchedulePersistence = rawMonitors.some((raw, index) => {
+      const monitor = normalizedMonitors[index];
+      return Boolean(
+        monitor
+        && monitor.enabled
+        && isAutomaticSchedule(monitor)
+        && !asIso(raw?.nextCheckAt, null)
+        && monitor.nextCheckAt
+      );
+    });
+    const needsHistoryPruning = rawMonitors.some((raw, index) => {
+      const monitor = normalizedMonitors[index];
+      return Boolean(
+        monitor
+        && Array.isArray(raw?.history)
+        && raw.history.length > monitor.history.length
+      );
+    });
+    if (needsSchedulePersistence || needsHistoryPruning) {
+      await chrome.storage.local.set({ [MONITORS_KEY]: monitors });
+      return true;
+    }
+    return false;
+  });
+
+  storageQueue = operation.catch(() => undefined);
+  return operation;
+}
+
 function moveMonitorToSiteHost(monitor, url, timestamp) {
   // A host migration changes only where the existing monitor is fetched. Its
   // baseline, change snapshots, run log, read state, and timestamps remain the
@@ -5228,6 +5261,8 @@ async function startImportSession(message) {
     fragmentRecords: new Map(),
     discardedFragmentRecordIds: new Set(),
     rejected: 0,
+    invalidRejected: 0,
+    capacityRejected: 0,
     disabledForPermission: 0,
     expiresAt: Date.now() + IMPORT_SESSION_TTL_MS
   });
@@ -5238,17 +5273,20 @@ async function prepareImportSessionMonitor(session, raw) {
   const result = { prepared: 0, rejected: 0, disabledForPermission: 0 };
   if (session.sourceCount >= MAX_MONITORS) {
     session.rejected += 1;
+    session.capacityRejected += 1;
     result.rejected = 1;
     return result;
   }
   session.sourceCount += 1;
   if (session.prepared.length >= session.remainingCapacity) {
     session.rejected += 1;
+    session.capacityRejected += 1;
     result.rejected = 1;
     return result;
   }
   if (!raw || typeof raw !== 'object') {
     session.rejected += 1;
+    session.invalidRejected += 1;
     result.rejected = 1;
     return result;
   }
@@ -5256,6 +5294,7 @@ async function prepareImportSessionMonitor(session, raw) {
   const monitor = normalizeMonitor(raw);
   if (!monitor) {
     session.rejected += 1;
+    session.invalidRejected += 1;
     result.rejected = 1;
     return result;
   }
@@ -5263,6 +5302,7 @@ async function prepareImportSessionMonitor(session, raw) {
     await validateLocatorList(monitor.locators);
   } catch {
     session.rejected += 1;
+    session.invalidRejected += 1;
     result.rejected = 1;
     return result;
   }
@@ -5325,6 +5365,7 @@ function appendImportFragments(message) {
   const sourceFragments = Array.isArray(message?.fragments) ? message.fragments : [];
   if (session.prepared.length >= session.remainingCapacity) {
     session.rejected += sourceFragments.length;
+    session.capacityRejected += sourceFragments.length;
     session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
     return { ok: true, received: 0, rejected: sourceFragments.length };
   }
@@ -5335,6 +5376,7 @@ function appendImportFragments(message) {
     const fragment = normalizedImportFragment(raw);
     if (!fragment) {
       session.rejected += 1;
+      session.invalidRejected += 1;
       rejected += 1;
       continue;
     }
@@ -5344,6 +5386,7 @@ function appendImportFragments(message) {
         if (!session.discardedFragmentRecordIds.has(fragment.recordId)) {
           session.discardedFragmentRecordIds.add(fragment.recordId);
           session.rejected += 1;
+          session.capacityRejected += 1;
           rejected += 1;
         }
         continue;
@@ -5383,6 +5426,7 @@ async function prepareFragmentedImportRecords(session) {
     session.fragmentRecords.delete(recordId);
     if (record.invalid || record.pieces.size !== record.fragmentCount) {
       session.rejected += 1;
+      session.invalidRejected += 1;
       continue;
     }
     const pieces = [];
@@ -5397,12 +5441,14 @@ async function prepareFragmentedImportRecords(session) {
     }
     if (!complete) {
       session.rejected += 1;
+      session.invalidRejected += 1;
       continue;
     }
     try {
       await prepareImportSessionMonitor(session, JSON.parse(pieces.join('')));
     } catch {
       session.rejected += 1;
+      session.invalidRejected += 1;
     }
   }
   session.fragmentRecords.clear();
@@ -5418,7 +5464,21 @@ async function finishImportSession(message) {
   try {
     await prepareFragmentedImportRecords(session);
     let rejected = session.rejected;
+    if (message?.requireAllValid && (session.invalidRejected > 0 || session.capacityRejected > 0)) {
+      const reason = session.invalidRejected > 0
+        ? `손상되거나 유효하지 않은 추적 ${session.invalidRejected}개를 발견했습니다.`
+        : '현재 저장된 추적과 합치면 최대 5,000개 한도를 넘습니다.';
+      return {
+        ok: false,
+        reason: session.invalidRejected > 0 ? 'invalid-backup' : 'capacity',
+        error: `백업에서 ${reason} 기존 데이터는 변경하지 않았습니다.`
+      };
+    }
     const result = await mutateMonitors((monitors) => {
+      const existingCount = session.mode === 'replace' ? 0 : monitors.length;
+      if (message?.requireAllValid && existingCount + session.prepared.length > MAX_MONITORS) {
+        throw new Error('불러오기 도중 저장된 추적 수가 바뀌어 최대 5,000개 한도를 넘습니다. 기존 데이터는 변경하지 않았습니다.');
+      }
       if (session.mode === 'replace') {
         monitors.splice(0, monitors.length);
       }
@@ -5446,8 +5506,12 @@ async function finishImportSession(message) {
       }
       return { ok: true, imported, rejected, disabledForPermission: session.disabledForPermission };
     });
-    await finalizeImportedMonitors(beforeImport);
-    return result;
+    const finalization = await finalizeImportedMonitors(beforeImport);
+    return {
+      ...result,
+      committed: true,
+      finalizationWarnings: finalization.warnings
+    };
   } finally {
     session.prepared.length = 0;
     session.usedIds.clear();
@@ -5550,21 +5614,37 @@ async function importMonitors(message) {
     return { ok: true, imported, rejected, disabledForPermission };
   });
 
+  let finalization = { warnings: 0 };
   if (!message.deferFinalization) {
-    await finalizeImportedMonitors(beforeImport);
+    finalization = await finalizeImportedMonitors(beforeImport);
   }
-  return result;
+  return { ...result, committed: true, finalizationWarnings: finalization.warnings };
 }
 
 // Dashboard imports can arrive in small messages so structured cloning and
 // validation never monopolise the dashboard or the MV3 worker. Keep the
 // expensive global follow-up work for the final message in that sequence.
 async function finalizeImportedMonitors(beforeImport = []) {
-  await reconcileLiveSessions().catch(() => undefined);
-  await refreshBadge();
-  await scheduleNextAlarm();
-  await Promise.all(beforeImport.map((monitor) => releaseUnusedSitePermission(monitor.url)));
-  return { ok: true };
+  let warnings = 0;
+  const runBestEffort = async (operation) => {
+    try {
+      await operation();
+    } catch {
+      warnings += 1;
+    }
+  };
+
+  // Storage is the commit boundary. These derived UI/scheduler/live states can
+  // be rebuilt from storage on the next event, so a failure here must never
+  // turn a successful commit into a misleading "import failed" response.
+  await runBestEffort(() => reconcileLiveSessions());
+  await runBestEffort(() => refreshBadge());
+  await runBestEffort(() => scheduleNextAlarm());
+  const permissionResults = await Promise.allSettled(
+    beforeImport.map((monitor) => releaseUnusedSitePermission(monitor.url))
+  );
+  warnings += permissionResults.filter((result) => result.status === 'rejected').length;
+  return { ok: true, warnings };
 }
 
 async function openDashboard() {
@@ -5742,6 +5822,7 @@ async function initialize({ cleanupPermissions = false } = {}) {
     await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
   }
   await migrateLegacyScheduleModes();
+  await persistNormalizedMonitorRepairs();
   await refreshBadge();
   await clearExpiredPendingPickers();
   if (cleanupPermissions) {

@@ -20,6 +20,7 @@ $extensionFiles = @(
   'LICENSE',
   'THIRD_PARTY_NOTICES.md',
   'service-worker.js',
+  'backup-integrity.js',
   'selector-engine.js',
   'picker.js',
   'offscreen.html',

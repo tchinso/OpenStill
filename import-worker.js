@@ -1,5 +1,7 @@
 'use strict';
 
+importScripts('backup-integrity.js');
+
 // JSON parsing can be noticeably expensive even when the file is read
 // asynchronously. Keep it out of the dashboard document so its progress UI
 // and cancel/error feedback continue to paint while a backup part is decoded.
@@ -29,8 +31,13 @@ self.addEventListener('message', async (event) => {
     }
     const text = await readFileTextWithProgress(file);
     self.postMessage({ type: 'parsing' });
-    const payload = JSON.parse(text);
-    self.postMessage({ type: 'parsed', payload });
+    // A UTF-8 BOM is harmless and is commonly added by Windows editors, but
+    // JSON.parse does not consistently accept it as part of the JSON text.
+    const jsonText = typeof text === 'string' && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+    const payload = JSON.parse(jsonText);
+    const inspected = self.OpenStillBackupIntegrity.inspectBackupPart(payload);
+    if (!inspected.ok) throw new Error(inspected.error || '백업 파일의 무결성을 확인하지 못했습니다.');
+    self.postMessage({ type: 'parsed', payload, backupPart: inspected.part });
   } catch (error) {
     self.postMessage({ type: 'error', error: error?.message || 'JSON 파일을 읽지 못했습니다.' });
   }
