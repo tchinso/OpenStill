@@ -62,7 +62,10 @@
         );
         matches = [];
         for (let node = result.iterateNext(); node; node = result.iterateNext()) {
-          matches.push(node.nodeType === Node.ATTRIBUTE_NODE ? node.ownerElement : node);
+          if (![Node.ELEMENT_NODE, Node.ATTRIBUTE_NODE].includes(node.nodeType)) {
+            throw new Error('XPath는 요소 또는 속성(예: //a, //a/@href)을 선택해야 합니다. text(), comment() 결과는 지원하지 않습니다.');
+          }
+          matches.push(node);
         }
       } else {
         // xcss is CSS syntax with shadow-boundary whitespace. The detached
@@ -77,12 +80,12 @@
         ok: true,
         exists: Boolean(firstMatch),
         matchCount: matches.length,
-        text: firstMatch ? cleanText(firstMatch.textContent) : ''
+        text: firstMatch ? cleanText(firstMatch.nodeType === Node.ATTRIBUTE_NODE ? firstMatch.nodeValue : firstMatch.textContent) : ''
       };
     } catch (error) {
       return {
         ok: false,
-        error: `CSS 선택자를 해석할 수 없습니다: ${error.message}`
+        error: `선택자를 해석할 수 없습니다: ${error.message}`
       };
     }
   }
@@ -121,7 +124,43 @@
     }
   }
 
+  function filterTextInWorker(message) {
+    return new Promise((resolve) => {
+      let worker;
+      let timer;
+      let finished = false;
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        worker?.terminate();
+        resolve(result);
+      };
+      try {
+        worker = new Worker(chrome.runtime.getURL('regexp-worker.js'));
+        worker.onmessage = (event) => finish(event.data?.ok
+          ? { ok: true, text: String(event.data.text ?? ''),
+            ...(Array.isArray(event.data.itemTexts) ? { itemTexts: event.data.itemTexts } : {}) }
+          : { ok: false, error: event.data?.error || '정규식 필터가 실패했습니다.' });
+        worker.onerror = () => finish({ ok: false, error: '정규식 Worker를 실행하지 못했습니다.' });
+        worker.onmessageerror = () => finish({ ok: false, error: '정규식 Worker 응답을 읽지 못했습니다.' });
+        const budget = Math.max(50, Math.min(2_000, Number(message.timeoutMilliseconds) || 1_500));
+        timer = setTimeout(() => finish({
+          ok: false, timedOut: true,
+          error: '정규식 처리 시간이 초과돼 Worker를 종료했습니다. 이전 정상 자료를 유지합니다.'
+        }), budget);
+        worker.postMessage({ text: message.text, regexp: message.regexp, itemTexts: message.itemTexts });
+      } catch (error) {
+        finish({ ok: false, error: `정규식 Worker 오류: ${error?.message || String(error)}` });
+      }
+    });
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === 'filter-captured-text') {
+      void filterTextInWorker(message).then(sendResponse);
+      return true;
+    }
     if (message?.type === 'validate-locator-list') {
       const locators = Array.isArray(message.locators) ? message.locators : [];
       for (const locator of locators) {

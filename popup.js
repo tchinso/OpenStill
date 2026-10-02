@@ -21,7 +21,7 @@
   }
 
   function hostLabel(url) {
-    try { return new URL(url).hostname; } catch { return ''; }
+    try { return new URL(url).origin; } catch { return ''; }
   }
 
   function isSupportedPage(tab) {
@@ -62,9 +62,10 @@
       name.textContent = monitor.name;
       const meta = document.createElement('div');
       meta.className = 'recent-meta';
-      meta.textContent = monitor.status === 'needs-review'
-        ? '확인 필요 · 요소를 찾지 못함'
-        : monitor.unread ? `변경 감지 · ${formatWhen(monitor.lastChangedAt)}` : hostLabel(monitor.url);
+      const execution = monitor.enabled === false ? '일시정지' : monitor.status === 'needs-review' ? '요소 확인 필요' : monitor.status === 'error' ? '오류' : hostLabel(monitor.url);
+      meta.textContent = `${execution}${monitor.unread ? ` · 미확인 변경 ${formatWhen(monitor.lastChangedAt)}` : ''}`;
+      name.title = monitor.name;
+      item.title = monitor.url;
       text.append(name, meta);
       const open = document.createElement('button');
       open.type = 'button';
@@ -117,6 +118,8 @@
   pickButton.addEventListener('click', () => void beginPicker());
   document.querySelector('#openDashboard').addEventListener('click', () => void openDashboard());
   document.querySelector('#manage').addEventListener('click', () => void openDashboard());
-  chrome.storage.onChanged.addListener(() => void renderState());
-  void Promise.all([loadActiveTab(), renderState()]);
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'local' && ['openStill.monitors.v2', 'openStill.records.changed.v1', 'openStill.settings.v1'].some((key) => Object.prototype.hasOwnProperty.call(changes, key))) void renderState().catch((error) => { message.textContent = error.message; });
+  });
+  void Promise.all([loadActiveTab(), renderState()]).catch((error) => { message.textContent = error.message || '목록을 불러오지 못했습니다.'; });
 })();

@@ -26,14 +26,14 @@
 
     <main id="top" class="page-shell">
       <section class="overview" aria-label="현황">
-        <article><span id="summaryTotal" class="summary-number">0</span><span class="summary-label">전체 추적</span></article>
-        <article><span id="summaryActive" class="summary-number success">0</span><span class="summary-label">추적 중</span></article>
-        <article><span id="summaryChanged" class="summary-number warning">0</span><span class="summary-label">확인할 변경</span></article>
-        <article><span id="summaryAttention" class="summary-number muted">0</span><span class="summary-label">확인 필요</span></article>
+        <button type="button" data-summary-filter="all"><span id="summaryTotal" class="summary-number">0</span><span class="summary-label">전체 추적</span></button>
+        <button type="button" data-summary-filter="active"><span id="summaryActive" class="summary-number success">0</span><span class="summary-label">추적 중</span></button>
+        <button type="button" data-summary-filter="changed"><span id="summaryChanged" class="summary-number warning">0</span><span class="summary-label">확인할 변경</span></button>
+        <button type="button" data-summary-filter="attention"><span id="summaryAttention" class="summary-number muted">0</span><span class="summary-label">확인 필요</span></button>
       </section>
 
       <section class="toolbar" aria-label="목록 도구">
-        <label class="search"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="이름, 주소, 선택자로 검색"></label>
+        <label class="search"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="이름, 페이지 제목, 주소, 선택자, 라벨 검색"></label>
         <select id="statusFilter" aria-label="상태로 필터링">
           <option value="all">모든 상태</option>
           <option value="changed">변경 감지됨</option>
@@ -55,7 +55,9 @@
       </section>
 
       <section class="bulk-actions" aria-label="선택한 추적 일괄 확인">
-        <label class="bulk-select-label"><input id="selectVisible" type="checkbox"><span>현재 목록 전체 선택</span></label>
+        <label class="bulk-select-label"><input id="selectVisible" type="checkbox"><span>검색 결과 전체 선택</span></label>
+        <button id="selectViewport" class="button secondary" type="button">현재 화면 선택</button>
+        <button id="selectAll" class="button secondary" type="button">전체 추적 선택</button>
         <span id="selectedCount" class="selected-count">0개 선택</span>
         <button id="checkSelected" class="button secondary" type="button" disabled>선택 항목 확인</button>
         <button id="invertSelection" class="button secondary" type="button" disabled>선택 반전</button>
@@ -69,14 +71,18 @@
       <section class="content-grid">
         <aside class="label-panel" aria-label="라벨별 모아보기">
           <div class="aside-heading"><h2>라벨</h2><span id="labelCount"></span></div>
+          <input id="labelSearch" type="search" aria-label="라벨 검색" placeholder="라벨 검색">
           <nav id="labelList" class="label-list"></nav>
+          <button id="moreLabels" class="button secondary" type="button" hidden>더 보기</button>
         </aside>
 
         <section class="monitor-panel" aria-label="저장된 추적">
           <div class="monitor-heading"><div><h1 id="listTitle">모든 추적</h1><p id="listDescription">주소 하나와 그 CSS 선택자 목록을 하나의 추적으로 관리합니다.</p></div><span id="visibleCount" class="visible-count"></span></div>
-          <div id="monitorList" class="monitor-list"></div>
+          <div id="monitorList" class="monitor-list" tabindex="0" aria-label="추적 목록"></div>
         </section>
       </section>
+
+      <div class="runtime-summary"><span id="runtimeSummary" role="status" aria-live="polite"></span><button id="refreshRuntime" class="button secondary" type="button">실행 상태 갱신</button><button id="runtimeOwnership" class="button secondary" type="button" hidden>탭 소유권·정리 확인</button></div>
 
       <section class="disclosure" aria-label="작동 방식 안내">
         <span class="disclosure-mark">i</span>
@@ -90,8 +96,8 @@
         <input id="editId" type="hidden">
         <label>표시 이름<input id="editName" maxlength="120" required></label>
         <label>웹페이지 주소<input id="editUrl" type="url" inputmode="url" required></label>
-        <label>선택자 <span class="field-help">기본 CSS는 한 줄에 하나씩 입력합니다. XCSS·XPath·제외 규칙과 필드는 JSON 한 줄로도 보존할 수 있습니다.</span><textarea id="editSelectors" spellcheck="false" maxlength="10000" rows="6" required></textarea></label>
-        <fieldset><legend>변경 비교</legend><label><span>기준</span><select id="editCompareMode"><option value="text">텍스트</option><option value="data">HTML·링크</option></select></label><label><span>렌더링 대기(초)</span><input id="editDelaySeconds" type="number" min="0" max="60" step="1" inputmode="numeric"></label><label><span>최대 캡처 시간(초)</span><input id="editTimeoutSeconds" type="number" min="10" max="300" step="1" inputmode="numeric"></label><label>정규식 필터 <span class="field-help">일치한 텍스트만 비교합니다. 비우면 전체 텍스트를 비교합니다.</span><input id="editRegexp" maxlength="1000" spellcheck="false" placeholder="예: 가격:\\s*\\d+"></label><label><span>정규식 플래그</span><input id="editRegexpFlags" maxlength="12" spellcheck="false" placeholder="예: gim"></label><label class="check-row"><input id="editIgnoreWhitespace" type="checkbox"><span>공백 변경 무시</span></label><label class="check-row"><input id="editAllowEmpty" type="checkbox"><span>빈 선택 결과도 값으로 추적</span></label><label class="check-row"><input id="editIncludeStyle" type="checkbox"><span>인라인 스타일·스타일시트도 포함</span></label><label class="check-row"><input id="editIncludeScript" type="checkbox"><span>인라인 스크립트도 포함</span></label><label class="check-row"><input id="editKeepComments" type="checkbox"><span>HTML 주석도 포함</span></label><label class="check-row"><input id="editLive" type="checkbox"><span>열어 둔 페이지를 실시간으로 감시</span></label></fieldset>
+        <label>선택자 <span class="field-help">한 줄에 하나씩 입력합니다. JSON 오류는 행 번호와 함께 표시합니다. 비우면 전체 페이지 body를 추적합니다.</span><textarea id="editSelectors" spellcheck="false" maxlength="10000" rows="6"></textarea></label>
+        <fieldset><legend>변경 비교</legend><label><span>기준</span><select id="editCompareMode"><option value="text">텍스트</option><option value="data">HTML·링크</option></select></label><label><span>추가 렌더링 대기(초)</span><span class="field-help">DOM 준비 뒤 약 2초를 기다리며, 이 값을 추가로 적용합니다.</span><input id="editDelaySeconds" type="number" min="0" max="60" step="1" inputmode="numeric"></label><label><span>최대 캡처 시간(초)</span><input id="editTimeoutSeconds" type="number" min="10" max="300" step="1" inputmode="numeric"></label><label>정규식 필터 <span class="field-help">일치한 텍스트만 비교합니다. 비우면 전체 텍스트를 비교합니다.</span><input id="editRegexp" maxlength="1000" spellcheck="false" placeholder="예: 가격:\\s*\\d+"></label><label><span>정규식 플래그</span><input id="editRegexpFlags" maxlength="12" spellcheck="false" placeholder="예: gim"></label><label class="check-row"><input id="editIgnoreWhitespace" type="checkbox"><span>공백 변경 무시</span></label><label class="check-row"><input id="editAllowEmpty" type="checkbox"><span>빈 선택 결과도 값으로 추적</span></label><label class="check-row"><input id="editIncludeStyle" type="checkbox"><span>인라인 스타일·스타일시트도 포함</span></label><label class="check-row"><input id="editIncludeScript" type="checkbox"><span>인라인 스크립트도 포함</span></label><label class="check-row"><input id="editKeepComments" type="checkbox"><span>HTML 주석도 포함</span></label><label class="check-row"><input id="editLive" type="checkbox"><span>별도 고정 탭을 열어 실시간으로 감시</span></label></fieldset>
         <label>라벨 <span class="field-help">쉼표로 여러 개를 구분</span><input id="editLabels" maxlength="500" placeholder="예: 공지, 가격"></label>
         <fieldset><legend>확인 방식</legend><label><span>방식</span><select id="editScheduleMode"><option value="manual">수동</option><option value="interval">정기 확인</option></select></label><div id="editIntervalInputs" class="interval-inputs"><label><span>일</span><select id="editDays"></select></label><label><span>시간</span><select id="editHours"></select></label></div><p id="editIntervalHelp" class="field-help"></p></fieldset>
         <label class="check-row"><input id="editEnabled" type="checkbox"><span>추적 사용</span></label>
@@ -106,7 +112,7 @@
         <input id="pageUrlSource" type="hidden">
         <p id="pageUrlDescription" class="field-help"></p>
         <label>새 웹페이지 주소<input id="pageUrlInput" type="url" inputmode="url" required></label>
-        <p class="field-help">CSS 선택자, 표시 이름, 라벨, 확인 방식은 그대로 유지합니다. 새 주소에서는 첫 확인을 기준값으로 저장합니다.</p>
+        <p class="field-help">선택자, 이름, 라벨, 확인 방식을 유지합니다. 주소 이동은 기존 스냅샷과 변경·실행 기록을 보존합니다. 복제는 새 추적을 만들고 첫 확인에서 기준값을 저장합니다.</p>
         <p id="pageUrlMessage" class="form-message" role="alert"></p>
         <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog="pageUrlDialog">취소</button><button id="pageUrlSave" class="button primary" type="submit">주소 변경</button></div>
       </form>
@@ -128,7 +134,7 @@
     <dialog id="changeDialog" class="dialog change-dialog">
       <div class="dialog-heading"><div><p class="eyebrow">변경 내용</p><h2 id="changeTitle">변경 감지</h2></div><button class="icon-button" type="button" data-close-dialog="changeDialog" aria-label="닫기">×</button></div>
       <p id="changeWhen" class="field-help"></p>
-      <p class="diff-help"><span class="diff-added">초록색</span>은 추가·수정 후 텍스트, <span class="diff-removed">빨간색</span>은 삭제·수정 전 텍스트입니다.</p>
+      <p class="diff-help"><span class="diff-added">초록색</span>은 추가·수정 후, <span class="diff-removed">빨간색</span>은 수정 전·관측 목록 이탈입니다. 관측 목록 이탈은 서버의 영구 삭제를 뜻하지 않습니다. 순서 이동은 별도로 표시합니다.</p>
       <div class="snapshot-grid"><section><h3>이전 텍스트</h3><pre id="previousSnapshot"></pre></section><section><h3>현재 텍스트</h3><pre id="currentSnapshot"></pre></section></div>
       <div class="dialog-actions"><button id="changeOpenPage" class="button secondary" type="button">작은 창에서 열기</button><button id="changeOpenPageTab" class="button secondary" type="button">새 탭에서 열기</button><button id="acknowledgeButton" class="button primary" type="button">확인 완료</button></div>
     </dialog>
@@ -142,6 +148,7 @@
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="backup-integrity.js"></script>
+    <script src="dashboard-core.js"></script>
     <script src="dashboard.js"></script>
   </body>
 </html>

@@ -1,28 +1,26 @@
 (() => {
   const backupIntegrity = globalThis.OpenStillBackupIntegrity;
+  const dashboardCore = globalThis.OpenStillDashboardCore;
+  if (!dashboardCore) throw new Error('대시보드 비교 모듈을 불러오지 못했습니다.');
   if (!backupIntegrity) throw new Error('백업 무결성 모듈을 불러오지 못했습니다.');
-  const MIN_HOURS = 1;
-  const MAX_HOURS = 14 * 24;
   // Keep a small buffer below the requested 32 MiB split point. It leaves
   // room for the runtime-message envelope while every generated JSON part is
   // valid JSON and remains strictly below 32 MiB.
   const EXPORT_FILE_SPLIT_BYTES = 32 * 1024 * 1024;
   const EXPORT_FILE_HEADROOM_BYTES = 64 * 1024;
-  const EXPORT_INTEGRITY_METADATA_RESERVE_BYTES = 1_024;
+  const EXPORT_INTEGRITY_METADATA_RESERVE_BYTES = 1024 * 1024;
   const MAX_EXPORT_FILE_BYTES = EXPORT_FILE_SPLIT_BYTES - EXPORT_FILE_HEADROOM_BYTES;
   const MAX_IMPORT_MESSAGE_BYTES = MAX_EXPORT_FILE_BYTES;
   const IMPORT_RECORD_FRAGMENT_CHARS = 3 * 1024 * 1024;
   const BULK_TRANSFER_THRESHOLD = 200;
   const BULK_TRANSFER_CHUNK_SIZE = 100;
   const TRANSFER_YIELD_BYTE_BUDGET = 4 * 1024 * 1024;
-  const DASHBOARD_RENDER_CHUNK_SIZE = 50;
   const SELECTED_CHECK_CHUNK_SIZE = 6;
-  const MONITOR_PREVIEW_MAX_CHARS = 800;
   const SEARCH_RENDER_DEBOUNCE_MS = 150;
   const dateTimeFormatter = new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium', timeStyle: 'short' });
   const state = { monitors: [], settings: { soundEnabled: true } };
   const filters = { label: '', status: 'all', query: '' };
-  const sorting = { field: 'lastViewedAt', direction: 'desc' };
+  const sorting = { field: 'lastChangedAt', direction: 'desc' };
   const SORT_FIELDS = new Set(['lastViewedAt', 'lastCheckedAt', 'lastChangedAt', 'name']);
   const SORT_DIRECTIONS = new Set(['asc', 'desc']);
   const SORT_PREFERENCE_KEY = 'openstill-dashboard-sort';
@@ -41,6 +39,66 @@
   let refreshQueued = false;
   let refreshPending = false;
   let refreshQueueTimer = null;
+  const monitorsById = new Map();
+  const monitorsByUrl = new Map();
+  const searchById = new Map();
+  const labelsByKey = new Map();
+  const visibleRowsById = new Map();
+  const rowHeight = 48;
+  let filteredMonitors = [];
+  const filteredIndexesById = new Map();
+  let virtualRows = null;
+  let virtualTop = null;
+  let virtualBottom = null;
+  let virtualFrame = null;
+  let labelQuery = '';
+  let labelLimit = 40;
+  let editorBaseline = null;
+  let editorOriginalValues = new Map();
+  let pageUrlBaseline = [];
+  const formLocks = new Set();
+  const operationIds = new WeakMap();
+  const pendingRecordIds = new Set();
+  const pendingDeletedIds = new Set();
+  let recordPatchTimer = null;
+  let recordsPatching = false;
+  let runtimeRefreshedAt = 0;
+
+  function operationIdFor(form) {
+    if (!operationIds.has(form)) operationIds.set(form, crypto.randomUUID());
+    return operationIds.get(form);
+  }
+
+  function mutationWarningSuffix(response) {
+    return response?.finalizationWarnings || response?.warnings?.length ? ' 저장은 완료됐으며 실행 상태 갱신은 다시 시도됩니다.' : '';
+  }
+
+  async function submitForm(form, messageNode, callback) {
+    if (formLocks.has(form)) return;
+    formLocks.add(form);
+    const buttons = [...form.querySelectorAll('button[type="submit"]')];
+    buttons.forEach((button) => { button.disabled = true; });
+    try { await callback(); }
+    catch (error) { messageNode.textContent = error.message || '저장하지 못했습니다.'; }
+    finally { formLocks.delete(form); buttons.forEach((button) => { button.disabled = false; }); }
+  }
+
+  function rebuildMonitorIndexes() {
+    monitorsById.clear(); monitorsByUrl.clear(); searchById.clear(); labelsByKey.clear();
+    for (const monitor of state.monitors) {
+      monitorsById.set(monitor.id, monitor);
+      let page = monitorsByUrl.get(monitor.url);
+      if (!page) monitorsByUrl.set(monitor.url, page = []);
+      page.push(monitor);
+      searchById.set(monitor.id, [monitor.name, monitor.pageTitle, monitor.url, ...selectorsOf(monitor), ...(monitor.labels ?? [])].join(' ').toLocaleLowerCase('ko-KR'));
+      for (const label of monitor.labels ?? []) {
+        const key = label.toLocaleLowerCase('ko-KR');
+        let entry = labelsByKey.get(key);
+        if (!entry) labelsByKey.set(key, entry = { label, ids: new Set() });
+        entry.ids.add(monitor.id);
+      }
+    }
+  }
 
   const elements = {
     soundEnabled: document.querySelector('#soundEnabled'),
@@ -227,18 +285,13 @@
 
   // CSS line clamping only limits what is painted; keeping a large snapshot in
   // every card still makes dashboard construction and updates expensive.
-  function monitorPreviewText(value) {
-    const text = String(value ?? '');
-    return text.length > MONITOR_PREVIEW_MAX_CHARS
-      ? `${text.slice(0, MONITOR_PREVIEW_MAX_CHARS - 1)}…`
-      : text;
-  }
 
   function locatorsOf(monitor) {
     if (Array.isArray(monitor?.locators)) {
       return monitor.locators
         .filter((item) => item && typeof item === 'object')
         .map((item) => ({
+          ...item,
           type: ['css', 'xcss', 'xpath'].includes(item.type) ? item.type : 'css',
           expr: String(item.expr ?? item.selector ?? item.value ?? '').trim(),
           op: item.op === 'exclude' ? 'exclude' : 'include',
@@ -267,61 +320,18 @@
       && locator.op === 'include'
       && locator.frameId === 0
       && !locator.framePath?.length
+      && !locator.frameUrl
+      && !locator.identityAttribute
+      && !locator.frameVolatileParameters?.length
+      && locator.frameOrder == null
+      && Object.keys(locator).every((key) => ['type', 'expr', 'op', 'frameId', 'framePath', 'fields', 'fieldsSpecified'].includes(key))
       && locator.fieldsSpecified !== true
       && (!locator.fields?.length || locator.fields.every((field) => field?.type === 'text'));
     return basic ? locator.expr : JSON.stringify(locator);
   }
 
-  function parseLocatorLine(line) {
-    const source = String(line ?? '').trim();
-    if (!source) return null;
-    if (source.startsWith('{')) {
-      try {
-        const value = JSON.parse(source);
-        return value && typeof value === 'object' ? value : null;
-      } catch {
-        return null;
-      }
-    }
-    const prefixed = source.match(/^(?:(exclude)\s+)?(css|xcss|xpath)\s*:\s*(.+)$/i);
-    if (prefixed) {
-      return { type: prefixed[2].toLowerCase(), expr: prefixed[3].trim(), op: prefixed[1] ? 'exclude' : 'include' };
-    }
-    return { type: 'css', expr: source, op: 'include' };
-  }
 
-  function selectorPreview(monitor) {
-    const selectors = selectorsOf(monitor);
-    if (!selectors.length) return 'CSS 선택자가 없습니다.';
-    const first = selectors[0];
-    return selectors.length === 1 ? first : `${selectors.length}개 선택자 · ${first}`;
-  }
 
-  function snapshotItems(snapshot) {
-    if (Array.isArray(snapshot?.items) && snapshot.items.length) {
-      return snapshot.items
-        .map((item) => typeof item === 'string' ? item : item?.text)
-        .map((text) => String(text ?? '').trim())
-        .filter(Boolean);
-    }
-    const text = String(snapshot?.text ?? '').trim();
-    return text ? text.split('\n').filter(Boolean) : [];
-  }
-
-  function formatDuration(hours) {
-    const numeric = Number(hours);
-    const days = Math.floor(numeric / 24);
-    const rest = numeric % 24;
-    return `${days ? `${days}일` : ''}${days && rest ? ' ' : ''}${rest ? `${rest}시간` : ''}` || '0시간';
-  }
-
-  function scheduleModeOf(monitor) {
-    return monitor?.scheduleMode === 'interval' ? 'interval' : 'manual';
-  }
-
-  function formatSchedule(monitor) {
-    return scheduleModeOf(monitor) === 'manual' ? '수동' : formatDuration(monitor.intervalHours);
-  }
 
   // Expanded schedule descriptors are intentionally decoded in the dashboard
   // rather than flattened to the legacy intervalHours field.
@@ -431,20 +441,24 @@
         ? { key: 'permission-needed', label: '권한 필요' }
         : { key: 'paused', label: '일시정지' };
     }
+    if (monitor.runtime?.checking) return { key: 'checking', label: '확인 중' };
+    if (monitor.runtime?.queued) return { key: 'queued', label: '확인 대기' };
+    if (monitor.runtime?.retryAt) return { key: 'needs-review', label: '재시도 대기' };
+    if (monitor.runtime?.liveConnection === 'pending') return { key: 'needs-review', label: '연결 대기' };
+    if (monitor.runtime?.liveConnection === 'loading') return { key: 'queued', label: '연결 중' };
     if (monitor.status === 'needs-review') return { key: 'needs-review', label: '확인 필요' };
-    if (monitor.unread || monitor.status === 'changed') return { key: 'changed', label: '변경 감지' };
+    if (monitor.runtime?.liveConnection === 'observing' && !['error', 'permission-needed', 'needs-baseline'].includes(monitor.status)) return { key: 'ok', label: '실시간 연결' };
     const labels = {
       ok: ['ok', '정상'],
       error: ['error', '오류'],
       'permission-needed': ['permission-needed', '권한 필요'],
       'needs-baseline': ['needs-baseline', '기준값 필요']
     };
-    const [key, label] = labels[monitor.status] ?? labels.ok;
+    const [key, label] = labels[monitor.status] ?? (monitor.runtime?.liveConnection === 'observing' ? ['ok', '실시간 연결'] : labels.ok);
     return { key, label };
   }
 
   function needsAttention(monitor) {
-    if (!monitor.enabled && monitor.status !== 'permission-needed') return false;
     return ['needs-review', 'error', 'permission-needed'].includes(monitor.status);
   }
 
@@ -476,92 +490,34 @@
   }
 
   function monitorMatchesFilters(monitor) {
-    if (filters.label && !(monitor.labels ?? []).some((label) => label.toLocaleLowerCase('ko-KR') === filters.label)) return false;
+    if (filters.label && !labelsByKey.get(filters.label)?.ids.has(monitor.id)) return false;
     if (filters.status === 'changed' && !monitor.unread) return false;
     if (filters.status === 'active' && !monitor.enabled) return false;
     if (filters.status === 'attention' && !needsAttention(monitor)) return false;
     if (filters.status === 'paused' && monitor.enabled) return false;
     const query = filters.query.trim().toLocaleLowerCase('ko-KR');
     if (!query) return true;
-    const haystack = [monitor.name, monitor.url, ...selectorsOf(monitor), ...(monitor.labels ?? [])]
+    const haystack = searchById.get(monitor.id) ?? [monitor.name, monitor.pageTitle, monitor.url, ...selectorsOf(monitor), ...(monitor.labels ?? [])]
       .join(' ')
       .toLocaleLowerCase('ko-KR');
     return haystack.includes(query);
   }
 
-  function groupMonitorsBySite(monitors) {
-    const sites = new Map();
-    for (const monitor of monitors) {
-      const origin = originOf(monitor.url);
-      let site = sites.get(origin);
-      if (!site) {
-        site = { origin, host: hostname(monitor.url), allMonitors: [], pagesByUrl: new Map() };
-        sites.set(origin, site);
-      }
-      site.allMonitors.push(monitor);
-      let page = site.pagesByUrl.get(monitor.url);
-      if (!page) {
-        page = { url: monitor.url, monitors: [] };
-        site.pagesByUrl.set(monitor.url, page);
-      }
-      page.monitors.push(monitor);
-    }
-
-    return [...sites.values()].map((site) => ({
-      ...site,
-      pages: [...site.pagesByUrl.values()]
-    }));
-  }
-
-  function getFilteredSiteGroups() {
-    return groupMonitorsBySite(state.monitors)
-      .map((site) => {
-        const pages = site.pages
-          .map((page) => {
-            const visibleMonitors = page.monitors.filter(monitorMatchesFilters).sort(compareMonitors);
-            return {
-              ...page,
-              visibleMonitors,
-              sortMonitor: visibleMonitors[0] ?? null
-            };
-          })
-          .filter((page) => page.visibleMonitors.length)
-          .sort((left, right) => (
-            compareMonitors(left.sortMonitor, right.sortMonitor)
-            || left.url.localeCompare(right.url)
-          ));
-        return {
-          ...site,
-          pages,
-          sortMonitor: pages[0]?.sortMonitor ?? null
-        };
-      })
-      .filter((site) => site.pages.length)
-      .sort((left, right) => (
-        compareMonitors(left.sortMonitor, right.sortMonitor)
-        || left.origin.localeCompare(right.origin)
-      ));
-  }
-
-  function visibleMonitorIds(sites = getFilteredSiteGroups()) {
-    return sites.flatMap((site) => site.pages.flatMap((page) => (
-      page.visibleMonitors.map((monitor) => monitor.id)
-    )));
-  }
 
   function pruneSelectedMonitorIds() {
-    const knownIds = new Set(state.monitors.map((monitor) => monitor.id));
     for (const id of selectedMonitorIds) {
-      if (!knownIds.has(id)) selectedMonitorIds.delete(id);
+      if (!monitorsById.has(id)) selectedMonitorIds.delete(id);
     }
   }
 
-  function renderSelectionControls(sites = getFilteredSiteGroups()) {
+  function renderSelectionControls() {
+    document.querySelector('#selectAll').disabled = batchActionRunning || !state.monitors.length;
+    document.querySelector('#selectViewport').disabled = batchActionRunning || !filteredMonitors.length;
     pruneSelectedMonitorIds();
-    const visibleIds = visibleMonitorIds(sites);
+    const visibleIds = filteredMonitors.map((monitor) => monitor.id);
     const selectedVisible = visibleIds.filter((id) => selectedMonitorIds.has(id)).length;
     const selectedCount = selectedMonitorIds.size;
-    elements.selectedCount.textContent = `${selectedCount}개 선택`;
+    elements.selectedCount.textContent = `표시 선택 ${selectedVisible} · 숨김 선택 ${selectedCount - selectedVisible} · 전체 ${selectedCount}`;
     elements.selectVisible.checked = Boolean(visibleIds.length) && selectedVisible === visibleIds.length;
     elements.selectVisible.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
     elements.selectVisible.disabled = batchActionRunning || !visibleIds.length;
@@ -574,21 +530,21 @@
   }
 
   function setVisibleSelection(selected) {
-    const ids = visibleMonitorIds();
+    const ids = filteredMonitors.map((monitor) => monitor.id);
     ids.forEach((id) => {
       if (selected) selectedMonitorIds.add(id);
       else selectedMonitorIds.delete(id);
     });
-    void renderMonitorList();
+    patchVisibleSelections();
   }
 
   function invertVisibleSelection() {
     if (batchActionRunning) return;
-    visibleMonitorIds().forEach((id) => {
+    filteredMonitors.forEach(({ id }) => {
       if (selectedMonitorIds.has(id)) selectedMonitorIds.delete(id);
       else selectedMonitorIds.add(id);
     });
-    void renderMonitorList();
+    patchVisibleSelections();
   }
 
   function renderOverview() {
@@ -600,21 +556,16 @@
   }
 
   function labelCollection() {
-    const labels = new Map();
-    for (const monitor of state.monitors) {
-      for (const label of monitor.labels ?? []) {
-        const key = label.toLocaleLowerCase('ko-KR');
-        const entry = labels.get(key) ?? { label, count: 0 };
-        entry.count += 1;
-        labels.set(key, entry);
-      }
-    }
-    return [...labels.entries()].sort((left, right) => left[1].label.localeCompare(right[1].label, 'ko-KR'));
+    return [...labelsByKey.entries()].map(([key, entry]) => [key, { label: entry.label, count: entry.ids.size }]);
   }
 
   function renderLabels() {
-    const labels = labelCollection();
+    const labels = labelCollection().sort((left, right) => right[1].count - left[1].count || left[1].label.localeCompare(right[1].label, 'ko-KR'));
+    const matches = labels.filter(([key]) => key.includes(labelQuery));
     elements.labelCount.textContent = `${labels.length}개`;
+    const more = document.querySelector('#moreLabels');
+    more.hidden = matches.length <= labelLimit;
+    more.textContent = `더 보기 (${Math.max(0, matches.length - labelLimit)}개 남음)`;
     elements.labelList.replaceChildren();
 
     const allButton = element('button', `label-button${filters.label ? '' : ' active'}`);
@@ -623,7 +574,7 @@
     allButton.append(element('span', 'label-dot'), element('span', '', '전체'), element('small', '', String(state.monitors.length)));
     elements.labelList.append(allButton);
 
-    for (const [key, entry] of labels) {
+    for (const [key, entry] of matches.slice(0, labelLimit)) {
       const button = element('button', `label-button${filters.label === key ? ' active' : ''}`);
       button.type = 'button';
       button.dataset.label = key;
@@ -648,148 +599,121 @@
     return button;
   }
 
-  function monitorCard(monitor) {
-    const selected = selectedMonitorIds.has(monitor.id);
-    const card = element('article', `tracking-card${monitor.unread ? ' unread' : ''}${needsAttention(monitor) ? ' needs-attention' : ''}${selected ? ' selected' : ''}`);
-    const top = element('div', 'tracking-top');
-    const selectLabel = element('label', 'monitor-select');
-    const selectInput = document.createElement('input');
-    selectInput.type = 'checkbox';
-    selectInput.dataset.selectMonitor = monitor.id;
-    selectInput.checked = selected;
-    selectInput.disabled = batchActionRunning;
-    selectInput.setAttribute('aria-label', `“${monitor.name}” 추적 선택`);
-    selectLabel.append(selectInput);
-    const title = element('div', 'tracking-title');
-    title.append(element('h4', '', monitor.name), element('p', 'selector-preview', selectorPreview(monitor)));
-    const status = statusInfo(monitor);
-    top.append(selectLabel, title, element('span', `status ${status.key}`, status.label));
-    card.append(top);
 
-    if (monitor.labels?.length) {
-      const chips = element('div', 'chips');
-      monitor.labels.forEach((label) => chips.append(element('span', 'chip', label)));
-      card.append(chips);
+  function compactMonitorRow(monitor) {
+    const card = element('article', 'monitor-row');
+    card.dataset.monitorId = monitor.id;
+    const checkbox = element('input');
+    checkbox.type = 'checkbox';
+    checkbox.dataset.selectMonitor = monitor.id;
+    checkbox.setAttribute('aria-label', `${monitor.name} 선택`);
+    const name = makeAction(monitor.name, 'detail', monitor.id, 'row-name');
+    name.title = monitor.name;
+    const page = element('span', 'row-page', `${originOf(monitor.url)} · ${monitor.pageTitle || pagePath(monitor.url)}`);
+    page.title = `${monitor.pageTitle || ''}\n${monitor.url}`;
+    const execution = statusInfo(monitor);
+    const status = element('span', `status ${execution.key}`, execution.label);
+    const unread = element('span', `row-unread${monitor.unread ? ' changed' : ''}`, monitor.unread ? '미확인 변경' : '');
+    const activity = element('time', 'row-activity', formatDate(monitor.lastChangedAt || monitor.lastCheckedAt || monitor.createdAt));
+    activity.title = `변경 ${formatDate(monitor.lastChangedAt)} · 확인 ${formatDate(monitor.lastCheckedAt)}`;
+    const action = makeAction(monitor.unread ? '변경 보기' : '확인', monitor.unread ? 'change' : 'check', monitor.id, 'row-primary');
+    card.append(checkbox, name, page, status, unread, activity, action);
+    return card;
+  }
+
+  function patchVisibleSelections(updateControls = true) {
+    for (const [id, record] of visibleRowsById) {
+      const checkbox = record.row.querySelector('input[data-select-monitor]');
+      checkbox.checked = selectedMonitorIds.has(id);
+      checkbox.disabled = batchActionRunning;
+      record.row.classList.toggle('selected', checkbox.checked);
     }
+    if (updateControls) renderSelectionControls();
+  }
 
-    const snapshot = monitor.snapshot;
-    let previewText = snapshot
-      ? (snapshot.text || '(텍스트 없음)')
-      : '(아직 기준값이 없습니다)';
-    if (monitor.status === 'needs-review' && snapshot) {
-      previewText = `마지막 정상 값: ${previewText}`;
+  function renderVirtualViewport() {
+    if (!virtualRows) return;
+    const range = dashboardCore.viewport(filteredMonitors.length, elements.monitorList.scrollTop, elements.monitorList.clientHeight || 480, rowHeight);
+    const active = document.activeElement;
+    const focusId = active?.dataset?.id || active?.dataset?.selectMonitor;
+    const focusAction = active?.dataset?.action;
+    const wanted = new Set(filteredMonitors.slice(range.start, range.end).map((monitor) => monitor.id));
+    const focusedIndex = focusId ? filteredIndexesById.get(focusId) ?? -1 : -1;
+    const pinned = focusedIndex >= 0 && !wanted.has(focusId);
+    if (pinned) wanted.add(focusId);
+    for (const [id, record] of visibleRowsById) {
+      if (!wanted.has(id)) { record.row.remove(); visibleRowsById.delete(id); }
     }
-    card.append(element('p', 'snapshot-preview', monitorPreviewText(previewText)));
-
-    const details = element('div', 'tracking-details');
-    const rows = [
-      ['선택', `${selectorsOf(monitor).length}개`],
-      ['확인 방식', formatSchedule(monitor)],
-      ['마지막 읽음', formatDate(monitor.lastViewedAt)],
-      ['마지막 확인', formatDate(monitor.lastCheckedAt)],
-      ['마지막 변경', formatDate(monitor.lastChangedAt)]
-    ];
-    rows.forEach(([label, value]) => {
-      const row = element('div');
-      row.append(element('span', '', label), element('strong', '', value));
-      details.append(row);
-    });
-    card.append(details);
-
-    if (monitor.lastError) {
-      card.append(element('p', monitor.status === 'needs-review' ? 'review-text' : 'error-text', monitor.lastError));
+    let previous = null;
+    const indexes = Array.from({ length: range.end - range.start }, (_, index) => range.start + index);
+    if (pinned) indexes.push(focusedIndex);
+    for (const index of indexes) {
+      const monitor = filteredMonitors[index];
+      const signature = JSON.stringify([monitor.name, monitor.url, monitor.pageTitle, monitor.status, monitor.enabled, monitor.unread, monitor.lastChangedAt, monitor.lastCheckedAt, monitor.createdAt, monitor.runtime]);
+      let record = visibleRowsById.get(monitor.id);
+      if (!record || record.signature !== signature) {
+        const row = compactMonitorRow(monitor);
+        if (record) record.row.replaceWith(row);
+        record = { row, signature };
+        visibleRowsById.set(monitor.id, record);
+      }
+      const next = previous ? previous.nextSibling : virtualRows.firstChild;
+      if (record.row !== next) virtualRows.insertBefore(record.row, next);
+      const isPinned = pinned && index === focusedIndex;
+      record.row.classList.toggle('virtual-pinned', isPinned);
+      record.row.style.top = isPinned ? `${focusedIndex * rowHeight - range.top}px` : '';
+      previous = record.row;
     }
+    virtualTop.style.height = `${range.top}px`;
+    virtualBottom.style.height = `${range.bottom}px`;
+    patchVisibleSelections(false);
+    if (focusId && document.activeElement !== active && wanted.has(focusId)) {
+      const row = visibleRowsById.get(focusId)?.row;
+      const target = focusAction ? [...row.querySelectorAll('button[data-action]')].find((button) => button.dataset.action === focusAction) ?? row.querySelector('.row-primary') : row.querySelector('input');
+      target?.focus({ preventScroll: true });
+    }
+  }
 
+  function openMonitorDetails(monitor) {
+    let dialog = document.querySelector('#monitorDetailDialog');
+    if (!dialog) {
+      dialog = element('dialog', 'dialog monitor-detail-dialog');
+      dialog.id = 'monitorDetailDialog';
+      document.body.append(dialog);
+      dialog.addEventListener('click', (event) => void handleCardAction(event));
+    }
+    dialog.replaceChildren();
+    const heading = element('div', 'dialog-heading');
+    const title = element('h2', '', monitor.name);
+    const close = element('button', 'icon-button', '×');
+    close.type = 'button'; close.dataset.closeDialog = dialog.id;
+    heading.append(title, close);
+    const url = element('p', 'detail-url', monitor.url);
+    const copy = makeAction('주소 복사', 'copy-url', monitor.id);
+    const copyName = makeAction('이름 복사', 'copy-name', monitor.id);
+    const details = element('p', 'field-help', `${statusInfo(monitor).label}${monitor.unread ? ' · 미확인 변경' : ''} · ${formatSchedule(monitor)}\n확인 ${formatDate(monitor.lastCheckedAt)} · 변경 ${formatDate(monitor.lastChangedAt)}`);
+    const selectors = element('pre', 'detail-selectors', locatorsOf(monitor).map(locatorLine).join('\n') || 'body (전체 페이지)');
+    const labels = element('p', 'field-help', (monitor.labels ?? []).join(', '));
     const actions = element('div', 'card-actions');
-    if (monitor.unread) actions.append(makeAction('변경 내용', 'change', monitor.id, 'attention-action'));
-    if (monitor.hasErrorEvidence) actions.append(makeAction('선택 실패 화면', 'evidence', monitor.id, 'attention-action'));
-    if (monitor.historyCount || monitor.runCount) actions.append(makeAction('기록', 'history', monitor.id));
+    if (monitor.unread) actions.append(makeAction('변경 내용', 'change', monitor.id));
+    if (monitor.hasErrorEvidence) actions.append(makeAction('선택 실패 화면', 'evidence', monitor.id));
+    actions.append(makeAction('기록', 'history', monitor.id), makeAction('지금 확인', 'check', monitor.id), makeAction('작은 창', 'open', monitor.id), makeAction('새 탭', 'open-tab', monitor.id), makeAction('편집', 'edit', monitor.id), makeAction(monitor.enabled ? '일시정지' : '다시 시작', 'toggle', monitor.id), makeAction('삭제', 'delete', monitor.id));
     if (monitor.tracking?.live) actions.append(makeAction('실시간 연결', 'live', monitor.id));
-    if (monitor.status === 'permission-needed') actions.append(makeAction('추적 시작', 'grant', monitor.id, 'attention-action'));
-    actions.append(
-      makeAction('지금 확인', 'check', monitor.id),
-      makeAction('작은 창', 'open', monitor.id),
-      makeAction('새 탭', 'open-tab', monitor.id),
-      makeAction('편집', 'edit', monitor.id),
-      makeAction(monitor.enabled ? '일시정지' : '다시 시작', 'toggle', monitor.id),
-      makeAction('삭제', 'delete', monitor.id, 'attention-action')
-    );
-    card.append(actions);
-    return card;
+    const page = pageByUrl(monitor.url);
+    const pageActions = element('div', 'page-actions');
+    pageActions.append(makePageAction(`같은 주소 ${page.monitors.length}개 확인`, 'check-page', monitor.url), makePageAction('페이지 주소 변경', 'move-page-url', monitor.url), makePageAction('페이지 주소 복제', 'copy-page-url', monitor.url), makePageAction(`같은 주소 ${page.monitors.length}개 삭제`, 'delete-page', monitor.url));
+    dialog.append(heading, url, copy, copyName, details, labels, selectors);
+    if (monitor.lastError) dialog.append(element('p', 'error-text', monitor.lastError));
+    dialog.append(actions, pageActions);
+    if (!dialog.open) dialog.showModal();
   }
 
-  function pageCardShell(page) {
-    const pageElement = element('section', 'page-card');
-    const top = element('div', 'page-top');
-    const heading = element('div', 'page-title');
-    const pageTitle = page.monitors.map((monitor) => monitor.pageTitle).find(Boolean);
-    heading.append(
-      element('h3', '', pageTitle || pagePath(page.url)),
-      element('p', 'page-url', page.url)
-    );
-
-    const selectorCount = page.monitors.reduce((count, monitor) => count + selectorsOf(monitor).length, 0);
-    const changed = page.monitors.some((monitor) => monitor.unread) ? 1 : 0;
-    const attention = page.monitors.some(needsAttention) ? 1 : 0;
-    const summary = element('div', 'page-summary');
-    summary.append(element('span', 'page-count', `${selectorCount}개 선택자`));
-    if (changed) summary.append(element('span', 'page-badge changed', '변경 감지'));
-    if (attention) summary.append(element('span', 'page-badge attention', '확인 필요'));
-    top.append(heading, summary);
-    pageElement.append(top);
-
-    const actions = element('div', 'page-actions');
-    actions.append(
-      makePageAction('이 페이지 확인', 'check-page', page.url),
-      makePageAction('주소만 변경', 'move-page-url', page.url),
-      makePageAction('주소만 복제', 'copy-page-url', page.url),
-      makePageAction('페이지 추적 삭제', 'delete-page', page.url, 'attention-action')
-    );
-    pageElement.append(actions);
-
-    const tracks = element('div', 'tracking-list');
-    pageElement.append(tracks);
-    return { pageElement, tracks };
-  }
-
-  function pageCard(page) {
-    const { pageElement, tracks } = pageCardShell(page);
-    page.visibleMonitors.forEach((monitor) => tracks.append(monitorCard(monitor)));
-    return pageElement;
-  }
-
-  function siteCardShell(site) {
-    const card = element('article', 'site-group');
-    const top = element('div', 'site-heading');
-    const title = element('div');
-    title.append(
-      element('h2', '', site.host),
-      element('p', '', `${site.pages.length}개 페이지 · ${site.allMonitors.length}개 추적`)
-    );
-    const changed = site.allMonitors.filter((monitor) => monitor.unread).length;
-    const attention = site.allMonitors.filter(needsAttention).length;
-    const badges = element('div', 'site-badges');
-    if (changed) badges.append(element('span', 'page-badge changed', `변경 ${changed}`));
-    if (attention) badges.append(element('span', 'page-badge attention', `확인 ${attention}`));
-    top.append(title, badges);
-    card.append(top);
-
-    const pages = element('div', 'site-pages');
-    card.append(pages);
-    return { card, pages };
-  }
-
-  function siteCard(site) {
-    const { card, pages } = siteCardShell(site);
-    site.pages.forEach((page) => pages.append(pageCard(page)));
-    return card;
-  }
 
   function updateListHeading(sites, visibleMonitorCount) {
     if (filters.label) {
-      const current = labelCollection().find(([key]) => key === filters.label);
-      elements.listTitle.textContent = current ? `${current[1].label} 라벨` : '라벨 추적';
-      elements.listDescription.textContent = '같은 사이트와 페이지를 묶어 표시합니다.';
+      const current = labelsByKey.get(filters.label);
+      elements.listTitle.textContent = current ? `${current.label} 라벨` : '라벨 추적';
+      elements.listDescription.textContent = '제목을 누르면 선택자·일정·기록·페이지 작업을 확인합니다.';
     } else {
       const headings = {
         changed: '변경 감지됨',
@@ -799,100 +723,109 @@
         all: '모든 추적'
       };
       elements.listTitle.textContent = headings[filters.status] ?? headings.all;
-      elements.listDescription.textContent = '사이트 → 페이지(주소) → CSS 선택자 목록 순서로 하나의 추적을 관리합니다.';
+      elements.listDescription.textContent = '제목을 누르면 상세 정보와 페이지 작업을 확인합니다. 상단 현황은 전체 추적 기준입니다.';
     }
-    elements.visibleCount.textContent = `${sites.length}개 사이트 · ${visibleMonitorCount}개 추적`;
+    elements.visibleCount.textContent = `표시 ${visibleMonitorCount} / 전체 ${state.monitors.length} · ${sites.length}개 사이트`;
   }
 
-  function renderMonitors() {
-    monitorRenderGeneration += 1;
-    if (searchRenderTimer !== null) {
-      clearTimeout(searchRenderTimer);
-      searchRenderTimer = null;
-    }
-    const sites = getFilteredSiteGroups();
-    const visibleMonitorCount = sites.reduce((count, site) => count + site.pages.reduce(
-      (pageCount, page) => pageCount + page.visibleMonitors.length,
-      0
-    ), 0);
-    updateListHeading(sites, visibleMonitorCount);
-    renderSelectionControls(sites);
-    elements.monitorList.replaceChildren();
-    if (!sites.length) {
-      const empty = element('div', 'empty-state');
-      const title = element('strong', '', state.monitors.length ? '조건에 맞는 추적이 없습니다.' : '아직 저장된 추적이 없습니다.');
-      empty.append(title, document.createTextNode(state.monitors.length
-        ? '검색어, 라벨, 상태 필터를 바꿔 보세요.'
-        : '추적할 웹페이지에서 브라우저 툴바의 OpenStill 버튼을 눌러 CSS 요소를 선택하세요.'));
-      elements.monitorList.append(empty);
-      return;
-    }
-    sites.forEach((site) => elements.monitorList.append(siteCard(site)));
-  }
-
-  async function renderMonitorsProgressively(total = state.monitors.length) {
-    const generation = ++monitorRenderGeneration;
-    if (searchRenderTimer !== null) {
-      clearTimeout(searchRenderTimer);
-      searchRenderTimer = null;
-    }
-    const sites = getFilteredSiteGroups();
-    const visibleMonitorCount = sites.reduce((count, site) => count + site.pages.reduce(
-      (pageCount, page) => pageCount + page.visibleMonitors.length,
-      0
-    ), 0);
-    updateListHeading(sites, visibleMonitorCount);
-    renderSelectionControls(sites);
-    elements.monitorList.replaceChildren();
-    if (!sites.length) {
-      const empty = element('div', 'empty-state');
-      const title = element('strong', '', state.monitors.length ? '조건에 맞는 추적이 없습니다.' : '아직 등록된 추적이 없습니다.');
-      empty.append(title, document.createTextNode(state.monitors.length
-        ? '검색어, 라벨, 상태 필터를 바꿔 보세요.'
-        : '추적할 웹페이지에서 브라우저 도구 모음의 OpenStill 버튼을 눌러 CSS 요소를 선택하세요.'));
-      elements.monitorList.append(empty);
-      return;
-    }
-
-    const pendingNodes = document.createDocumentFragment();
-    let rendered = 0;
-    updateDashboardRenderProgress(0, total);
-    for (const site of sites) {
-      if (generation !== monitorRenderGeneration) return;
-      const { card, pages } = siteCardShell(site);
-      pendingNodes.append(card);
-      for (const page of site.pages) {
-        const { pageElement, tracks } = pageCardShell(page);
-        pages.append(pageElement);
-        for (const monitor of page.visibleMonitors) {
-          tracks.append(monitorCard(monitor));
-          rendered += 1;
-          if (rendered % DASHBOARD_RENDER_CHUNK_SIZE === 0) {
-            elements.monitorList.append(pendingNodes);
-            updateDashboardRenderProgress(Math.min(rendered, total), total);
-            await yieldToBrowser();
-            if (generation !== monitorRenderGeneration) return;
-          }
-        }
-      }
-    }
-    if (generation !== monitorRenderGeneration) return;
-    elements.monitorList.append(pendingNodes);
-    updateDashboardRenderProgress(total, total);
-  }
 
   function renderMonitorList() {
-    if (state.monitors.length >= BULK_TRANSFER_THRESHOLD) {
-      return renderMonitorsProgressively(state.monitors.length);
+    const oldAnchorIndex = Math.floor(elements.monitorList.scrollTop / rowHeight);
+    const oldAnchorId = filteredMonitors[oldAnchorIndex]?.id;
+    const offset = elements.monitorList.scrollTop % rowHeight;
+    filteredMonitors = state.monitors.filter(monitorMatchesFilters).sort(compareMonitors);
+    filteredIndexesById.clear();
+    filteredMonitors.forEach((monitor, index) => filteredIndexesById.set(monitor.id, index));
+    const sites = new Set(filteredMonitors.map((monitor) => originOf(monitor.url)));
+    updateListHeading([...sites], filteredMonitors.length);
+    if (!virtualRows || !virtualRows.isConnected) {
+      visibleRowsById.clear();
+      virtualTop = element('div', 'virtual-spacer');
+      virtualRows = element('div', 'virtual-rows');
+      virtualBottom = element('div', 'virtual-spacer');
+      elements.monitorList.replaceChildren(virtualTop, virtualRows, virtualBottom);
     }
-    renderMonitors();
+    if (!filteredMonitors.length) {
+      visibleRowsById.clear();
+      virtualRows.replaceChildren(element('div', 'empty-state', state.monitors.length ? '조건에 맞는 추적이 없습니다.' : '아직 저장된 추적이 없습니다.'));
+    } else {
+      if (virtualRows.querySelector('.empty-state')) virtualRows.replaceChildren();
+      const index = oldAnchorId ? filteredIndexesById.get(oldAnchorId) ?? -1 : -1;
+      if (index >= 0) elements.monitorList.scrollTop = index * rowHeight + offset;
+      else elements.monitorList.scrollTop = Math.min(elements.monitorList.scrollTop, Math.max(0, filteredMonitors.length * rowHeight - elements.monitorList.clientHeight));
+    }
+    renderVirtualViewport();
+    renderSelectionControls();
+    updateDashboardRenderProgress(state.monitors.length, state.monitors.length);
     return Promise.resolve();
   }
 
   function render() {
     renderOverview();
     renderLabels();
+    void refreshRuntimeOverview();
     return renderMonitorList();
+  }
+
+  async function refreshRuntimeOverview(force = false) {
+    if (!force && Date.now() - runtimeRefreshedAt < 1000) return;
+    runtimeRefreshedAt = Date.now();
+    const target = document.querySelector('#runtimeSummary');
+    try {
+      const response = await send({ type: 'get-runtime-status' });
+      if (!response?.ok) throw new Error(response?.error || '실행 상태를 불러오지 못했습니다.');
+      target.textContent = `확인 ${response.activeCaptures ?? 0}/${response.globalLimit ?? '–'} · 대기 ${response.queuedCaptures ?? 0}${response.queuedCaptures ? ` (최장 ${formatSeconds(Math.floor((response.oldestQueueWaitMilliseconds || 0) / 1000))})` : ''} · 실시간 탭 ${response.residentLiveTabs ?? 0}/${response.residentLimit ?? '–'}${response.pendingCleanup?.length ? ` · 정리/소유권 확인 대기 ${response.pendingCleanup.length}` : ''}${response.backoff?.length ? ` · 저장 재시도 대기 ${response.backoff.length}` : ''}`;
+      document.querySelector('#runtimeOwnership').hidden = !response.pendingCleanup?.length;
+    } catch (error) { if (force) target.textContent = error.message; }
+  }
+
+  async function openRuntimeOwnership() {
+    let dialog = document.querySelector('#runtimeOwnershipDialog');
+    if (!dialog) {
+      dialog = element('dialog', 'dialog runtime-ownership-dialog'); dialog.id = 'runtimeOwnershipDialog';
+      const heading = element('div', 'dialog-heading');
+      const close = element('button', 'icon-button', '×'); close.type = 'button'; close.setAttribute('aria-label', '닫기'); close.onclick = () => dialog.close();
+      heading.append(element('h2', '', '탭 소유권·정리 확인'), close);
+      dialog.append(heading, element('p', 'field-help', '재시작 뒤 소유권이 불확실한 탭입니다. 표시된 주소와 탭 번호를 확인하고 연결·정리·기록 해제를 선택하세요. 기록 해제는 탭을 열어 둡니다.'), element('div', 'runtime-ownership-list'));
+      document.body.append(dialog);
+    }
+    const list = dialog.querySelector('.runtime-ownership-list');
+    list.replaceChildren(element('p', '', '탭 상태를 불러오는 중…'));
+    if (!dialog.open) dialog.showModal();
+    try {
+      const response = await send({ type: 'get-runtime-status' });
+      if (!response?.ok) throw new Error(response?.error || '탭 상태를 불러오지 못했습니다.');
+      list.replaceChildren();
+      const pending = response.pendingCleanup ?? [];
+      document.querySelector('#runtimeOwnership').hidden = !pending.length;
+      if (!pending.length) { list.append(element('p', '', '소유권 확인 또는 정리가 필요한 탭이 없습니다.')); return; }
+      for (const entry of pending) {
+        const row = element('section', 'runtime-ownership-record');
+        row.append(element('strong', '', monitorById(entry.monitorId ?? entry.id)?.name || entry.monitorId || entry.id), element('p', '', `${entry.kind === 'live' ? '실시간' : '일회성 확인'} · 탭 ${entry.tabId} · ${entry.stage === 'ownership-unverified' ? '소유권 확인 필요' : '정리 대기'}`), element('p', '', `저장 주소: ${entry.url || '없음'}`), element('p', '', entry.candidate ? `현재 주소: ${entry.candidate.url || '없음'} · ${entry.candidate.pinned ? '고정 탭' : '일반 탭'}` : '현재 탭 없음'));
+        const status = element('p', 'form-message'); status.setAttribute('role', 'status');
+        const controls = element('div', 'dialog-actions');
+        const canCleanup = !entry.candidate || (entry.candidate.pinned && entry.candidate.url === entry.url);
+        for (const [action, caption, available] of [['adopt', '이 탭으로 재연결', entry.canAdopt === true], ['retry-cleanup', '탭 닫고 정리', canCleanup], ['release', '탭 유지·기록 해제', true]]) {
+          const button = element('button', 'button secondary', caption); button.type = 'button'; button.disabled = !available; button.dataset.ownershipAction = action;
+          const operationId = operationIdFor(button);
+          button.onclick = async () => {
+            if (row.dataset.submitting) return;
+            row.dataset.submitting = 'true';
+            controls.querySelectorAll('button').forEach((item) => { item.disabled = true; });
+            try {
+              const result = await send({ type: 'reconcile-runtime-ownership', monitorId: entry.monitorId ?? entry.id, kind: entry.kind, tabId: entry.tabId, ownerToken: entry.ownerToken, expectedRevision: entry.monitorRevision, action, operationId });
+              if (!result?.ok) throw new Error(result?.error || '탭 복구 작업을 완료하지 못했습니다.');
+              showToast((action === 'adopt' ? '표시된 탭으로 실시간 감시 재연결을 요청했습니다.' : action === 'release' ? '탭을 유지하고 소유권 기록을 해제했습니다.' : '표시된 탭의 정리 기록을 처리했습니다.') + mutationWarningSuffix(result));
+              await refreshRuntimeOverview(true); await openRuntimeOwnership();
+              queueDashboardRefresh();
+            } catch (error) { status.textContent = error.message; }
+            finally { delete row.dataset.submitting; controls.querySelectorAll('button').forEach((item) => { item.disabled = item.dataset.ownershipAction === 'adopt' ? entry.canAdopt !== true : item.dataset.ownershipAction === 'retry-cleanup' ? !canCleanup : false; }); }
+          };
+          controls.append(button);
+        }
+        row.append(controls, status); list.append(row);
+      }
+    } catch (error) { list.replaceChildren(element('p', 'form-message', error.message)); }
   }
 
   async function refresh() {
@@ -945,6 +878,7 @@
         }
         if (expired) continue;
         state.monitors = monitors;
+        rebuildMonitorIndexes();
         state.settings = started.settings ?? { soundEnabled: true };
         await render();
         finishDashboardLoadProgress(total);
@@ -1140,11 +1074,22 @@
   }
 
   function monitorById(id) {
-    return state.monitors.find((monitor) => monitor.id === id);
+    return monitorsById.get(id);
   }
 
   async function loadMonitorDetail(id) {
     const response = await send({ type: 'get-monitor-detail', id });
+    if (response?.ok && response.fragmented) {
+      const fragments = [];
+      try {
+        for (let index = 0; index < response.fragmentCount; index += 1) {
+          const part = await send({ type: 'get-monitor-detail-fragment', id: response.id, revision: response.revision, detailToken: response.detailToken, fragmentIndex: index });
+          if (!part?.ok || typeof part.payload !== 'string') throw new Error(part?.error || '세부 정보 조각을 불러오지 못했습니다.');
+          fragments.push(part.payload);
+        }
+        return JSON.parse(fragments.join(''));
+      } finally { await send({ type: 'finish-monitor-detail', detailToken: response.detailToken }).catch(() => undefined); }
+    }
     if (!response?.ok || !response.monitor) {
       throw new Error(response?.error || '추적 세부 정보를 불러오지 못했습니다.');
     }
@@ -1152,7 +1097,7 @@
   }
 
   function pageByUrl(url) {
-    const monitors = state.monitors.filter((monitor) => monitor.url === url);
+    const monitors = monitorsByUrl.get(url) ?? [];
     return monitors.length ? { url, monitors } : null;
   }
 
@@ -1169,26 +1114,6 @@
     }
   }
 
-  function updateEditorInterval() {
-    const scheduleMode = elements.editScheduleMode.value === 'interval' ? 'interval' : 'manual';
-    const days = Number(elements.editDays.value);
-    let hours = Number(elements.editHours.value);
-    if (days === 14 && hours > 0) {
-      hours = 0;
-      elements.editHours.value = '0';
-    }
-    [...elements.editHours.options].forEach((option) => {
-      option.disabled = days === 14 && Number(option.value) > 0;
-    });
-    const total = days * 24 + hours;
-    elements.editIntervalInputs.hidden = scheduleMode === 'manual';
-    elements.editIntervalHelp.textContent = scheduleMode === 'manual'
-      ? '자동으로 갱신하지 않습니다. 대시보드의 “지금 확인”으로만 갱신합니다.'
-      : total >= MIN_HOURS && total <= MAX_HOURS
-      ? `매 ${formatDuration(total)}마다 확인합니다.`
-      : '간격은 최소 1시간, 최대 14일입니다.';
-    return total;
-  }
 
   function updateEditorInterval() {
     const rawMode = elements.editScheduleMode.value;
@@ -1213,7 +1138,7 @@
     elements.editIntervalHelp.textContent = scheduleMode === 'manual'
       ? '수동 확인만 수행합니다.'
       : scheduleMode === 'live'
-        ? '열려 있는 동일 페이지에 자동으로 실시간 감시를 연결합니다.'
+        ? '별도 고정 탭을 열어 실시간 감시합니다. 연결 상태와 상주 탭 한도에 따라 대기할 수 있습니다.'
         : scheduleMode === 'interval'
           ? (validInterval ? `매 ${formatSeconds(intervalSeconds)}마다 확인합니다.` : '간격은 5초에서 30일 사이의 정수여야 합니다.')
           : scheduleMode === 'random'
@@ -1229,6 +1154,8 @@
   }
 
   function openEditor(monitor) {
+    editorBaseline = structuredClone(monitor);
+    operationIds.delete(elements.editorForm);
     elements.editId.value = monitor.id;
     elements.editName.value = monitor.name;
     elements.editUrl.value = monitor.url;
@@ -1259,18 +1186,29 @@
     elements.editEnabled.checked = monitor.enabled;
     elements.editorMessage.textContent = '';
     updateEditorInterval();
+    editorOriginalValues = new Map([...elements.editorForm.querySelectorAll('input,select,textarea')].map((input) => [input.id, input.type === 'checkbox' ? input.checked : input.value]));
     elements.editorDialog.showModal();
   }
 
   async function saveEditor() {
+    return submitForm(elements.editorForm, elements.editorMessage, saveEditorUnlocked);
+  }
+
+  async function saveEditorUnlocked() {
     const id = elements.editId.value;
     const scheduleDraft = updateEditorInterval();
     const { scheduleMode, intervalSeconds, randomMin, randomMax, validInterval, validRandom, validCron } = scheduleDraft;
     const url = elements.editUrl.value.trim();
-    const locators = elements.editSelectors.value
-      .split(/\r?\n/)
-      .map(parseLocatorLine)
-      .filter(Boolean);
+    const parsedLocators = dashboardCore.parseLocators(elements.editSelectors.value);
+    if (parsedLocators.errors.length) {
+      const first = parsedLocators.errors[0];
+      elements.editorMessage.textContent = `${first.line}행: ${first.error}\n${first.source}`;
+      const start = elements.editSelectors.value.split(/\r?\n/).slice(0, first.line - 1).reduce((total, line) => total + line.length + 1, 0);
+      elements.editSelectors.focus();
+      elements.editSelectors.setSelectionRange(start, start + first.source.length);
+      return;
+    }
+    const locators = parsedLocators.locators;
     const delaySeconds = Number(elements.editDelaySeconds.value || 0);
     const timeoutSeconds = Number(elements.editTimeoutSeconds.value || 60);
     const regexp = elements.editRegexp.value.trim();
@@ -1314,13 +1252,16 @@
             }
           : { type: scheduleMode, params: {} };
 
-    const response = await send({
+    const draft = {
       type: 'save-monitor',
       id,
+      expectedRevision: editorBaseline?.revision,
+      operationId: operationIdFor(elements.editorForm),
       name: elements.editName.value,
       url,
       locators,
       tracking: {
+        ...editorBaseline?.tracking,
         dataAttr: elements.editCompareMode.value === 'data' ? 'data' : 'text',
         ignoreWhitespace: elements.editIgnoreWhitespace.checked,
         allowEmpty: elements.editAllowEmpty.checked,
@@ -1338,24 +1279,41 @@
       intervalSeconds,
       intervalHours: intervalSeconds / 3_600,
       enabled
+    };
+    // A stale editor must never resubmit fields the user did not edit.
+    const controlsUnchanged = (ids) => ids.every((id) => {
+      const input = document.getElementById(id);
+      return editorOriginalValues.get(id) === (input.type === 'checkbox' ? input.checked : input.value);
     });
+    for (const [key, control] of [['name', 'editName'], ['url', 'editUrl'], ['labels', 'editLabels'], ['enabled', 'editEnabled'], ['locators', 'editSelectors']]) {
+      if (controlsUnchanged([control])) delete draft[key];
+    }
+    const trackingControls = ['editCompareMode', 'editIgnoreWhitespace', 'editAllowEmpty', 'editDelaySeconds', 'editTimeoutSeconds', 'editRegexp', 'editRegexpFlags', 'editIncludeStyle', 'editIncludeScript', 'editKeepComments', 'editLive'];
+    if (controlsUnchanged(trackingControls)) delete draft.tracking;
+    if (controlsUnchanged(['editScheduleMode', 'editIntervalSeconds', 'editRandomMinSeconds', 'editRandomMaxSeconds', 'editCronExpression', 'editCronTimezone'])) {
+      for (const key of ['scheduleMode', 'schedule', 'intervalSeconds', 'intervalHours']) delete draft[key];
+    }
+    const response = await send(draft);
     if (!response?.ok) {
       elements.editorMessage.textContent = response?.error || '저장하지 못했습니다.';
       return;
     }
     elements.editorDialog.close();
-    showToast('추적 설정을 저장했습니다. 주소나 선택자를 바꾸면 다음 확인에서 새 기준값을 저장합니다.');
-    await refresh();
+    operationIds.delete(elements.editorForm);
+    showToast(`추적 설정을 저장했습니다. 기존 기준값과 기록을 보존하고 다음 확인 결과를 비교합니다.${mutationWarningSuffix(response)}`);
+    await refresh().catch((error) => showToast(`설정은 저장됐지만 목록을 불러오지 못했습니다: ${error.message}`));
   }
 
   function openPageUrlDialog(page, mode) {
+    pageUrlBaseline = page.monitors.map(({ id, revision, url }) => ({ id, revision, url }));
+    operationIds.delete(elements.pageUrlForm);
     const copying = mode === 'copy';
     elements.pageUrlDialog.dataset.mode = mode;
     elements.pageUrlSource.value = page.url;
     elements.pageUrlTitle.textContent = copying ? '주소만 복제' : '주소만 변경';
     elements.pageUrlDescription.textContent = copying
-      ? `이 페이지의 ${page.monitors.length}개 추적을 새 주소에 복제합니다. 원래 페이지 추적은 그대로 남습니다.`
-      : `이 페이지의 ${page.monitors.length}개 추적을 새 주소로 옮깁니다.`;
+      ? `이 주소의 전체 ${page.monitors.length}개 추적(필터 밖 ${page.monitors.filter((monitor) => !monitorMatchesFilters(monitor)).length}개 포함)을 새 주소에 복제합니다.`
+      : `이 주소의 전체 ${page.monitors.length}개 추적(필터 밖 ${page.monitors.filter((monitor) => !monitorMatchesFilters(monitor)).length}개 포함)을 옮깁니다. 기준값과 기록을 보존합니다.`;
     elements.pageUrlInput.value = page.url;
     elements.pageUrlMessage.textContent = '';
     elements.pageUrlSave.textContent = copying ? '새 주소로 복제' : '주소 변경';
@@ -1367,6 +1325,10 @@
   }
 
   async function savePageUrl() {
+    return submitForm(elements.pageUrlForm, elements.pageUrlMessage, savePageUrlUnlocked);
+  }
+
+  async function savePageUrlUnlocked() {
     const sourceUrl = elements.pageUrlSource.value;
     const targetUrl = elements.pageUrlInput.value.trim();
     const mode = elements.pageUrlDialog.dataset.mode;
@@ -1387,17 +1349,20 @@
     const response = await send({
       type: mode === 'copy' ? 'copy-page-url' : 'move-page-url',
       sourceUrl,
-      targetUrl
+      targetUrl,
+      expectedRevisions: pageUrlBaseline,
+      operationId: operationIdFor(elements.pageUrlForm)
     });
     if (!response?.ok) {
       elements.pageUrlMessage.textContent = response?.error || '주소를 저장하지 못했습니다.';
       return;
     }
     elements.pageUrlDialog.close();
-    showToast(mode === 'copy'
+    showToast((mode === 'copy'
       ? `${response.count}개 추적을 새 주소에 복제했습니다. 첫 확인에서 기준값을 저장합니다.`
-      : `${response.count}개 추적의 주소를 변경했습니다. 첫 확인에서 기준값을 저장합니다.`);
-    await refresh();
+      : `${response.count}개 추적의 주소를 변경했습니다. 기존 기준값과 기록을 보존했습니다.`) + mutationWarningSuffix(response));
+    operationIds.delete(elements.pageUrlForm);
+    await refresh().catch((error) => showToast(`주소는 저장됐지만 목록을 불러오지 못했습니다: ${error.message}`));
   }
 
   function updateBatchUrlPreview() {
@@ -1418,11 +1383,13 @@
       return 0;
     }
 
-    elements.batchUrlPreview.textContent = `${sourceHost} → ${targetHost}: ${affected}개 추적 페이지의 주소를 변경합니다.`;
+    const hidden = state.monitors.filter((monitor) => { try { return new URL(monitor.url).host.toLowerCase() === sourceHost && !monitorMatchesFilters(monitor); } catch { return false; } }).length;
+    elements.batchUrlPreview.textContent = `${sourceHost} → ${targetHost}: 전체 ${affected}개 추적(필터 밖 ${hidden}개 포함)의 주소를 변경합니다.`;
     return affected;
   }
 
   function openBatchUrlDialog() {
+    operationIds.delete(elements.batchUrlForm);
     elements.batchUrlSource.value = '';
     elements.batchUrlTarget.value = '';
     elements.batchUrlMessage.textContent = '';
@@ -1432,6 +1399,10 @@
   }
 
   async function saveBatchUrl() {
+    return submitForm(elements.batchUrlForm, elements.batchUrlMessage, saveBatchUrlUnlocked);
+  }
+
+  async function saveBatchUrlUnlocked() {
     const sourceHost = siteHostFromInput(elements.batchUrlSource.value);
     const targetHost = siteHostFromInput(elements.batchUrlTarget.value);
     if (!sourceHost || !targetHost) {
@@ -1450,14 +1421,16 @@
     elements.batchUrlSave.disabled = true;
     elements.batchUrlMessage.textContent = '주소를 안전하게 변경하는 중입니다…';
     try {
-      const response = await send({ type: 'replace-site-host', sourceHost, targetHost });
+      const expectedRevisions = state.monitors.filter((monitor) => { try { return new URL(monitor.url).host.toLowerCase() === sourceHost; } catch { return false; } }).map(({ id, revision, url }) => ({ id, revision, url }));
+      const response = await send({ type: 'replace-site-host', sourceHost, targetHost, expectedRevisions, operationId: operationIdFor(elements.batchUrlForm) });
       if (!response?.ok) {
         elements.batchUrlMessage.textContent = response?.error || '주소를 일괄 변경하지 못했습니다.';
         return;
       }
       elements.batchUrlDialog.close();
-      showToast(`${response.count}개 추적 페이지의 사이트 주소를 변경했습니다. 기존 기록을 유지한 채 다음 결과를 비교합니다.`);
-      await refresh();
+      operationIds.delete(elements.batchUrlForm);
+      showToast(`${response.count}개 추적 페이지의 사이트 주소를 변경했습니다. 기존 기록을 유지한 채 다음 결과를 비교합니다.${mutationWarningSuffix(response)}`);
+      await refresh().catch((error) => showToast(`주소는 저장됐지만 목록을 불러오지 못했습니다: ${error.message}`));
     } catch (error) {
       elements.batchUrlMessage.textContent = error.message || '주소를 일괄 변경하지 못했습니다.';
     } finally {
@@ -1531,19 +1504,19 @@
 
   function snapshotAttributesFromNode(node, tagName, baseUrl) {
     const attributes = {};
-    const title = clippedSnapshotText(node.getAttribute('title'), 500);
-    const label = clippedSnapshotText(node.getAttribute('aria-label'), 500);
+    const title = String(node.getAttribute('title') ?? '');
+    const label = String(node.getAttribute('aria-label') ?? '');
     if (title) attributes.title = title;
     if (label) attributes.ariaLabel = label;
     // This is displayed only as a changed-attribute badge; it is never copied
     // back onto the dashboard element, so opted-in inline-style comparison
     // cannot affect the dashboard's own rendering.
-    const inlineStyle = clippedSnapshotText(node.getAttribute('style'), 2_000);
+    const inlineStyle = String(node.getAttribute('style') ?? '');
     if (inlineStyle) attributes.style = inlineStyle;
-    for (const attribute of [...node.attributes].slice(0, 24)) {
+    for (const attribute of node.attributes) {
       const name = attribute.name.toLowerCase();
-      if (name === 'id' || name === 'class' || name.startsWith('data-')) {
-        const value = clippedSnapshotText(attribute.value, 500);
+      if (!['href', 'src', 'alt', 'style', 'title', 'aria-label', 'datetime', 'colspan', 'rowspan', 'start', 'value', 'open'].includes(name)) {
+        const value = attribute.value;
         if (value) attributes[name] = value;
       }
     }
@@ -1553,13 +1526,13 @@
       if (href) attributes.href = href;
     }
     if (tagName === 'img') {
-      const alt = clippedSnapshotText(node.getAttribute('alt'), 500);
+      const alt = String(node.getAttribute('alt') ?? '');
       if (alt) attributes.alt = alt;
       const src = safeSnapshotLink(node.getAttribute('src'), baseUrl);
       if (src) attributes.src = src;
     }
     if (tagName === 'time') {
-      const dateTime = clippedSnapshotText(node.getAttribute('datetime'), 200);
+      const dateTime = String(node.getAttribute('datetime') ?? '');
       if (dateTime) attributes.dateTime = dateTime;
     }
     if (['td', 'th'].includes(tagName)) {
@@ -1659,19 +1632,37 @@
   }
 
   function snapshotTextTree(snapshot) {
-    const lines = snapshotItems(snapshot);
+    const lines = Array.isArray(snapshot?.items) && snapshot.items.length > 1
+      ? snapshot.items
+      : String(snapshot?.text ?? snapshot?.data ?? '').split('\n');
     return {
       type: 'root',
-      children: lines.map((line) => ({
+      children: lines.filter((line) => line != null).map((line) => ({
         type: 'element',
         tagName: 'p',
         attributes: {},
-        children: [{ type: 'text', text: line }]
+        ...(line?.identity ? { identity: line.identity } : {}),
+        children: [{ type: 'text', text: typeof line === 'string' ? line : String(line.text ?? '') }]
       }))
     };
   }
 
+  function hasStructuredSnapshotItems(snapshot) {
+    return Array.isArray(snapshot?.items) && (snapshot.items.length > 1 || snapshot.items.some((item) => item?.identity || item?.locator || item?.frame));
+  }
+
   function snapshotTree(snapshot, fallbackBaseUrl = '') {
+    if (hasStructuredSnapshotItems(snapshot)) {
+      return {
+        type: 'root',
+        children: snapshot.items.map((item) => {
+          const itemSnapshot = { text: item.text, html: item.html, data: item.data, baseUrl: snapshotBaseUrl(snapshot, fallbackBaseUrl) };
+          const large = Math.max(String(item.text ?? '').length, String(item.html ?? '').length, String(item.data ?? '').length) > SNAPSHOT_MAX_TEXT;
+          const tree = large ? { children: [] } : snapshotTree(itemSnapshot, fallbackBaseUrl);
+          return { type: 'element', tagName: 'article', attributes: {}, identity: item.identity, frame: item.frame, locator: item.locator, locators: item.locators, itemSnapshot, large: large || tree.truncated, children: large || tree.truncated ? [] : tree.children };
+        })
+      };
+    }
     const html = typeof snapshot?.html === 'string' ? snapshot.html.trim() : '';
     if (!html || typeof DOMParser !== 'function') return snapshotTextTree(snapshot);
     try {
@@ -1681,13 +1672,13 @@
       for (const node of parsed.body.childNodes) {
         appendSnapshotTreeChild(children, snapshotTreeFromDomNode(node, context));
       }
-      return children.length ? { type: 'root', children } : snapshotTextTree(snapshot);
+      return children.length ? { type: 'root', children, truncated: context.nodes >= SNAPSHOT_MAX_NODES || context.text >= SNAPSHOT_MAX_TEXT } : snapshotTextTree(snapshot);
     } catch {
       return snapshotTextTree(snapshot);
     }
   }
 
-  function visibleSnapshotText(node, maximum = 800) {
+  function visibleSnapshotText(node, maximum = Infinity) {
     if (!node) return '';
     if (node.visibleText !== undefined) return node.visibleText;
     let text = '';
@@ -1702,30 +1693,7 @@
   }
 
   function snapshotFingerprint(node, maximum = 260) {
-    if (!node) return '';
-    if (node.fingerprint !== undefined) return node.fingerprint;
-    if (node.type === 'text') {
-      node.fingerprint = `text:${clippedSnapshotText(node.text, maximum)}`;
-      return node.fingerprint;
-    }
-    if (node.type === 'code') {
-      node.fingerprint = `code:${node.language}:${clippedSnapshotText(node.text, maximum)}`;
-      return node.fingerprint;
-    }
-    if (node.type === 'comment') {
-      node.fingerprint = `comment:${clippedSnapshotText(node.text, maximum)}`;
-      return node.fingerprint;
-    }
-    const attributeText = Object.entries(node.attributes ?? {})
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, value]) => `${key}=${String(value)}`)
-      .join('&');
-    const childText = (node.children ?? [])
-      .map((child) => snapshotFingerprint(child, Math.max(32, Math.floor(maximum / 2))))
-      .join('|')
-      .slice(0, maximum);
-    node.fingerprint = `${node.type}:${node.tagName ?? ''}:${attributeText}:${childText}`.slice(0, maximum);
-    return node.fingerprint;
+    return dashboardCore.fingerprint(node);
   }
 
   function wordOverlap(left, right) {
@@ -1776,152 +1744,12 @@
     return Boolean(beforeText && beforeText === afterText);
   }
 
-  function greedySnapshotAlignment(beforeChildren, afterChildren) {
-    const operations = [];
-    let beforeIndex = 0;
-    let afterIndex = 0;
-    const lookAhead = 12;
-
-    while (beforeIndex < beforeChildren.length && afterIndex < afterChildren.length) {
-      const before = beforeChildren[beforeIndex];
-      const after = afterChildren[afterIndex];
-      if (sameSnapshotAlignmentAnchor(before, after) || snapshotNodeSimilarity(before, after) >= 1) {
-        operations.push({ type: 'pair', before, after });
-        beforeIndex += 1;
-        afterIndex += 1;
-        continue;
-      }
-      const matchingAfter = afterChildren.slice(afterIndex + 1, afterIndex + 1 + lookAhead)
-        .findIndex((candidate) => sameSnapshotAlignmentAnchor(before, candidate));
-      const matchingBefore = beforeChildren.slice(beforeIndex + 1, beforeIndex + 1 + lookAhead)
-        .findIndex((candidate) => sameSnapshotAlignmentAnchor(candidate, after));
-      if (matchingAfter >= 0 && (matchingBefore < 0 || matchingAfter <= matchingBefore)) {
-        operations.push({ type: 'added', after });
-        afterIndex += 1;
-      } else if (matchingBefore >= 0) {
-        operations.push({ type: 'removed', before });
-        beforeIndex += 1;
-      } else {
-        operations.push({ type: 'removed', before }, { type: 'added', after });
-        beforeIndex += 1;
-        afterIndex += 1;
-      }
-    }
-    while (beforeIndex < beforeChildren.length) operations.push({ type: 'removed', before: beforeChildren[beforeIndex++] });
-    while (afterIndex < afterChildren.length) operations.push({ type: 'added', after: afterChildren[afterIndex++] });
-    return operations;
-  }
-
   function alignSnapshotChildren(beforeChildren, afterChildren) {
-    const beforeLength = beforeChildren.length;
-    const afterLength = afterChildren.length;
-    if (!beforeLength || !afterLength) {
-      return [
-        ...beforeChildren.map((before) => ({ type: 'removed', before })),
-        ...afterChildren.map((after) => ({ type: 'added', after }))
-      ];
-    }
-    if (beforeLength * afterLength > SNAPSHOT_ALIGNMENT_CELLS) {
-      return greedySnapshotAlignment(beforeChildren, afterChildren);
-    }
-
-    const matrix = Array.from({ length: beforeLength + 1 }, () => new Float32Array(afterLength + 1));
-    for (let beforeIndex = beforeLength - 1; beforeIndex >= 0; beforeIndex -= 1) {
-      for (let afterIndex = afterLength - 1; afterIndex >= 0; afterIndex -= 1) {
-        const paired = snapshotNodeSimilarity(beforeChildren[beforeIndex], afterChildren[afterIndex]);
-        matrix[beforeIndex][afterIndex] = Math.max(
-          matrix[beforeIndex + 1][afterIndex],
-          matrix[beforeIndex][afterIndex + 1],
-          paired ? paired + matrix[beforeIndex + 1][afterIndex + 1] : 0
-        );
-      }
-    }
-
-    const operations = [];
-    let beforeIndex = 0;
-    let afterIndex = 0;
-    while (beforeIndex < beforeLength && afterIndex < afterLength) {
-      const paired = snapshotNodeSimilarity(beforeChildren[beforeIndex], afterChildren[afterIndex]);
-      const diagonal = paired ? paired + matrix[beforeIndex + 1][afterIndex + 1] : -1;
-      const removed = matrix[beforeIndex + 1][afterIndex];
-      const added = matrix[beforeIndex][afterIndex + 1];
-      if (paired && diagonal >= removed && diagonal >= added) {
-        operations.push({ type: 'pair', before: beforeChildren[beforeIndex++], after: afterChildren[afterIndex++] });
-      } else if (removed >= added) {
-        operations.push({ type: 'removed', before: beforeChildren[beforeIndex++] });
-      } else {
-        operations.push({ type: 'added', after: afterChildren[afterIndex++] });
-      }
-    }
-    while (beforeIndex < beforeLength) operations.push({ type: 'removed', before: beforeChildren[beforeIndex++] });
-    while (afterIndex < afterLength) operations.push({ type: 'added', after: afterChildren[afterIndex++] });
-    return operations;
+    return dashboardCore.align(beforeChildren, afterChildren, snapshotNodeSimilarity, SNAPSHOT_ALIGNMENT_CELLS);
   }
 
   function buildDiffOperations(before, after, maxCells = 60_000) {
-    const operations = [];
-    let prefix = 0;
-    while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) {
-      operations.push({ type: 'same', value: before[prefix] });
-      prefix += 1;
-    }
-
-    let beforeEnd = before.length - 1;
-    let afterEnd = after.length - 1;
-    const suffix = [];
-    while (beforeEnd >= prefix && afterEnd >= prefix && before[beforeEnd] === after[afterEnd]) {
-      suffix.unshift({ type: 'same', value: before[beforeEnd] });
-      beforeEnd -= 1;
-      afterEnd -= 1;
-    }
-
-    const beforeMiddle = before.slice(prefix, beforeEnd + 1);
-    const afterMiddle = after.slice(prefix, afterEnd + 1);
-    if (!beforeMiddle.length) {
-      afterMiddle.forEach((value) => operations.push({ type: 'added', value }));
-      return operations.concat(suffix);
-    }
-    if (!afterMiddle.length) {
-      beforeMiddle.forEach((value) => operations.push({ type: 'removed', value }));
-      return operations.concat(suffix);
-    }
-    if (beforeMiddle.length * afterMiddle.length > maxCells) {
-      beforeMiddle.forEach((value) => operations.push({ type: 'removed', value }));
-      afterMiddle.forEach((value) => operations.push({ type: 'added', value }));
-      return operations.concat(suffix);
-    }
-
-    const matrix = Array.from({ length: beforeMiddle.length + 1 }, () => new Uint16Array(afterMiddle.length + 1));
-    for (let beforeIndex = beforeMiddle.length - 1; beforeIndex >= 0; beforeIndex -= 1) {
-      for (let afterIndex = afterMiddle.length - 1; afterIndex >= 0; afterIndex -= 1) {
-        matrix[beforeIndex][afterIndex] = beforeMiddle[beforeIndex] === afterMiddle[afterIndex]
-          ? matrix[beforeIndex + 1][afterIndex + 1] + 1
-          : Math.max(matrix[beforeIndex + 1][afterIndex], matrix[beforeIndex][afterIndex + 1]);
-      }
-    }
-
-    let beforeIndex = 0;
-    let afterIndex = 0;
-    while (beforeIndex < beforeMiddle.length && afterIndex < afterMiddle.length) {
-      if (beforeMiddle[beforeIndex] === afterMiddle[afterIndex]) {
-        operations.push({ type: 'same', value: beforeMiddle[beforeIndex] });
-        beforeIndex += 1;
-        afterIndex += 1;
-      } else if (matrix[beforeIndex + 1][afterIndex] >= matrix[beforeIndex][afterIndex + 1]) {
-        operations.push({ type: 'removed', value: beforeMiddle[beforeIndex] });
-        beforeIndex += 1;
-      } else {
-        operations.push({ type: 'added', value: afterMiddle[afterIndex] });
-        afterIndex += 1;
-      }
-    }
-    while (beforeIndex < beforeMiddle.length) {
-      operations.push({ type: 'removed', value: beforeMiddle[beforeIndex++] });
-    }
-    while (afterIndex < afterMiddle.length) {
-      operations.push({ type: 'added', value: afterMiddle[afterIndex++] });
-    }
-    return operations.concat(suffix);
+    return dashboardCore.diff(before, after, maxCells);
   }
 
   function tokenize(text) {
@@ -1991,6 +1819,12 @@
       markSnapshotSubtree(beforeStates, before, 'removed');
       return;
     }
+    if ((before.large || after.large) && before.itemSnapshot && after.itemSnapshot) {
+      const comparison = { previous: before.itemSnapshot, current: after.itemSnapshot };
+      Object.assign(stateForSnapshotNode(beforeStates, before), { largeComparison: comparison, largeChange: snapshotFingerprint(before) !== snapshotFingerprint(after) });
+      Object.assign(stateForSnapshotNode(afterStates, after), { largeComparison: comparison, largeChange: snapshotFingerprint(before) !== snapshotFingerprint(after) });
+      return;
+    }
     if (before.type === 'text' && after.type === 'text') {
       if (before.text === after.text) return;
       const diff = buildSnapshotTextDiff(before.text, after.text);
@@ -2035,6 +1869,10 @@
     }
     for (const operation of alignSnapshotChildren(before.children ?? [], after.children ?? [])) {
       if (operation.type === 'pair') {
+        if (operation.moved) {
+          stateForSnapshotNode(beforeStates, operation.before).moved = true;
+          stateForSnapshotNode(afterStates, operation.after).moved = true;
+        }
         compareSnapshotNodes(operation.before, operation.after, beforeStates, afterStates);
       } else if (operation.type === 'removed') {
         markSnapshotSubtree(beforeStates, operation.before, 'removed');
@@ -2104,6 +1942,10 @@
   }
 
   function decorateSnapshotNode(target, node, nodeState, side, inheritedMode) {
+    if (nodeState?.moved) {
+      target.classList.add('snapshot-moved');
+      target.title = '순서 이동 (내용 변경과 별도)';
+    }
     const mode = nodeState?.mode ?? inheritedMode;
     target.classList.add('snapshot-node');
     if (mode) {
@@ -2131,6 +1973,18 @@
   }
 
   function appendSnapshotNode(target, node, states, side, inheritedMode = '', insideLink = false) {
+    if ((node.large || states.get(node)?.largeComparison) && node.itemSnapshot) {
+      const nodeState = states.get(node);
+      const previous = element('pre');
+      const current = element('pre');
+      const comparison = nodeState?.largeComparison;
+      renderPagedSnapshotDiff(comparison?.previous ?? (side === 'before' ? node.itemSnapshot : null), comparison?.current ?? (side === 'after' ? node.itemSnapshot : null), { previousSnapshot: previous, currentSnapshot: current });
+      const shell = element('section', 'snapshot-large-item');
+      decorateSnapshotNode(shell, node, nodeState, side, inheritedMode);
+      shell.append(side === 'before' ? previous : current);
+      target.append(shell);
+      return;
+    }
     const nodeState = states.get(node);
     const mode = nodeState?.mode ?? inheritedMode;
     if (node.type === 'root') {
@@ -2215,30 +2069,137 @@
       target.append(element('span', 'snapshot-empty', '(텍스트 없음)'));
       return;
     }
+    const pageSize = 80;
+    let page = 0;
+    const hasChange = (node) => Boolean(states.get(node)?.mode || states.get(node)?.moved || states.get(node)?.largeChange || states.get(node)?.changedAttributes?.length || states.get(node)?.textOperations?.some((operation) => operation.type !== 'same') || (node.children ?? []).some(hasChange));
+    const changedPages = [...new Set(tree.children.map((node, index) => hasChange(node) ? Math.floor(index / pageSize) : -1).filter((index) => index >= 0))];
+    if (changedPages.length) page = changedPages[0];
     const documentView = element('div', 'snapshot-document');
-    tree.children.forEach((node) => appendSnapshotNode(documentView, node, states, side));
-    target.append(documentView);
+    const controls = element('div', 'snapshot-controls');
+    const draw = () => {
+      documentView.replaceChildren(); controls.replaceChildren();
+      tree.children.slice(page * pageSize, (page + 1) * pageSize).forEach((node) => appendSnapshotNode(documentView, node, states, side));
+      if (tree.children.length > pageSize) {
+        const previous = element('button', '', '이전 부분');
+        const next = element('button', '', '다음 부분');
+        const change = element('button', '', '다음 변경');
+        previous.type = next.type = change.type = 'button';
+        previous.disabled = page === 0;
+        next.disabled = (page + 1) * pageSize >= tree.children.length;
+        change.disabled = !changedPages.length;
+        previous.onclick = () => { page -= 1; draw(); };
+        next.onclick = () => { page += 1; draw(); };
+        change.onclick = () => { page = changedPages.find((value) => value > page) ?? changedPages[0]; draw(); };
+        controls.append(element('span', '', `부분 ${page + 1} / ${Math.ceil(tree.children.length / pageSize)} · 전체 ${tree.children.length}개 항목`), previous, next, change);
+      }
+    };
+    target.append(controls, documentView);
+    draw();
+  }
+
+  function snapshotContentNotice(snapshot) {
+    if (!snapshot) return '저장된 값 없음';
+    if (snapshot.contentUnavailable) return '저장 내용 손상 · 원본은 복구함에 보관됨';
+    if (snapshot.contentOmitted || snapshot.omitted || snapshot.completeness === 'omitted') return '내용 생략됨 (빈 값과 다릅니다)';
+    if (snapshot.textTruncated || snapshot.dataTruncated || snapshot.htmlTruncated || snapshot.truncated) return '저장 당시 일부 내용이 잘렸습니다. 남아 있는 저장 내용만 표시합니다.';
+    if (snapshot.exists === false) return '관측 결과가 비어 있음';
+    return '';
+  }
+
+  function renderPagedSnapshotDiff(previousSnapshot, currentSnapshot, targets, representation = 'auto') {
+    const raw = (snapshot) => String(snapshot?.text ?? snapshot?.data ?? snapshot?.html ?? '');
+    let before = raw(previousSnapshot);
+    let after = raw(currentSnapshot);
+    if (representation === 'html' || (representation === 'auto' && before === after && (previousSnapshot?.data || previousSnapshot?.html) !== (currentSnapshot?.data || currentSnapshot?.html))) {
+      before = String(previousSnapshot?.data || previousSnapshot?.html || '');
+      after = String(currentSnapshot?.data || currentSnapshot?.html || '');
+    }
+    const chunks = (value) => (value.match(/[^\n]*\n|[^\n]+$/g) || []).flatMap((line) => line.match(/[\s\S]{1,1000}/g) || []);
+    let prefix = 0;
+    while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix += 1;
+    let beforeEnd = before.length;
+    let afterEnd = after.length;
+    while (beforeEnd > prefix && afterEnd > prefix && before[beforeEnd - 1] === after[afterEnd - 1]) { beforeEnd -= 1; afterEnd -= 1; }
+    const operations = [
+      ...chunks(before.slice(0, prefix)).map((value) => ({ type: 'same', value })),
+      ...dashboardCore.diff(chunks(before.slice(prefix, beforeEnd)), chunks(after.slice(prefix, afterEnd))),
+      ...chunks(before.slice(beforeEnd)).map((value) => ({ type: 'same', value }))
+    ];
+    const pages = [];
+    let page = [];
+    let chars = 0;
+    for (const operation of operations) {
+      if (chars + operation.value.length > 16000 && page.length) { pages.push(page); page = []; chars = 0; }
+      page.push(operation); chars += operation.value.length;
+    }
+    if (page.length) pages.push(page);
+    if (!pages.length) pages.push([]);
+    const changedPages = pages.map((values, index) => values.some((operation) => operation.type !== 'same') ? index : -1).filter((index) => index >= 0);
+    let index = changedPages[0] ?? 0;
+    const draw = () => {
+      for (const [side, target, snapshot, total] of [['before', targets.previousSnapshot, previousSnapshot, before.length], ['after', targets.currentSnapshot, currentSnapshot, after.length]]) {
+        target.replaceChildren();
+        target.classList.add('snapshot-render');
+        const controls = element('div', 'snapshot-controls');
+        controls.append(element('span', '', `큰 내용 부분 ${index + 1}/${pages.length} · 저장된 전체 ${total.toLocaleString('ko-KR')}자. ${snapshotContentNotice(snapshot)}`));
+        if (previousSnapshot?.html || currentSnapshot?.html || previousSnapshot?.data || currentSnapshot?.data) {
+          for (const [caption, mode] of [['텍스트 보기', 'text'], ['저장 HTML·데이터 보기', 'html']]) {
+            const button = element('button', '', caption); button.type = 'button';
+            button.onclick = () => renderPagedSnapshotDiff(previousSnapshot, currentSnapshot, targets, mode);
+            controls.append(button);
+          }
+        }
+        for (const [caption, destination] of [['이전 부분', index - 1], ['다음 부분', index + 1], ['다음 변경', changedPages.find((value) => value > index) ?? changedPages[0]]]) {
+          const button = element('button', '', caption); button.type = 'button';
+          button.disabled = destination === undefined || destination < 0 || destination >= pages.length;
+          button.onclick = () => { index = destination; draw(); };
+          controls.append(button);
+        }
+        const content = element('div', 'snapshot-text-page');
+        for (const operation of pages[index]) {
+          if ((side === 'before' && operation.type === 'added') || (side === 'after' && operation.type === 'removed')) continue;
+          const value = element('span', operation.type === 'added' ? 'diff-added' : operation.type === 'removed' ? 'diff-removed' : '', operation.value);
+          content.append(value);
+        }
+        target.append(controls, content);
+      }
+    };
+    draw();
   }
 
   function renderSnapshotDiff(previousSnapshot, currentSnapshot, fallbackBaseUrl = '', targets = elements) {
+    const structured = [previousSnapshot, currentSnapshot].some(hasStructuredSnapshotItems);
+    if (!structured && [previousSnapshot, currentSnapshot].some((snapshot) => Math.max(String(snapshot?.text ?? '').length, String(snapshot?.data ?? '').length, String(snapshot?.html ?? '').length) > SNAPSHOT_MAX_TEXT)) {
+      renderPagedSnapshotDiff(previousSnapshot, currentSnapshot, targets);
+      return;
+    }
     const beforeTree = snapshotTree(previousSnapshot, fallbackBaseUrl);
     const afterTree = snapshotTree(currentSnapshot, fallbackBaseUrl);
+    if (beforeTree.truncated || afterTree.truncated) {
+      renderPagedSnapshotDiff(previousSnapshot, currentSnapshot, targets);
+      return;
+    }
     const beforeStates = new WeakMap();
     const afterStates = new WeakMap();
     compareSnapshotNodes(beforeTree, afterTree, beforeStates, afterStates);
     renderSnapshotTree(targets.previousSnapshot, beforeTree, beforeStates, 'before');
     renderSnapshotTree(targets.currentSnapshot, afterTree, afterStates, 'after');
+    for (const [target, snapshot] of [[targets.previousSnapshot, previousSnapshot], [targets.currentSnapshot, currentSnapshot]]) {
+      const notice = snapshotContentNotice(snapshot);
+      if (notice) target.prepend(element('p', 'snapshot-notice', notice));
+    }
   }
 
   function openChange(monitor) {
     const lastChange = monitor.lastChange;
     const current = lastChange?.current ?? monitor.snapshot;
     elements.changeDialog.dataset.id = monitor.id;
+    elements.changeDialog.dataset.changeId = String(lastChange?.id ?? lastChange?.detectedAt ?? monitor.lastChangedAt ?? '');
     elements.changeTitle.textContent = monitor.name;
     elements.changeWhen.textContent = `감지 시각: ${formatDate(monitor.lastChangedAt ?? lastChange?.detectedAt)}`;
     renderSnapshotDiff(
-      lastChange?.previous?.exists ? lastChange.previous : null,
-      current?.exists ? current : null,
+      lastChange?.previous ?? null,
+      current ?? null,
       monitor.url
     );
     elements.changeDialog.showModal();
@@ -2280,7 +2241,7 @@
       const kind = entry.kind === 'baseline' ? '기준값' : entry.kind === 'evidence' ? '선택 실패 화면' : '변경 기록';
       button.append(
         element('strong', '', kind),
-        element('span', '', `${formatDate(entry.capturedAt ?? entry.snapshot?.capturedAt)} · ${entry.snapshot?.matchCount ?? 0}개 일치`)
+        element('span', '', `${formatDate(entry.capturedAt ?? entry.snapshot?.capturedAt)} · ${entry.snapshot?.contentUnavailable ? '저장 내용 손상 · 원본 보관됨' : entry.contentOmitted || entry.snapshot?.contentOmitted ? '내용 생략됨' : `${entry.snapshot?.matchCount ?? 0}개 일치`}`)
       );
       elements.historyEntries.append(button);
     });
@@ -2300,14 +2261,14 @@
     const previous = activeHistoryEntries[selectedIndex + 1] ?? null;
     elements.historyWhen.textContent = `${current.kind === 'baseline' ? '기준값' : current.kind === 'evidence' ? '선택 실패' : '변경'} · ${formatDate(current.capturedAt ?? current.snapshot?.capturedAt)}`;
     renderHistoryEntries(selectedIndex);
-    renderSnapshotDiff(previous?.snapshot ?? null, current.snapshot ?? null, activeHistoryUrl, {
+    renderSnapshotDiff(previous?.contentOmitted ? { contentOmitted: true } : previous?.snapshot ?? null, current.contentOmitted ? { contentOmitted: true } : current.snapshot ?? null, activeHistoryUrl, {
       previousSnapshot: elements.historyPreviousSnapshot,
       currentSnapshot: elements.historyCurrentSnapshot
     });
   }
 
   function openHistory(monitor) {
-    const stored = Array.isArray(monitor.history) ? monitor.history.filter((entry) => entry?.snapshot) : [];
+    const stored = Array.isArray(monitor.history) ? monitor.history.filter((entry) => entry && (entry.snapshot || entry.contentOmitted || entry.capturedAt)) : [];
     activeHistoryEntries = stored.length
       ? stored
       : monitor.snapshot ? [{ kind: 'baseline', capturedAt: monitor.snapshot.capturedAt, snapshot: monitor.snapshot }] : [];
@@ -2353,20 +2314,24 @@
   }
 
   async function acknowledgeChange() {
+    if (elements.acknowledgeButton.disabled) return;
     const id = elements.changeDialog.dataset.id;
-    closeChangeDialog();
+    const expectedChangeId = elements.changeDialog.dataset.changeId;
+    elements.acknowledgeButton.disabled = true;
     try {
-      const response = await send({ type: 'acknowledge-monitor', id });
+      const response = await send({ type: 'acknowledge-monitor', id, expectedChangeId, operationId: crypto.randomUUID() });
       if (!response?.ok) {
         throw new Error(response?.error || 'Could not mark the change as reviewed.');
       }
-      await refresh();
+      closeChangeDialog();
+      await refresh().catch((error) => showToast(`읽음 처리는 완료됐지만 목록을 불러오지 못했습니다: ${error.message}`));
     } catch (error) {
       showToast(error.message || 'Could not mark the change as reviewed.');
-    }
+    } finally { elements.acknowledgeButton.disabled = false; }
   }
 
   async function actionCheck(monitor, button) {
+    const caption = button.textContent;
     button.disabled = true;
     button.textContent = '확인 중…';
     try {
@@ -2378,24 +2343,43 @@
     } catch (error) {
       showToast(error.message || '확인하지 못했습니다.');
     }
-    await refresh();
+    try { await refresh(); }
+    catch (error) { showToast(`확인 결과와 별도로 목록을 불러오지 못했습니다: ${error.message}`); }
+    finally { button.disabled = false; button.textContent = caption; }
   }
 
   async function actionCheckPage(page, button) {
+    const caption = button.textContent;
     button.disabled = true;
     button.textContent = '확인 중…';
     try {
       const response = await send({ type: 'check-page', url: page.url });
       if (!response?.ok) throw new Error(response?.error || '페이지를 확인하지 못했습니다.');
-      showToast(response.needsReview && response.changed
-        ? '변경을 감지했고, 일부 요소는 찾지 못했습니다. 로그인 상태나 페이지 구성을 확인해 주세요.'
-        : response.needsReview
-          ? '일부 요소를 찾지 못했습니다. 로그인 상태나 페이지 구성을 확인해 주세요.'
-          : response.changed ? '변경을 감지했습니다.' : '이 페이지의 추적을 최신 상태로 확인했습니다.');
+      const counts = dashboardCore.resultSummary(response, page.monitors.length);
+      showToast(checkResultText(counts, response.changedCount ?? Number(response.changed), response.needsReviewCount ?? Number(response.needsReview)));
+      installFailedRetry(response.failedIds ?? [], counts.failed ? page.monitors.map((monitor) => monitor.id) : []);
     } catch (error) {
       showToast(error.message || '페이지를 확인하지 못했습니다.');
     }
-    await refresh();
+    try { await refresh(); }
+    catch (error) { showToast(`페이지 확인 결과와 별도로 목록을 불러오지 못했습니다: ${error.message}`); }
+    finally { button.disabled = false; button.textContent = caption; }
+  }
+
+  function checkResultText(counts, changed = 0, needsReview = 0) {
+    return `확인 완료 ${counts.completed} · 실패 ${counts.failed} · 일시정지 ${counts.paused} · 누락 ${counts.missing} · 충돌 ${counts.conflict} · 미처리 ${counts.unprocessed}${changed ? ` · 변경 ${Number(changed)}` : ''}${needsReview ? ` · 확인 필요 ${Number(needsReview)}` : ''}`;
+  }
+
+  function installFailedRetry(ids, fallback = []) {
+    let retry = document.querySelector('#retryFailedChecks');
+    if (!retry) { retry = element('button', 'button secondary'); retry.id = 'retryFailedChecks'; retry.type = 'button'; elements.bulkStatus.parentElement.append(retry); }
+    const targets = ids.length ? ids : fallback;
+    retry.hidden = !targets.length;
+    retry.textContent = ids.length ? `실패 ${ids.length}개 재시도` : '실패 포함 목록 재시도';
+    retry.onclick = () => {
+      selectedMonitorIds.clear(); targets.forEach((id) => { if (monitorsById.has(id)) selectedMonitorIds.add(id); });
+      patchVisibleSelections(); void actionCheckSelected();
+    };
   }
 
   async function actionCheckSelected() {
@@ -2411,6 +2395,11 @@
     let changed = 0;
     let needsReview = 0;
     let failed = 0;
+    let paused = 0;
+    let missing = 0;
+    let conflict = 0;
+    let unprocessed = 0;
+    const failedIds = [];
     let lastError = '';
     void renderMonitorList();
 
@@ -2421,23 +2410,28 @@
         try {
           const response = await send({ type: 'check-monitors', ids: chunk });
           if (!response?.ok) throw new Error(response?.error || '선택한 추적을 확인하지 못했습니다.');
-          completed += response.completed ?? 0;
+          const counts = dashboardCore.resultSummary(response, chunk.length);
+          completed += counts.completed;
           changed += response.changed ?? 0;
           needsReview += response.needsReview ?? 0;
-          failed += response.failed ?? 0;
+          failed += counts.failed;
+          paused += counts.paused; missing += counts.missing; conflict += counts.conflict; unprocessed += counts.unprocessed;
+          failedIds.push(...(response.failedIds ?? []));
         } catch (error) {
           failed += chunk.length;
+          failedIds.push(...chunk);
           lastError = error.message || '선택한 추적을 확인하지 못했습니다.';
         }
-        await refresh();
       }
 
-      const summary = `${completed}개 확인 완료${changed ? ` · 변경 ${changed}개` : ''}${needsReview ? ` · 확인 필요 ${needsReview}개` : ''}${failed ? ` · 실패 ${failed}개` : ''}`;
+      const summary = checkResultText({ completed, failed, paused, missing, conflict, unprocessed }, changed, needsReview);
       elements.bulkStatus.textContent = lastError ? `${summary} · ${lastError}` : summary;
       showToast(lastError ? `${summary} (${lastError})` : summary);
+      installFailedRetry(failedIds, failed ? ids : []);
+      await refresh().catch((error) => showToast(`${summary} · 목록 불러오기 실패: ${error.message}`));
     } finally {
       batchActionRunning = false;
-      void renderMonitorList();
+      patchVisibleSelections(); flushQueuedDashboardRefresh();
     }
   }
 
@@ -2465,23 +2459,18 @@
     elements.bulkStatus.textContent = `선택한 ${ids.length}개 추적의 라벨을 ${mode === 'add' ? '추가' : '제거'}하는 중…`;
     void renderMonitorList();
     try {
-      const response = await send({ type: 'update-monitor-labels', mode, label, ids });
-      if (!response?.ok) throw new Error(response?.error || '라벨을 변경하지 못했습니다.');
-      const summary = `${response.updated ?? 0}개 추적의 라벨을 ${mode === 'add' ? '추가' : '제거'}했습니다.`;
-      const details = [
-        response.skipped ? `${response.skipped}개 건너뜀` : '',
-        response.missing ? `${response.missing}개 찾지 못함` : ''
-      ].filter(Boolean).join(' · ');
-      elements.bulkStatus.textContent = details ? `${summary} ${details}` : summary;
-      showToast(details ? `${summary} ${details}` : summary);
-      await refresh();
+      const counts = await runBulkMutation('update-monitor-labels', ids, { mode, label });
+      const summary = `라벨 ${mode === 'add' ? '추가' : '제거'} ${counts.completed} · 건너뜀 ${counts.skipped} · 실패 ${counts.failed} · 누락 ${counts.missing} · 충돌 ${counts.conflict} · 미처리 ${counts.unprocessed}`;
+      elements.bulkStatus.textContent = summary;
+      showToast(summary);
+      await refresh().catch((error) => showToast(`${summary} · 목록 불러오기 실패: ${error.message}`));
     } catch (error) {
       const message = error.message || '라벨을 변경하지 못했습니다.';
       elements.bulkStatus.textContent = message;
       showToast(message);
     } finally {
       batchActionRunning = false;
-      void renderMonitorList();
+      patchVisibleSelections(); flushQueuedDashboardRefresh();
     }
   }
 
@@ -2492,28 +2481,49 @@
       renderSelectionControls();
       return;
     }
-    if (!window.confirm(`선택한 ${ids.length}개 페이지 추적을 삭제할까요? 이 작업은 되돌릴 수 없습니다.`)) return;
+    const hidden = ids.filter((id) => !monitorMatchesFilters(monitorById(id))).length;
+    if (!window.confirm(`선택한 ${ids.length}개 추적(필터 밖 ${hidden}개 포함)을 삭제할까요?`)) return;
 
     batchActionRunning = true;
     elements.bulkStatus.textContent = `선택한 ${ids.length}개 페이지 추적을 삭제하는 중…`;
     void renderMonitorList();
     try {
-      const response = await send({ type: 'delete-monitors', ids });
-      if (!response?.ok) throw new Error(response?.error || '선택한 추적을 삭제하지 못했습니다.');
-      ids.forEach((id) => selectedMonitorIds.delete(id));
-      const summary = `${response.deletedCount ?? 0}개 페이지 추적을 삭제했습니다.`;
-      const detail = response.missing ? ` ${response.missing}개는 이미 없었습니다.` : '';
-      elements.bulkStatus.textContent = `${summary}${detail}`;
-      showToast(`${summary}${detail}`);
-      await refresh();
+      const counts = await runBulkMutation('delete-monitors', ids);
+      const summary = `삭제 ${counts.completed} · 실패 ${counts.failed} · 누락 ${counts.missing} · 충돌 ${counts.conflict} · 미처리 ${counts.unprocessed}`;
+      elements.bulkStatus.textContent = summary;
+      showToast(summary);
+      await refresh().catch((error) => showToast(`${summary} · 목록 불러오기 실패: ${error.message}`));
     } catch (error) {
       const message = error.message || '선택한 추적을 삭제하지 못했습니다.';
       elements.bulkStatus.textContent = message;
       showToast(message);
     } finally {
       batchActionRunning = false;
-      void renderMonitorList();
+      patchVisibleSelections(); flushQueuedDashboardRefresh();
     }
+
+  async function runBulkMutation(type, ids, extra = {}) {
+    const total = { completed: 0, skipped: 0, failed: 0, paused: 0, missing: 0, conflict: 0, unprocessed: 0 };
+    const jobId = crypto.randomUUID();
+    for (let start = 0; start < ids.length; start += 500) {
+      const chunk = ids.slice(start, start + 500);
+      try {
+        const response = await send({ type, ids: chunk, ...extra, operationId: `${jobId}:${start}`, expectedRevisions: chunk.map((id) => ({ id, revision: monitorById(id)?.revision })) });
+        if (!response?.ok) throw new Error(response?.error || '일괄 작업을 처리하지 못했습니다.');
+        const counts = dashboardCore.resultSummary(response, chunk.length);
+        for (const key of Object.keys(total)) total[key] += counts[key];
+        if (type === 'delete-monitors') {
+          const removed = response.deletedIds ?? (counts.completed === chunk.length ? chunk : []);
+          [...removed, ...(response.missingIds ?? [])].forEach((id) => selectedMonitorIds.delete(id));
+        }
+      } catch (error) {
+        total.failed += chunk.length;
+        elements.bulkStatus.textContent = error.message || '일괄 작업 실패';
+      }
+      await yieldToBrowser();
+    }
+    return total;
+  }
   }
 
   async function actionGrant(monitor) {
@@ -2538,9 +2548,9 @@
         openPageUrlDialog(page, 'copy');
         break;
       case 'delete-page':
-        if (!window.confirm(`“${pagePath(page.url)}” 페이지의 ${page.monitors.length}개 추적을 모두 삭제할까요?`)) return;
+        if (!window.confirm(`“${page.url}” 주소의 전체 ${page.monitors.length}개 추적(필터 밖 ${page.monitors.filter((monitor) => !monitorMatchesFilters(monitor)).length}개 포함)을 삭제할까요?`)) return;
         {
-          const response = await send({ type: 'delete-page', url: page.url });
+          const response = await send({ type: 'delete-page', url: page.url, expectedRevisions: page.monitors.map(({ id, revision }) => ({ id, revision })), operationId: crypto.randomUUID() });
           showToast(response?.ok ? `${response.deletedCount}개 추적을 삭제했습니다.` : (response?.error || '페이지 추적을 삭제하지 못했습니다.'));
           await refresh();
         }
@@ -2563,6 +2573,14 @@
     const monitor = monitorById(button.dataset.id);
     if (!monitor) return;
     switch (button.dataset.action) {
+      case 'detail':
+        openMonitorDetails(monitor);
+        break;
+      case 'copy-url':
+      case 'copy-name':
+        try { await navigator.clipboard.writeText(button.dataset.action === 'copy-url' ? monitor.url : monitor.name); showToast('복사했습니다.'); }
+        catch { showToast('복사하지 못했습니다. 상세 화면에서 텍스트를 선택해 복사할 수 있습니다.'); }
+        break;
       case 'change':
       case 'history':
       case 'evidence': {
@@ -2586,7 +2604,7 @@
           if (!response?.ok) throw new Error(response?.error || '실시간 감시를 시작하지 못했습니다.');
           showToast(response.initial?.needsReview
             ? '실시간 감시는 연결했지만 현재 선택 결과가 비어 있습니다.'
-            : '열려 있는 페이지에 실시간 감시를 연결했습니다.');
+            : '별도 고정 탭에서 실시간 감시를 연결했습니다.');
           await refresh();
         } catch (error) {
           showToast(error.message || '실시간 감시를 시작하지 못했습니다.');
@@ -2619,7 +2637,7 @@
           await actionGrant(monitor);
           break;
         }
-        const response = await send({ type: 'set-monitor-enabled', id: monitor.id, enabled: !monitor.enabled });
+        const response = await send({ type: 'set-monitor-enabled', id: monitor.id, enabled: !monitor.enabled, expectedRevision: monitor.revision, operationId: crypto.randomUUID() });
         if (!response?.ok && response?.reason === 'permission') {
           await actionGrant(monitor);
           break;
@@ -2632,7 +2650,7 @@
       }
       case 'delete': {
         if (!window.confirm(`“${monitor.name}” 추적을 삭제할까요?`)) return;
-        const response = await send({ type: 'delete-monitor', id: monitor.id });
+        const response = await send({ type: 'delete-monitor', id: monitor.id, expectedRevision: monitor.revision, operationId: crypto.randomUUID() });
         showToast(response?.ok ? '삭제했습니다.' : (response?.error || '삭제하지 못했습니다.'));
         await refresh();
         break;
@@ -2666,7 +2684,7 @@
   function createExportPart(exportedAt, exportId, partNumber) {
     const prefix = `${JSON.stringify({
       format: 'openstill-export',
-      schemaVersion: 4,
+      schemaVersion: 5,
       exportedAt,
       exportId,
       part: partNumber
@@ -2715,21 +2733,26 @@
   }
 
   function exportPartBlobParts(part, finalPart, totalMonitors) {
-    const prefix = `${JSON.stringify({
+    const envelope = {
       format: 'openstill-export',
-      schemaVersion: 4,
+      schemaVersion: 5,
       exportedAt: part.exportedAt,
       exportId: part.exportId,
       part: part.partNumber,
       integrityRequired: true,
-      integrity: backupIntegrity.createIntegrityMetadata(part.integrityState, {
+      previousPartDigest: part.previousPartDigest || null,
+      ...(finalPart ? { manifest: part.manifest || [] } : {})
+    };
+    const integrity = backupIntegrity.createIntegrityMetadata(part.integrityState, {
         monitorCount: part.monitorCount,
         fragmentCount: part.fragmentCount,
         finalPart,
         totalParts: part.partNumber,
-        totalMonitors
-      })
-    }).slice(0, -1)},"monitors":[`;
+        totalMonitors,
+        envelope
+    });
+    part.envelopeDigest = integrity.envelopeDigest;
+    const prefix = `${JSON.stringify({ ...envelope, integrity }).slice(0, -1)},"monitors":[`;
     return [prefix, ...part.monitorParts.slice(1), part.divider, ...part.fragmentParts, part.suffix];
   }
 
@@ -2799,15 +2822,16 @@
     if (!chrome.downloads?.download) window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   }
 
-  async function exportMonitors() {
+  async function exportMonitors(resumeId = '') {
     if (transferRunning || dashboardLoading) return;
     let total = state.monitors.length;
     let completed = 0;
     let exportSessionId = '';
     let exportKeepaliveTimer = null;
+    let succeeded = false;
     beginTransfer('내보내는 중', total);
     try {
-      const started = await send({ type: 'start-export-session' });
+      const started = await send({ type: 'start-export-session', dashboardSort: sorting, ...(resumeId ? { resumeId } : {}) });
       if (!started?.ok) throw new Error(started?.error || '내보낼 데이터를 준비하지 못했습니다.');
       exportSessionId = started.id;
       exportKeepaliveTimer = window.setInterval(() => {
@@ -2819,14 +2843,27 @@
       // Serialise a modest number of records at once. This keeps a large
       // snapshot backup from blocking dashboard painting for one long task.
       if (showsTransferProgress(total)) await yieldToBrowser();
-      const exportedAt = new Date().toISOString();
-      const exportId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-      let partNumber = 1;
+      const saved = started.progress || {};
+      if (saved.done) { succeeded = true; finishTransfer('이미 내보내기 완료', total, total); return; }
+      const exportedAt = saved.exportedAt || new Date().toISOString();
+      const exportId = saved.exportId || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      let partNumber = saved.partNumber || 1;
+      const manifest = [...(saved.manifest || [])];
+      let cursor = { nextIndex: saved.nextIndex || 0, fragmentIndex: saved.fragmentIndex || 0 };
       let part = createExportPart(exportedAt, exportId, partNumber);
+      const checkpoint = async (done = false) => {
+        const response = await send({ type: 'checkpoint-export-session', id: exportSessionId,
+          progress: { ...cursor, exportId, exportedAt, partNumber, manifest: [...manifest], done } });
+        if (!response?.ok) throw new Error(response?.error || '내보내기 재개 위치를 저장하지 못했습니다.');
+      };
+      await checkpoint();
       const flushExportPart = async () => {
         if (!hasExportPartData(part)) return;
+        part.previousPartDigest = manifest.at(-1) || null;
         await downloadExportPart(part, exportedAt, partNumber, false, total);
+        manifest.push(part.envelopeDigest);
         partNumber += 1;
+        await checkpoint();
         part = createExportPart(exportedAt, exportId, partNumber);
       };
       const appendExportPartValueSafely = async (partsKey, countKey, value) => {
@@ -2842,7 +2879,9 @@
       };
       const chunkSize = transferChunkSize(total);
       let bytesSinceYield = 0;
-      for (let start = 0; start < total; start += chunkSize) {
+      const firstIndex = cursor.nextIndex;
+      const firstFragment = cursor.fragmentIndex;
+      for (let start = firstIndex; start < total; start += chunkSize) {
         const end = Math.min(start + chunkSize, total);
         for (let index = start; index < end; index += 1) {
           const response = await send({ type: 'get-export-monitor', id: exportSessionId, index });
@@ -2853,7 +2892,7 @@
             if (typeof response.recordId !== 'string' || !Number.isInteger(response.fragmentCount) || response.fragmentCount < 1) {
               throw new Error('내보낼 큰 추적 데이터를 나누지 못했습니다.');
             }
-            for (let fragmentIndex = 0; fragmentIndex < response.fragmentCount; fragmentIndex += 1) {
+            for (let fragmentIndex = index === firstIndex ? firstFragment : 0; fragmentIndex < response.fragmentCount; fragmentIndex += 1) {
               const fragmentResponse = await send({
                 type: 'get-export-monitor-fragment',
                 id: exportSessionId,
@@ -2870,6 +2909,9 @@
                 payload: fragmentResponse.payload
               });
               const fragmentBytes = await appendExportPartValueSafely('fragmentParts', 'fragmentCount', fragment);
+              cursor = fragmentIndex + 1 === response.fragmentCount
+                ? { nextIndex: index + 1, fragmentIndex: 0 }
+                : { nextIndex: index, fragmentIndex: fragmentIndex + 1 };
               bytesSinceYield += fragmentBytes;
               if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET) {
                 await yieldToBrowser();
@@ -2878,6 +2920,7 @@
             }
           } else if (typeof response.record === 'string') {
             const recordBytes = await appendExportPartValueSafely('monitorParts', 'monitorCount', response.record);
+            cursor = { nextIndex: index + 1, fragmentIndex: 0 };
             bytesSinceYield += recordBytes;
             if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET) {
               await yieldToBrowser();
@@ -2891,7 +2934,12 @@
         updateTransferProgress('내보내는 중', completed, total);
         if (end < total && showsTransferProgress(total)) await yieldToBrowser();
       }
+      part.previousPartDigest = manifest.at(-1) || null;
+      part.manifest = [...manifest];
       await downloadExportPart(part, exportedAt, partNumber, true, total);
+      cursor = { nextIndex: total, fragmentIndex: 0 };
+      await checkpoint(true);
+      succeeded = true;
       finishTransfer('내보내기 완료', total, total);
       showToast(partNumber > 1
         ? `${partNumber}개의 JSON 파일을 저장했습니다.`
@@ -2901,7 +2949,7 @@
       showToast(error.message || '내보내지 못했습니다.');
     } finally {
       if (exportKeepaliveTimer !== null) window.clearInterval(exportKeepaliveTimer);
-      if (exportSessionId) await send({ type: 'finish-export-session', id: exportSessionId }).catch(() => undefined);
+      if (exportSessionId) await send({ type: 'finish-export-session', id: exportSessionId, completed: succeeded }).catch(() => undefined);
     }
   }
 
@@ -2922,199 +2970,156 @@
     return null;
   }
 
-  function parseImportFile(file, onProgress) {
+  let importAbortController = null;
+  function parseImportFile(file, sessionId, fileIndex, onProgress, signal) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(chrome.runtime.getURL('import-worker.js'));
-      const finish = () => worker.terminate();
-      worker.addEventListener('message', (event) => {
-        const message = event.data;
-        if (message?.type === 'read-progress' || message?.type === 'parsing') {
-          onProgress?.(message);
-        } else if (message?.type === 'parsed') {
-          finish();
-          resolve({ payload: message.payload, backupPart: message.backupPart ?? null });
-        } else if (message?.type === 'error') {
-          finish();
-          reject(new Error(message.error || 'JSON 파일을 읽지 못했습니다.'));
-        }
-      }, { once: false });
-      worker.addEventListener('error', () => {
-        finish();
-        reject(new Error('JSON 파일을 해석하지 못했습니다.'));
-      }, { once: true });
-      worker.postMessage({ type: 'parse', file });
+      let timer; let finished = false;
+      const finish = (error, result) => {
+        if (finished) return;
+        finished = true; clearTimeout(timer); worker.terminate();
+        signal?.removeEventListener('abort', abort);
+        if (error) reject(error); else resolve(result);
+      };
+      const abort = () => finish(new Error('불러오기를 중단했습니다. 원본과 준비한 자료는 복구함에서 이어갈 수 있습니다.'));
+      const watchdog = () => { clearTimeout(timer); timer = setTimeout(() => finish(new Error('파일 처리 응답이 없어 중단했습니다. 준비한 자료를 보관했습니다.')), 90_000); };
+      worker.addEventListener('message', async (event) => {
+        watchdog(); const message = event.data;
+        if (message?.type === 'record') {
+          try {
+            const serialized = JSON.stringify(message.record);
+            if (message.kind === 'monitor' && utf8ByteLength(serialized) + 1024 >= MAX_IMPORT_MESSAGE_BYTES) {
+              const fragmentCount = Math.ceil(serialized.length / IMPORT_RECORD_FRAGMENT_CHARS);
+              for (let index = 0; index < fragmentCount; index += 1) {
+                const response = await send({ type: 'append-import-fragments', id: sessionId, exportId: message.source?.exportId,
+                  fragments: [{ recordId: `file:${fileIndex}:${message.source.recordIndex}`, fragmentIndex: index, fragmentCount, payload: serialized.slice(index * IMPORT_RECORD_FRAGMENT_CHARS, (index + 1) * IMPORT_RECORD_FRAGMENT_CHARS) }] });
+                if (!response?.ok) throw new Error(response?.error || '레코드 조각을 준비하지 못했습니다.');
+              }
+            } else {
+              const response = await send({ type: message.kind === 'fragment' ? 'append-import-fragments' : 'append-import-session', id: sessionId,
+                [message.kind === 'fragment' ? 'fragments' : 'monitors']: [message.record], source: message.source, exportId: message.source?.exportId });
+              if (!response?.ok) throw new Error(response?.error || '레코드를 준비하지 못했습니다.');
+            }
+            worker.postMessage({ type: 'ack' }); watchdog();
+          } catch (error) { worker.postMessage({ type: 'ack', error: error.message }); finish(error); }
+        } else if (message?.type === 'read-progress' || message?.type === 'parsing') onProgress?.(message);
+        else if (message?.type === 'parsed') finish(null, message);
+        else if (message?.type === 'error') finish(new Error(message.error || '파일을 읽지 못했습니다.'));
+      });
+      worker.addEventListener('error', () => finish(new Error('JSON 해석 워커가 중단되었습니다. 원본과 준비 자료는 보관했습니다.')));
+      worker.addEventListener('messageerror', () => finish(new Error('파일 처리 메시지를 읽지 못했습니다. 준비 자료는 보관했습니다.')));
+      signal?.addEventListener('abort', abort, { once: true }); watchdog();
+      worker.postMessage({ type: 'parse', ...(file.storedFileId ? { storedFileId: file.storedFileId } : { file }), sessionId, fileIndex });
     });
   }
-
-  async function splitLargeImportMonitors(monitors, fileIndex) {
-    const directMonitors = [];
-    const fragments = [];
-    const importId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${fileIndex}`;
-    let bytesSinceYield = 0;
-    for (let monitorIndex = 0; monitorIndex < monitors.length; monitorIndex += 1) {
-      const monitor = monitors[monitorIndex];
-      const record = JSON.stringify(monitor);
-      const recordBytes = await utf8ByteLengthYielding(record);
-      if (monitor && typeof monitor === 'object') importRecordByteLengths.set(monitor, recordBytes);
-      bytesSinceYield += recordBytes;
-      // Reserve the message envelope as well as the 32 MiB part buffer. A
-      // large legacy/Reference record is represented in the same v4 fragment
-      // form as a record that crossed the export-file boundary.
-      if (recordBytes + 1_024 < MAX_IMPORT_MESSAGE_BYTES) {
-        directMonitors.push(monitor);
-      } else {
-        const fragmentCount = Math.ceil(record.length / IMPORT_RECORD_FRAGMENT_CHARS);
-        for (let fragmentIndex = 0; fragmentIndex < fragmentCount; fragmentIndex += 1) {
-          const start = fragmentIndex * IMPORT_RECORD_FRAGMENT_CHARS;
-          fragments.push({
-            recordId: `${importId}:${monitorIndex}`,
-            fragmentIndex,
-            fragmentCount,
-            payload: record.slice(start, start + IMPORT_RECORD_FRAGMENT_CHARS)
-          });
-        }
-      }
-      if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET
-        || (monitors.length >= BULK_TRANSFER_THRESHOLD && (monitorIndex + 1) % BULK_TRANSFER_CHUNK_SIZE === 0)) {
-        await yieldToBrowser();
-        bytesSinceYield = 0;
+  function presentImportResult(result) {
+    if (result.settings) {
+      state.settings = { ...state.settings, ...result.settings };
+      elements.soundEnabled.checked = state.settings.soundEnabled !== false;
+      const saved = result.settings.dashboardSort;
+      if (saved && SORT_FIELDS.has(saved.field) && SORT_DIRECTIONS.has(saved.direction)) {
+        Object.assign(sorting, { field: saved.field, direction: saved.direction });
+        elements.sortField.value = sorting.field; elements.sortDirection.value = sorting.direction;
+        try { localStorage.setItem(SORT_PREFERENCE_KEY, JSON.stringify(sorting)); } catch { /* Session preference remains active. */ }
       }
     }
-    return { monitors: directMonitors, fragments };
+    showToast(`${result.imported || 0}개 복원 · ${result.repaired || 0}개 수리 · ${result.duplicates || 0}개 중복 · ${result.conflicts || 0}개 충돌 보존 · ${result.rejected || 0}개 복구 대기${result.capacityRejected ? ` (공간 제한 ${result.capacityRejected}개)` : ''}${result.finalizationWarnings ? ' · 후속 갱신 재시도 대기' : ''}`);
   }
-
-  async function importMonitors(fileList) {
-    const files = [...(fileList ?? [])];
-    if (!files.length) return;
-    if (transferRunning || dashboardLoading) return;
-    // Reading a large file is asynchronous. Reserve the transfer before its
-    // record count is known so a second picker selection cannot overlap it.
-    transferRunning = true;
-    beginTransfer('불러오기 준비 중', 0);
-    let total = 0;
-    let completed = 0;
-    let processedUnits = 0;
-    let transferStarted = false;
-    let importSessionId = '';
-    let importKeepaliveTimer = null;
-    const backupParts = [];
-    let allFilesVerified = true;
-    const summary = { imported: 0, rejected: 0, disabledForPermission: 0 };
+  async function importMonitors(fileList, resumeId = '', storedFiles = [], fileIndexOffset = 0) {
+    const files = [...storedFiles.map((file) => ({ ...file, storedFileId: file.id })), ...(fileList || [])];
+    if (!files.length || transferRunning || dashboardLoading) return;
+    beginTransfer('불러오기 준비 중', files.length); let sessionId = ''; let completed = 0;
+    importAbortController = new AbortController(); const parts = [];
     try {
-      for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
-        const file = files[fileIndex];
-        const parsingLabel = files.length > 1
-          ? `불러오기 파일 분석 중 (${fileIndex + 1}/${files.length})`
-          : '불러오기 파일 분석 중';
-        updateImportFileProgress(parsingLabel, 0, file.size || 0);
-        const parsedFile = await parseImportFile(file, (progress) => {
-          if (progress?.type === 'read-progress') {
-            updateImportFileProgress(parsingLabel, progress.loaded || 0, progress.total || file.size || 0);
-          } else if (progress?.type === 'parsing') {
-            updateImportFileProgress(parsingLabel, 0, 0, true);
-          }
-        });
-        const parsed = parsedFile.payload;
-        const importedPayload = importMonitorPayload(parsed);
-        if (!importedPayload) {
-          throw new Error(`“${file.name || '선택한 파일'}”은(는) OpenStill 또는 Reference 내보내기 파일 형식이 아닙니다.`);
+      const started = await send({ type: 'start-import-session', mode: 'merge', ...(resumeId ? { resumeId } : {}) });
+      if (!started?.ok) throw new Error(started?.error || '불러오기를 준비하지 못했습니다.');
+      sessionId = started.id;
+      for (let index = 0; index < files.length; index += 1) {
+        if (importAbortController.signal.aborted) break;
+        const file = files[index]; const label = `파일 분석 (${index + 1}/${files.length})`;
+        try {
+          const parsed = await parseImportFile(file, sessionId, file.fileIndex ?? fileIndexOffset + index, (progress) => updateImportFileProgress(label, progress.loaded || 0, progress.total || file.size), importAbortController.signal);
+          if (parsed.backupPart) parts.push({ ...parsed.backupPart, sourceName: file.name });
+          for (const diagnostic of parsed.diagnostics || []) await send({ type: 'append-import-session', id: sessionId, diagnostic: { ...diagnostic, source: file.name, recoveryId: parsed.recoveryId } });
+        } catch (error) {
+          await send({ type: 'append-import-session', id: sessionId, diagnostic: { source: file.name, error: error.message, staging: `import-file:${sessionId}:${index}` } });
+          if (importAbortController.signal.aborted) throw error;
         }
-        const backupPart = parsedFile.backupPart
-          ? { ...parsedFile.backupPart, sourceName: file.name || `part ${fileIndex + 1}` }
-          : null;
-        if (backupPart) backupParts.push(backupPart);
-        if (!backupPart?.verified) allFilesVerified = false;
-        updateImportFileProgress('불러오기 데이터 준비 중', 0, 0, true);
-        const splitPayload = await splitLargeImportMonitors(importedPayload.monitors, fileIndex);
-        const monitors = splitPayload.monitors;
-        const fragments = [...importedPayload.fragments, ...splitPayload.fragments];
-        if (!importSessionId) {
-          const started = await send({ type: 'start-import-session', mode: 'merge' });
-          if (!started?.ok || !started.id) {
-            throw new Error(started?.error || '불러오기 작업을 준비하지 못했습니다.');
-          }
-          importSessionId = started.id;
-          importKeepaliveTimer = window.setInterval(() => {
-            if (!importSessionId) return;
-            void send({ type: 'touch-import-session', id: importSessionId }).catch(() => undefined);
-          }, 20_000);
-        }
-        const fileTotal = monitors.length + fragments.length;
-        total = processedUnits + fileTotal;
-        completed = processedUnits;
-        const label = files.length > 1
-          ? `불러오는 중 (${fileIndex + 1}/${files.length})`
-          : '불러오는 중';
-        beginTransfer(label, total, completed);
-        transferStarted = true;
-        if (showsTransferProgress(total)) await yieldToBrowser();
-        const chunkSize = transferChunkSize(total);
-
-        for (let start = 0; start < monitors.length;) {
-          const chunk = await nextImportChunk(monitors, start, chunkSize);
-          const { end } = chunk;
-          const response = await send({
-            type: 'append-import-session',
-            id: importSessionId,
-            monitors: chunk.monitors,
-          });
-          if (!response?.ok) throw new Error(response?.error || '불러오지 못했습니다.');
-          completed = processedUnits + end;
-          updateTransferProgress(label, completed, total);
-          if (end < monitors.length && showsTransferProgress(total)) await yieldToBrowser();
-          start = end;
-        }
-        for (let start = 0; start < fragments.length;) {
-          const chunk = await nextImportChunk(fragments, start, chunkSize);
-          const { end } = chunk;
-          const response = await send({
-            type: 'append-import-fragments',
-            id: importSessionId,
-            fragments: chunk.monitors,
-          });
-          if (!response?.ok) throw new Error(response?.error || '큰 추적 데이터를 불러오지 못했습니다.');
-          completed = processedUnits + monitors.length + end;
-          updateTransferProgress(label, completed, total);
-          if (end < fragments.length && showsTransferProgress(total)) await yieldToBrowser();
-          start = end;
-        }
-        processedUnits += fileTotal;
-        completed = processedUnits;
-        total = processedUnits;
+        completed = index + 1; updateTransferProgress('파일 분석 완료', completed, files.length);
       }
-      const selectionValidation = backupIntegrity.validateBackupPartSelection(backupParts, {
-        totalFiles: files.length
-      });
-      if (!selectionValidation.ok) {
-        throw new Error(selectionValidation.error || '백업 part 구성을 확인하지 못했습니다.');
-      }
-      let finalized = null;
-      if (importSessionId) {
-        finalized = await send({
-          type: 'finish-import-session',
-          id: importSessionId,
-          requireAllValid: allFilesVerified
-        });
-        if (!finalized?.ok) throw new Error(finalized?.error || '불러온 추적을 준비하지 못했습니다.');
-        summary.imported = finalized.imported || 0;
-        summary.rejected = finalized.rejected || 0;
-        summary.disabledForPermission = finalized.disabledForPermission || 0;
-        importSessionId = '';
-      }
-      finishTransfer('불러오기 완료', completed, total);
-      transferStarted = false;
-      showToast(`${summary.imported}개를 불러왔습니다.${summary.rejected ? ` ${summary.rejected}개는 유효하지 않거나 최대 5,000개 제한을 넘어 제외했습니다.` : ''}${summary.disabledForPermission ? ` ${summary.disabledForPermission}개는 사이트 권한을 허용한 뒤 시작하세요.` : ''}${finalized?.finalizationWarnings ? ' 데이터 저장은 완료됐으며, 후속 상태 갱신은 다음 실행 때 다시 처리됩니다.' : ''}`);
-      queueDashboardRefresh();
+      const selection = backupIntegrity.recoverBackupPartSelection(parts);
+      for (const diagnostic of selection.diagnostics) await send({ type: 'append-import-session', id: sessionId, diagnostic });
+      const result = await send({ type: 'finish-import-session', id: sessionId, retry: Boolean(resumeId) });
+      if (!result?.ok) throw new Error(result?.error || '복원을 마무리하지 못했습니다.');
+      finishTransfer('불러오기 완료', files.length, files.length); presentImportResult(result);
+      sessionId = ''; queueDashboardRefresh();
+      if (result.diagnostics?.length) await showRecoveryPanel(result.diagnostics);
     } catch (error) {
-      if (importSessionId) await send({ type: 'abort-import-session', id: importSessionId }).catch(() => undefined);
-      if (transferStarted) finishTransfer('불러오기 실패', completed, total);
-      else finishTransfer('불러오기 실패', 0, 0);
-      showToast(error.message || '불러오지 못했습니다.');
-    } finally {
-      if (importKeepaliveTimer !== null) window.clearInterval(importKeepaliveTimer);
-      elements.importInput.value = '';
-    }
+      if (sessionId) await send({ type: 'abort-import-session', id: sessionId }).catch(() => undefined);
+      finishTransfer('불러오기 중단 · 자료 보관됨', completed, files.length); showToast(error.message || '복원을 중단하고 자료를 보관했습니다.');
+    } finally { importAbortController = null; elements.importInput.value = ''; }
   }
+  const recoveryButton = document.createElement('button'); recoveryButton.type = 'button'; recoveryButton.className = 'button secondary'; recoveryButton.textContent = '복구함';
+  elements.importButton.after(recoveryButton);
+  const cancelTransfer = document.createElement('button'); cancelTransfer.type = 'button'; cancelTransfer.className = 'button secondary'; cancelTransfer.textContent = '불러오기 중단';
+  elements.transferProgress.append(cancelTransfer); cancelTransfer.addEventListener('click', () => importAbortController?.abort());
+  async function showRecoveryPanel(diagnostics = []) {
+    let dialog = document.querySelector('#recoveryDialog');
+    if (!dialog) { dialog = document.createElement('dialog'); dialog.id = 'recoveryDialog'; dialog.className = 'recovery-dialog'; document.body.append(dialog); }
+    dialog.replaceChildren(); const title = document.createElement('h2'); title.textContent = '보관된 원본과 복구 작업'; dialog.append(title);
+    const close = document.createElement('button'); close.type = 'button'; close.className = 'button'; close.textContent = '닫기'; close.addEventListener('click', () => dialog.close()); dialog.append(close);
+    const response = await send({ type: 'get-recovery-status' });
+    if (!response?.ok) { showToast(response?.error || '복구함을 읽지 못했습니다.'); return; }
+    const count = document.createElement('p'); count.textContent = `정상 ${response.normalCount || 0}개 · 수리 ${response.repairedCount || 0}개 · 원본 보관 ${response.records.length}개. 원본은 내보내기에 포함됩니다.`; dialog.append(count);
+    const list = document.createElement('div'); list.className = 'recovery-list'; dialog.append(list);
+    for (const session of response.sessions.filter((entry) => !['committed', 'completed'].includes(entry.phase))) {
+      const row = document.createElement('p'); row.textContent = `${session.kind === 'export' ? '내보내기' : '불러오기'} ${session.phase} · 준비 ${session.pending}개 `;
+      const resume = document.createElement('button'); resume.type = 'button'; resume.textContent = session.kind === 'export' ? '내보내기 이어가기' : '준비한 자료 복원';
+      resume.addEventListener('click', async () => {
+        resume.disabled = true;
+        try {
+          if (session.kind === 'export') { dialog.close(); await exportMonitors(session.id); }
+          else {
+            const result = await send({ type: 'finish-import-session', id: session.id, retry: true });
+            if (!result?.ok) throw new Error(result?.error); presentImportResult(result); queueDashboardRefresh(); dialog.close();
+          }
+        } catch (error) { showToast(error.message); } finally { resume.disabled = false; }
+      }); row.append(resume);
+      if (session.kind === 'import') {
+        const incomplete = (session.files || []).filter((file) => file.phase !== 'parsed');
+        if (incomplete.length) {
+          const reparse = document.createElement('button'); reparse.type = 'button'; reparse.textContent = '보관된 파일 처리 이어가기';
+          reparse.addEventListener('click', () => { dialog.close(); void importMonitors([], session.id, incomplete); }); row.append(reparse);
+        }
+        const add = document.createElement('button'); add.type = 'button'; add.textContent = '누락 파일 추가';
+        const input = document.createElement('input'); input.type = 'file'; input.multiple = true; input.accept = '.json,application/json'; input.hidden = true;
+        input.addEventListener('change', () => {
+          const offset = Math.max(-1, ...(session.files || []).map((file) => file.fileIndex)) + 1;
+          dialog.close(); void importMonitors(input.files, session.id, [], offset);
+        }); add.addEventListener('click', () => input.click()); row.append(add, input);
+        const discard = document.createElement('button'); discard.type = 'button'; discard.textContent = '준비 작업 폐기';
+        discard.addEventListener('click', async () => {
+          if (!confirm('이 작업의 이어하기 자료를 폐기합니다. 원본은 복구함에 보관하고 등록된 추적은 유지합니다.')) return;
+          discard.disabled = true;
+          try { const result = await send({ type: 'abort-import-session', id: session.id, discard: true }); if (!result?.ok) throw new Error(result?.error); await showRecoveryPanel(); }
+          catch (error) { showToast(error.message); } finally { discard.disabled = false; }
+        }); row.append(discard);
+      }
+      list.append(row);
+    }
+    const allRecords = [...diagnostics, ...response.records]; let shown = 0;
+    const more = document.createElement('button'); more.type = 'button'; more.textContent = '다음 원본 200개 보기';
+    const showMore = () => {
+    for (const record of allRecords.slice(shown, shown + 200)) {
+      const row = document.createElement('p'); row.textContent = `${record.source || record.id || '백업'}${record.recordIndex !== undefined ? ` · 레코드 ${record.recordIndex + 1}` : ''}${record.offset !== undefined ? ` · 문자 위치 ${record.offset}` : ''}: ${record.error || record.code || '원본 보관'}${record.missing !== undefined ? ` · 누락 ${Array.isArray(record.missing) ? record.missing.join(', ') : record.missing}` : ''}${record.fields?.length ? ` · 수리 ${record.fields.join(', ')}` : ''}${record.recordId ? ` · 추적 ${record.recordId}` : ''}${record.recoveryId || record.staging || record.id ? ` · 보관 ${record.recoveryId || record.staging || record.id}` : ''}`;
+      if (record.source === 'trash') { const restore = document.createElement('button'); restore.textContent = '복원'; restore.type = 'button'; restore.addEventListener('click', async () => { restore.disabled = true; try { const result = await send({ type: 'restore-recovery-record', id: record.id }); if (!result?.ok) throw new Error(result?.error); presentImportResult(result); queueDashboardRefresh(); } catch (error) { showToast(error.message); } finally { restore.disabled = false; } }); row.append(restore); }
+      list.append(row);
+    }
+    shown += 200; more.hidden = shown >= allRecords.length;
+    }; more.addEventListener('click', showMore); showMore(); dialog.append(more);
+    if (!dialog.open) dialog.showModal();
+  }
+  recoveryButton.addEventListener('click', () => void showRecoveryPanel().catch((error) => showToast(error.message)));
 
   elements.monitorList.addEventListener('click', (event) => void handleCardAction(event));
   elements.monitorList.addEventListener('change', (event) => {
@@ -3122,7 +3127,35 @@
     if (!input || batchActionRunning) return;
     if (input.checked) selectedMonitorIds.add(input.dataset.selectMonitor);
     else selectedMonitorIds.delete(input.dataset.selectMonitor);
-    void renderMonitorList();
+    patchVisibleSelections();
+  });
+  elements.monitorList.addEventListener('scroll', () => {
+    if (virtualFrame !== null) return;
+    virtualFrame = requestAnimationFrame(() => { virtualFrame = null; renderVirtualViewport(); });
+  }, { passive: true });
+  if (typeof ResizeObserver === 'function') new ResizeObserver(renderVirtualViewport).observe(elements.monitorList);
+  document.querySelector('#selectViewport').addEventListener('click', () => {
+    if (batchActionRunning) return;
+    const range = dashboardCore.viewport(filteredMonitors.length, elements.monitorList.scrollTop, elements.monitorList.clientHeight || 480, rowHeight, 0);
+    filteredMonitors.slice(range.start, range.end).forEach((monitor) => selectedMonitorIds.add(monitor.id)); patchVisibleSelections();
+  });
+  document.querySelector('#refreshRuntime').addEventListener('click', () => void refreshRuntimeOverview(true));
+  document.querySelector('#runtimeOwnership').addEventListener('click', () => void openRuntimeOwnership());
+  document.querySelector('#selectAll').addEventListener('click', () => {
+    if (batchActionRunning) return;
+    monitorsById.forEach((monitor, id) => selectedMonitorIds.add(id)); patchVisibleSelections();
+  });
+  document.querySelector('#labelSearch').addEventListener('input', (event) => {
+    labelQuery = event.target.value.toLocaleLowerCase('ko-KR'); labelLimit = 40; renderLabels();
+  });
+  document.querySelector('#moreLabels').addEventListener('click', () => { labelLimit += 40; renderLabels(); });
+  document.querySelector('.overview').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-summary-filter]');
+    if (!button) return;
+    filters.status = button.dataset.summaryFilter;
+    filters.label = ''; filters.query = ''; elements.searchInput.value = '';
+    elements.statusFilter.value = filters.status; void render();
+    elements.monitorList.focus({ preventScroll: true });
   });
   elements.labelList.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-label]');
@@ -3140,7 +3173,7 @@
   });
   elements.statusFilter.addEventListener('change', () => { filters.status = elements.statusFilter.value; void renderMonitorList(); });
   const updateSorting = () => {
-    sorting.field = SORT_FIELDS.has(elements.sortField.value) ? elements.sortField.value : 'lastViewedAt';
+    sorting.field = SORT_FIELDS.has(elements.sortField.value) ? elements.sortField.value : 'lastChangedAt';
     sorting.direction = SORT_DIRECTIONS.has(elements.sortDirection.value) ? elements.sortDirection.value : 'desc';
     try {
       localStorage.setItem(SORT_PREFERENCE_KEY, JSON.stringify(sorting));
@@ -3157,7 +3190,7 @@
     if (batchActionRunning) return;
     selectedMonitorIds.clear();
     elements.bulkStatus.textContent = '';
-    void renderMonitorList();
+    patchVisibleSelections();
   });
   elements.checkSelected.addEventListener('click', () => void actionCheckSelected());
   elements.addLabelSelected.addEventListener('click', () => void actionUpdateSelectedLabels('add'));
@@ -3211,7 +3244,7 @@
   }
 
   function queueDashboardRefresh() {
-    if (transferRunning || dashboardLoading) {
+    if (transferRunning || dashboardLoading || batchActionRunning) {
       refreshPending = true;
       return;
     }
@@ -3220,21 +3253,70 @@
     refreshQueueTimer = setTimeout(() => {
       refreshQueueTimer = null;
       refreshQueued = false;
-      if (transferRunning || dashboardLoading) {
+      if (transferRunning || dashboardLoading || batchActionRunning) {
         refreshPending = true;
         return;
       }
-      void refresh();
+      void refresh().catch((error) => showToast(error.message || '목록을 불러오지 못했습니다.'));
     }, 100);
   }
 
   function flushQueuedDashboardRefresh() {
-    if (!refreshPending || transferRunning || dashboardLoading) return;
+    if (pendingRecordIds.size || pendingDeletedIds.size) {
+      queueRecordPatch();
+    }
+    if (!refreshPending || transferRunning || dashboardLoading || batchActionRunning) return;
     refreshPending = false;
     queueDashboardRefresh();
   }
 
-  chrome.storage.onChanged.addListener(queueDashboardRefresh);
+  function queueRecordPatch() {
+    if (!pendingRecordIds.size && !pendingDeletedIds.size) return;
+    if (recordPatchTimer !== null || recordsPatching || transferRunning || dashboardLoading || batchActionRunning) return;
+    recordPatchTimer = setTimeout(() => {
+      recordPatchTimer = null;
+      void patchDashboardRecords().catch((error) => { showToast(error.message || '변경된 추적을 불러오지 못했습니다.'); queueDashboardRefresh(); });
+    }, 100);
+  }
+
+  async function patchDashboardRecords() {
+    if (recordsPatching || transferRunning || dashboardLoading || batchActionRunning) return;
+    recordsPatching = true;
+    const ids = [...pendingRecordIds];
+    const deleted = new Set(pendingDeletedIds);
+    pendingRecordIds.clear(); pendingDeletedIds.clear();
+    try {
+      const updated = new Map();
+      for (let start = 0; start < ids.length; start += 500) {
+        const response = await send({ type: 'get-monitor-summaries', ids: ids.slice(start, start + 500) });
+        if (!response?.ok) throw new Error(response?.error || '변경된 추적 요약을 불러오지 못했습니다.');
+        for (const monitor of response.monitors ?? []) updated.set(monitor.id, monitor);
+      }
+      const existing = new Set();
+      state.monitors = state.monitors.flatMap((monitor) => {
+        if (deleted.has(monitor.id)) return [];
+        existing.add(monitor.id);
+        return [updated.get(monitor.id) ?? monitor];
+      });
+      for (const [id, monitor] of updated) if (!existing.has(id) && !deleted.has(id)) state.monitors.push(monitor);
+      rebuildMonitorIndexes();
+      await render();
+    } finally {
+      recordsPatching = false;
+      queueRecordPatch();
+    }
+  }
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local') return;
+    if (Object.prototype.hasOwnProperty.call(changes, 'openStill.monitors.v2') || Object.prototype.hasOwnProperty.call(changes, 'openStill.settings.v1')) { queueDashboardRefresh(); return; }
+    const change = changes['openStill.records.changed.v1']?.newValue;
+    if (!change) return;
+    if (!Array.isArray(change.ids) || !Array.isArray(change.deletedIds)) { queueDashboardRefresh(); return; }
+    change.ids.forEach((id) => { pendingRecordIds.add(id); pendingDeletedIds.delete(id); });
+    change.deletedIds.forEach((id) => { pendingDeletedIds.add(id); pendingRecordIds.delete(id); });
+    queueRecordPatch();
+  });
 
   populateIntervalSelects();
   void refresh().catch((error) => showToast(error.message || '데이터를 불러오지 못했습니다.'));

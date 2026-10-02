@@ -1,5 +1,7 @@
 'use strict';
 
+if (typeof importScripts === 'function') importScripts('record-store.js', 'import-session.js', 'export-session.js');
+
 const MONITORS_KEY = 'openStill.monitors.v2';
 const SETTINGS_KEY = 'openStill.settings.v1';
 const PENDING_PICKERS_KEY = 'openStill.pending-pickers.v1';
@@ -33,7 +35,7 @@ const SCHEDULE_MODES = new Set([
 ]);
 // unlimitedStorage prevents a few large snapshots from blocking a legitimate
 // import of hundreds of user-configured trackers.
-const MAX_MONITORS = 5_000;
+const MAX_MONITORS = 10_000;
 const MAX_SELECTORS_PER_MONITOR = 20;
 const MAX_COLLECTION_ITEMS = 10_000;
 // Storage is explicitly unlimited. Keep the canonical comparison payload much
@@ -46,7 +48,7 @@ const MAX_RUN_HISTORY = 40;
 const PARSE_TIMEOUT_MS = 12_000;
 const SOUND_DEBOUNCE_MS = 3_000;
 const MAX_CHECKS_PER_SWEEP = 6;
-const MAX_BATCH_CHECKS = 1_000;
+const MAX_BATCH_CHECKS = 10_000;
 const MAX_CONCURRENT_BATCH_CHECKS = 3;
 const DASHBOARD_LOAD_PAGE_SIZE = 100;
 const MAX_DASHBOARD_LOAD_PAGE_SIZE = 199;
@@ -57,7 +59,9 @@ const IMPORT_SESSION_TTL_MS = 5 * 60 * 1000;
 // v4 file envelope. Large individual monitor records are transferred to the
 // dashboard as smaller JSON-string fragments instead of imposing a backup-
 // size cap on the monitor itself.
-const MAX_EXPORT_DIRECT_RECORD_BYTES = (32 * 1024 * 1024) - (128 * 1024);
+// Every direct record must fit the streaming parser's independent 16 MiB
+// budget, including its JSON envelope. Larger values use bounded fragments.
+const MAX_EXPORT_DIRECT_RECORD_BYTES = 12 * 1024 * 1024;
 const EXPORT_RECORD_FRAGMENT_CHARS = 3 * 1024 * 1024;
 const PENDING_PICKER_TTL_MS = 2 * 60 * 60 * 1000;
 const RENDER_LOAD_TIMEOUT_MS = 30_000;
@@ -102,6 +106,269 @@ let liveOwnershipQueue = Promise.resolve();
 const dashboardLoadSessions = new Map();
 const exportSessions = new Map();
 const importSessions = new Map();
+const MAX_GLOBAL_CAPTURES = 6;
+const MAX_ORIGIN_CAPTURES = 2;
+const MAX_RESIDENT_LIVE_TABS = 12;
+const RUNTIME_STATE_KEY = 'openStill.runtime.v1';
+const RUNTIME_SESSION_KEY = 'openStill.runtime-session.v1';
+const RUNTIME_ALARM_NAME = 'openStill.runtime-recovery';
+const captureQueue = [];
+const captureQueuedAt = new Map();
+const captureTasks = new Map();
+const captureOrigins = new Map();
+let activeCaptures = 0;
+let reservedLiveTabs = 0;
+let runtimePersistenceQueue = Promise.resolve();
+let mutationOperationQueue = Promise.resolve();
+let activeMutationOperation = null;
+let runtimeSessionPromise;
+let initializationPromise;
+let initializationPermissionCleanup = false;
+const liveLifecycleQueues = new Map();
+const storageFailureBackoff = new Map();
+const expectedRevisionMaps = new WeakMap();
+const pendingSnapshotCommits = new Map();
+const MAX_PENDING_CAPTURE_BYTES = 64 * 1024 * 1024;
+let pendingCaptureBytes = 0;
+let storageUnavailableUntil = 0;
+let storageRetryTimer = null;
+let runtimeRecoveryPromise;
+let recoveringRuntime = false;
+
+function rememberPendingCapture(id, value) {
+  const snapshot = value.snapshot;
+  const bytes = 2 * (['text', 'html', 'data', 'evidenceHtml'].reduce((sum, field) => sum + String(snapshot?.[field] || '').length, 0)
+    + (snapshot?.items || []).reduce((sum, item) => sum + 512 + String(item.text || '').length + String(item.html || '').length + String(item.data || '').length + String(item.permalink || '').length, 0));
+  const prior = pendingSnapshotCommits.get(id);
+  if (prior) { pendingCaptureBytes -= prior.bytes; pendingSnapshotCommits.delete(id); }
+  if (bytes > MAX_PENDING_CAPTURE_BYTES) return;
+  while (pendingSnapshotCommits.size >= MAX_GLOBAL_CAPTURES || pendingCaptureBytes + bytes > MAX_PENDING_CAPTURE_BYTES) {
+    const oldest = pendingSnapshotCommits.keys().next().value;
+    if (!oldest) break;
+    pendingCaptureBytes -= pendingSnapshotCommits.get(oldest).bytes;
+    pendingSnapshotCommits.delete(oldest);
+  }
+  pendingSnapshotCommits.set(id, { ...value, bytes }); pendingCaptureBytes += bytes;
+}
+
+function forgetPendingCapture(id) {
+  const value = pendingSnapshotCommits.get(id);
+  if (value) { pendingCaptureBytes -= value.bytes; pendingSnapshotCommits.delete(id); }
+}
+
+function pauseQueueForStorage(milliseconds) {
+  storageUnavailableUntil = Math.max(storageUnavailableUntil, Date.now() + Math.min(60_000, milliseconds));
+  if (storageRetryTimer !== null) return;
+  storageRetryTimer = setTimeout(() => {
+    storageRetryTimer = null;
+    drainCaptureQueue();
+    void recoverRuntime().catch(() => { drainCaptureQueue(); });
+  }, Math.max(1, storageUnavailableUntil - Date.now()));
+  storageRetryTimer?.unref?.();
+}
+
+async function getRuntimeAux(namespace, id) {
+  if (globalThis.OpenStillRecordStore?.getAux) return OpenStillRecordStore.getAux(namespace === 'runtime' ? 'meta' : namespace, namespace === 'runtime' ? `runtime.${id}` : id);
+  const key = `openStill.${namespace}.${id}`;
+  return (await chrome.storage.local.get(key))[key] ?? null;
+}
+
+async function putRuntimeAux(namespace, id, value) {
+  if (globalThis.OpenStillRecordStore?.putAux) return OpenStillRecordStore.putAux(namespace === 'runtime' ? 'meta' : namespace, namespace === 'runtime' ? `runtime.${id}` : id, value);
+  return chrome.storage.local.set({ [`openStill.${namespace}.${id}`]: value });
+}
+
+async function deleteRuntimeAux(namespace, id) {
+  if (globalThis.OpenStillRecordStore?.deleteAux) return OpenStillRecordStore.deleteAux(namespace === 'runtime' ? 'meta' : namespace, namespace === 'runtime' ? `runtime.${id}` : id);
+  return chrome.storage.local.remove(`openStill.${namespace}.${id}`);
+}
+
+async function captureJobRecords() {
+  if (globalThis.OpenStillRecordStore?.allAux) return (await OpenStillRecordStore.allAux('jobs')).filter((job) => job.kind === 'capture');
+  const stored = await chrome.storage.local.get(null);
+  return Object.entries(stored).filter(([key]) => key.startsWith('openStill.jobs.capture.')).map(([, job]) => job);
+}
+
+function mutateRuntimeState(mutator) {
+  const work = runtimePersistenceQueue.catch(() => undefined).then(async () => {
+    const state = await getRuntimeAux('runtime', 'checkpoint') || { jobs: {}, backoff: {}, liveCursor: 0 };
+    const result = await mutator(state);
+    await putRuntimeAux('runtime', 'checkpoint', state);
+    return result;
+  });
+  runtimePersistenceQueue = work.catch(() => undefined);
+  return work;
+}
+
+function runtimeSessionId() {
+  if (!runtimeSessionPromise) runtimeSessionPromise = (async () => {
+    const area = chrome.storage.session || chrome.storage.local;
+    const stored = await area.get(RUNTIME_SESSION_KEY);
+    const id = stored[RUNTIME_SESSION_KEY] || createRevision();
+    if (!stored[RUNTIME_SESSION_KEY]) await area.set({ [RUNTIME_SESSION_KEY]: id });
+    return id;
+  })();
+  return runtimeSessionPromise;
+}
+
+function queueLiveLifecycle(id, action) {
+  const prior = liveLifecycleQueues.get(id) || Promise.resolve();
+  const work = prior.catch(() => undefined).then(action);
+  liveLifecycleQueues.set(id, work);
+  work.finally(() => { if (liveLifecycleQueues.get(id) === work) liveLifecycleQueues.delete(id); }).catch(() => undefined);
+  return work;
+}
+
+function drainCaptureQueue() {
+  if (recoveringRuntime) return;
+  if (storageUnavailableUntil > Date.now()) { pauseQueueForStorage(0); return; }
+  while (activeCaptures < MAX_GLOBAL_CAPTURES) {
+    const index = captureQueue.findIndex((entry) => (captureOrigins.get(entry.origin) || 0) < MAX_ORIGIN_CAPTURES);
+    if (index < 0) break;
+    const entry = captureQueue.splice(index, 1)[0];
+    captureQueuedAt.delete(entry.id);
+    activeCaptures += 1;
+    captureOrigins.set(entry.origin, (captureOrigins.get(entry.origin) || 0) + 1);
+    void (async () => {
+      try {
+        await putRuntimeAux('jobs', `capture.${entry.id}`, { ...entry.checkpoint, stage: 'running' });
+        entry.started = true;
+        const value = await entry.run(entry.job);
+        entry.value = value;
+        entry.hasValue = true;
+        // A timeout response may finish before Chrome actually finishes an
+        // executeScript request. Keep its permit and monitor lock until then.
+        if (entry.job.draining) { entry.resolve(value); await entry.job.draining.catch(() => undefined); }
+      } catch (error) {
+        entry.reject(error);
+        if (!entry.started) {
+          const prior = storageFailureBackoff.get(entry.id);
+          storageFailureBackoff.set(entry.id, { attempts: (prior?.attempts || 0) + 1, retryAt: Date.now() + 30_000 });
+          pauseQueueForStorage(30_000);
+        }
+      }
+      finally {
+        try {
+          if (Number.isInteger(entry.job.ownedTabId)) {
+            entry.job.cleanupPending = await tabById(entry.job.ownedTabId) ? !await removeLiveControlledTab(entry.job.ownedTabId) : false;
+            if (entry.job.cleanupPending) await putRuntimeAux('jobs', `capture.${entry.id}`, { ...entry.checkpoint, tabId: entry.job.ownedTabId, stage: 'pendingCleanup' }).catch(() => undefined);
+          }
+          if ((!entry.job.draining || entry.job.finished) && !entry.job.cleanupPending) {
+            if (!entry.started || storageFailureBackoff.has(entry.id)) {
+              await putRuntimeAux('jobs', `capture.${entry.id}`, { ...entry.checkpoint, stage: 'resumable' }).catch(() => undefined);
+            } else await deleteRuntimeAux('jobs', `capture.${entry.id}`).catch(() => undefined);
+          }
+          if (entry.hasValue) entry.resolve(entry.job.cleanupPending ? { ...entry.value, warnings: [...(entry.value?.warnings || []), { step: 'tab-cleanup', error: '캡처 탭 정리를 다시 시도해야 합니다.' }] } : entry.value);
+        } catch (error) {
+          if (entry.hasValue) entry.resolve({ ...entry.value, warnings: [...(entry.value?.warnings || []), { step: 'tab-cleanup', error: responseError(error) }] });
+        } finally {
+          activeCaptures -= 1;
+          captureOrigins.set(entry.origin, Math.max(0, (captureOrigins.get(entry.origin) || 1) - 1));
+          if (captureTasks.get(entry.id) === entry.promise) captureTasks.delete(entry.id);
+          drainCaptureQueue();
+        }
+      }
+    })();
+  }
+}
+
+async function enqueueCaptureTask(id, url, source, run) {
+  if (captureTasks.has(id)) return { ok: false, reason: 'checking', error: '이미 확인 중입니다.' };
+  const origin = new URL(url).origin;
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const checkpoint = { kind: 'capture', id, url, source, stage: 'queued', createdAt: nowIso(), sessionId: await runtimeSessionId() };
+  if (captureTasks.has(id)) return { ok: false, reason: 'checking', error: '이미 확인 중입니다.' };
+  const persisted = await getRuntimeAux('jobs', `capture.${id}`);
+  if (persisted && ['ownership-unverified', 'pendingCleanup'].includes(persisted.stage)) return { ok: false, reason: 'pending-cleanup', error: '이전 캡처 탭의 소유권 확인 또는 정리가 필요합니다.' };
+  if (persisted && ['queued', 'resumable'].includes(persisted.stage) && persisted.url === url && asIso(persisted.createdAt, null)) checkpoint.createdAt = persisted.createdAt;
+  if (captureTasks.has(id)) return { ok: false, reason: 'checking', error: '이미 확인 중입니다.' };
+  const job = {
+    id, cancelled: false, signal: controller?.signal,
+    isCancelled() { return this.cancelled; },
+    async onTabCreated(tabId) {
+      this.ownedTabId = tabId;
+      await putRuntimeAux('jobs', `capture.${id}`, { ...checkpoint, stage: 'loading', tabId });
+    },
+    async cancel() {
+      this.cancelled = true;
+      controller?.abort();
+      const persisted = await getRuntimeAux('jobs', `capture.${id}`).catch(() => null);
+      if (persisted) await putRuntimeAux('jobs', `capture.${id}`, { ...persisted, stage: 'cancelling' }).catch(() => undefined);
+      if (Number.isInteger(this.ownedTabId)) this.cleanupPending = !await removeLiveControlledTab(this.ownedTabId);
+    }
+  };
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  captureTasks.set(id, promise);
+  try {
+    await putRuntimeAux('jobs', `capture.${id}`, checkpoint);
+    captureQueuedAt.set(id, checkpoint.createdAt);
+    const entry = { id, origin, source, run, job, checkpoint, promise, resolve, reject };
+    if (pendingSnapshotCommits.has(id)) captureQueue.unshift(entry);
+    else captureQueue.push(entry);
+    drainCaptureQueue();
+  } catch (error) { captureTasks.delete(id); captureQueuedAt.delete(id); reject(error); }
+  return promise;
+}
+
+function mutationConflict(monitor, message) {
+  let expectedRecord;
+  if (Array.isArray(message?.expectedRevisions)) {
+    let index = expectedRevisionMaps.get(message);
+    if (!index) { index = new Map(message.expectedRevisions.map((entry) => [entry.id, entry])); expectedRevisionMaps.set(message, index); }
+    expectedRecord = index.get(monitor?.id);
+    if (!expectedRecord || expectedRecord.url && monitor?.url !== expectedRecord.url) return { ok: false, reason: 'conflict', id: monitor?.id, error: '작업 대상 주소 또는 구성이 변경되었습니다.' };
+  }
+  const expected = message?.expectedRevision ?? expectedRecord?.revision;
+  if (expected && monitor?.revision !== expected) return { ok: false, reason: 'conflict', id: monitor?.id, revision: monitor?.revision, error: '다른 작업에서 추적이 변경되었습니다. 최신 내용을 다시 확인해 주세요.' };
+  const expectedChange = message?.expectedChangeId ?? message?.expectedChange;
+  const currentChange = monitor?.lastChange?.id ?? monitor?.lastChange?.detectedAt ?? null;
+  if (expectedChange !== undefined && expectedChange !== currentChange) return { ok: false, reason: 'change-conflict', id: monitor?.id, lastChangeId: currentChange, error: '확인한 뒤 새 변경이 도착했습니다.' };
+  return null;
+}
+
+function compactMonitor(monitor) {
+  if (!monitor) return null;
+  return { id: monitor.id, revision: monitor.revision, name: monitor.name, url: monitor.url, enabled: monitor.enabled, status: monitor.status, unread: monitor.unread, lastChangeId: monitor.lastChange?.id ?? monitor.lastChange?.detectedAt ?? null };
+}
+
+function compactMutationResult(result) {
+  if (!result || typeof result !== 'object') return result;
+  return { ...result, ...(result.monitor ? { monitor: compactMonitor(result.monitor) } : {}), ...(Array.isArray(result.monitors) ? { monitors: result.monitors.map(compactMonitor) } : {}) };
+}
+
+async function afterMonitorCommit(result, steps = []) {
+  if (!result?.ok) return result;
+  const warnings = [];
+  for (const [step, action] of steps) {
+    try { const outcome = await action(); if (outcome?.ok === false) warnings.push({ step, reason: outcome.reason, error: outcome.error || '후속 처리를 완료하지 못했습니다.' }); } catch (error) { warnings.push({ step, error: responseError(error) }); }
+  }
+  return { ...result, committed: true, ...(result.monitor ? { monitor: compactMonitor(result.monitor) } : {}), ...(warnings.length ? { warnings } : {}) };
+}
+
+function runMutationOperation(message, action) {
+  const id = cleanShortText(message?.operationId, 120) || createRevision();
+  const type = message?.type || 'mutation';
+  const work = mutationOperationQueue.catch(() => undefined).then(async () => {
+    const prior = await getRuntimeAux('operations', id);
+    if (prior) return prior.type && prior.type !== type ? { ok: false, reason: 'operation-conflict', error: '작업 ID가 다른 요청에 이미 사용되었습니다.' } : { ...(prior.result ?? prior), committed: true, operationId: id, replayed: true };
+    activeMutationOperation = { id, type };
+    try {
+      const result = await action();
+      const committed = result?.committed === true || activeMutationOperation.committed === true;
+      const response = { ...result, operationId: id, ...(committed ? { committed: true } : {}) };
+      if (committed) await putRuntimeAux('operations', id, { type, result: response, at: nowIso() }).catch((error) => {
+        response.warnings = [...(response.warnings || []), { step: 'operation-receipt', error: responseError(error) }];
+      });
+      return response;
+    } catch (error) {
+      if (!activeMutationOperation.committed) throw error;
+      return { ...compactMutationResult(activeMutationOperation.result), ok: true, committed: true, operationId: id, warnings: [{ step: 'post-commit', error: responseError(error) }] };
+    } finally { activeMutationOperation = null; }
+  });
+  mutationOperationQueue = work.catch(() => undefined);
+  return work;
+}
 
 function cleanText(value, maxLength = MAX_SNAPSHOT_CHARS) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -206,7 +473,7 @@ function cleanLabels(value) {
 
 function asIso(value, fallback = null) {
   const timestamp = typeof value === 'number' ? value : Date.parse(value ?? '');
-  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
+  return Number.isFinite(timestamp) && Math.abs(timestamp) <= 8.64e15 ? new Date(timestamp).toISOString() : fallback;
 }
 
 function nowIso() {
@@ -543,11 +810,14 @@ function normalizeScheduleDescriptor(input, fallbackMode = SCHEDULE_MODE_MANUAL,
     fallback?.type ?? fallbackMode
   );
   if (!type) return null;
-  const params = embedded?.params && typeof embedded.params === 'object' ? embedded.params : {};
-  const fallbackParams = fallback?.type === type && fallback.params && typeof fallback.params === 'object'
+  const params = embedded?.params && typeof embedded.params === 'object' && !Array.isArray(embedded.params) ? embedded.params : {};
+  const fallbackParams = fallback?.type === type && fallback.params && typeof fallback.params === 'object' && !Array.isArray(fallback.params)
     ? fallback.params
     : {};
-  if (type === SCHEDULE_MODE_MANUAL || type === SCHEDULE_MODE_LIVE) return { type, params: {} };
+  const descriptorExtensions = Object.fromEntries(Object.entries({ ...(fallback || {}), ...(embedded || {}) }).filter(([key]) => !['type', 'params'].includes(key)));
+  const parameterExtensions = Object.fromEntries(Object.entries({ ...fallbackParams, ...params }).filter(([key]) => !['interval', 'min', 'max', 'expr', 'tz'].includes(key)));
+  const descriptor = (parameters) => ({ ...descriptorExtensions, type, params: { ...parameterExtensions, ...parameters } });
+  if (type === SCHEDULE_MODE_MANUAL || type === SCHEDULE_MODE_LIVE) return descriptor({});
 
   if (type === SCHEDULE_MODE_INTERVAL) {
     const fromHours = source.intervalHours === undefined || source.intervalHours === null
@@ -556,13 +826,13 @@ function normalizeScheduleDescriptor(input, fallbackMode = SCHEDULE_MODE_MANUAL,
     const interval = scheduleSeconds(
       params.interval ?? source.intervalSeconds ?? source.interval ?? fromHours ?? fallbackParams.interval
     );
-    return interval ? { type, params: { interval } } : null;
+    return interval ? descriptor({ interval }) : null;
   }
 
   if (type === SCHEDULE_MODE_RANDOM) {
     const min = scheduleSeconds(params.min ?? source.randomMinSeconds ?? source.min ?? fallbackParams.min);
     const max = scheduleSeconds(params.max ?? source.randomMaxSeconds ?? source.max ?? fallbackParams.max);
-    return min && max && min <= max ? { type, params: { min, max } } : null;
+    return min && max && min <= max ? descriptor({ min, max }) : null;
   }
 
   const expr = String(params.expr ?? source.cronExpression ?? source.cron ?? source.expr ?? fallbackParams.expr ?? '').trim();
@@ -573,7 +843,7 @@ function normalizeScheduleDescriptor(input, fallbackMode = SCHEDULE_MODE_MANUAL,
   // The reference defers parsing to next-run calculation and simply returns
   // no due time on failure; rejecting it here would drop the monitor while
   // normalizing stored state.
-  return { type, params: { expr, ...(tz !== null ? { tz } : {}) } };
+  return descriptor({ expr, ...(tz !== null ? { tz } : {}) });
 }
 
 function scheduleDescriptorOf(monitor) {
@@ -658,17 +928,13 @@ function normalizeUrl(value) {
   }
 }
 
-// A monitor's URL is its page identity, so retain the fragment for hash-routed
-// applications.  A frame location is different: browser frame documents are
-// re-created independently of a fragment-only navigation, and the Reference
-// frame descriptor matches the document URL rather than a client-side route.
+// Keep document and application route identity intact for embedded pages.
 function normalizeFrameUrl(value) {
   const normalized = normalizeUrl(value);
   if (!normalized) return null;
   try {
-    const url = new URL(normalized);
-    url.hash = '';
-    return url.href;
+    // Fragment routes can identify a different SPA document in an embed.
+    return new URL(normalized).href;
   } catch {
     return null;
   }
@@ -775,7 +1041,8 @@ function cleanLocatorField(value) {
   }
   if (type === 'builtin') type = name === 'text' ? 'text' : '';
   if (!LOCATOR_FIELD_TYPES.has(type)) return null;
-  if (type === 'text') return { type: 'text' };
+  const { type: rawType, kind: rawKind, name: rawName, value: rawValue, ...extensions } = raw;
+  if (type === 'text') return { ...extensions, type: 'text' };
   // Attributes are surfaced by the reference picker verbatim, including
   // XML/SVG names such as `xlink:href` and non-ASCII names.  Property access
   // is also bracket-based, so it does not require a JavaScript identifier.
@@ -783,7 +1050,7 @@ function cleanLocatorField(value) {
   // that cannot be an attribute/property field selection.
   if (!name || name.length > 256 || /[\u0000-\u001F\u007F\s]/.test(name)) return null;
   if (type === 'attribute' && /["'<>\/=]/.test(name)) return null;
-  return { type, name };
+  return { ...extensions, type, name };
 }
 
 function cleanLocatorFields(value) {
@@ -817,7 +1084,12 @@ function cleanFramePath(value) {
         ? Number(indexValue)
         : Number.NaN;
     if (!url || !Number.isInteger(index) || index < 0 || index > 10_000) return null;
-    path.push({ url, index });
+    const element = entry.element && typeof entry.element === 'object'
+      && typeof entry.element.attribute === 'string' && typeof entry.element.value === 'string'
+      ? { ...entry.element, attribute: entry.element.attribute.slice(0, 256), value: entry.element.value.slice(0, 2_000) }
+      : null;
+    const { url: rawUrl, index: rawIndex, siblingIndex: rawSiblingIndex, element: rawElement, ...extensions } = entry;
+    path.push({ ...extensions, url, index, ...(element ? { element } : {}) });
   }
   return path;
 }
@@ -875,7 +1147,10 @@ function cleanLocator(value, defaults = {}) {
     // locator protocol.  It must inherit its parent's text mode instead of
     // silently becoming an explicit empty override after a save/reload.
     || (raw.fieldsSpecified !== false && Object.hasOwn(raw, 'fields') && raw.fields != null && !rawDefaultTextOnly);
+  const knownNames = new Set(['type', 'expr', 'selector', 'value', 'op', 'operation', 'frameId', 'frame', 'frameOrder', 'frameIndex', 'framePath', 'frameDescriptor', 'frameUrl', 'frameUri', 'frameVolatileParameters', 'identityAttribute', 'fields', 'fieldsSpecified']);
+  const extensions = Object.fromEntries(Object.entries(raw).filter(([name]) => !knownNames.has(name)));
   return {
+    ...extensions,
     type,
     expr,
     op,
@@ -883,6 +1158,11 @@ function cleanLocator(value, defaults = {}) {
     framePath,
     ...(frameOrder !== null ? { frameOrder } : {}),
     ...(frameUrl ? { frameUrl } : {}),
+    ...(Array.isArray(raw.frameVolatileParameters) ? {
+      frameVolatileParameters: raw.frameVolatileParameters.filter((name) => typeof name === 'string' && name.length <= 256).slice(0, 32)
+    } : {}),
+    ...(typeof raw.identityAttribute === 'string' && /^[^\s"'<>\/=\u0000-\u001F]{1,256}$/.test(raw.identityAttribute)
+      ? { identityAttribute: raw.identityAttribute } : {}),
     fields: cleanLocatorFields(raw.fields),
     ...(fieldsSpecified ? { fieldsSpecified: true } : {})
   };
@@ -896,6 +1176,8 @@ function locatorKey(locator) {
     locator.frameOrder ?? '',
     JSON.stringify(locator.framePath ?? []),
     locator.frameUrl ?? '',
+    JSON.stringify(locator.frameVolatileParameters ?? []),
+    locator.identityAttribute ?? '',
     locator.expr,
     locator.fieldsSpecified === true ? 'fields:explicit' : 'fields:inherited',
     ...locator.fields.map((field) => `${field.type}:${field.name ?? ''}`)
@@ -1046,30 +1328,29 @@ function framePathForFrame(frameId, frames) {
   while (current && current.parentFrameId >= 0) {
     const url = normalizeFrameUrl(current.url);
     if (!url) return null;
-    // Frame ids are assigned afresh on every load.  Counting every sibling
-    // makes a saved route drift merely because an unrelated ad or widget was
-    // inserted before it, so disambiguate only among siblings with the same
-    // normalized document URL.
     const siblings = frames
       .filter((frame) => frame.parentFrameId === current.parentFrameId && normalizeFrameUrl(frame.url) === url)
       .sort((left, right) => left.frameId - right.frameId);
     const index = siblings.findIndex((frame) => frame.frameId === current.frameId);
     if (index < 0) return null;
-    path.unshift({ url, index });
+    // Transient frame IDs cannot distinguish duplicate embeds after reload.
+    // Require the parent DOM identity when a document URL is ambiguous.
+    if (siblings.length > 1 && !current.elementIdentity) return null;
+    path.unshift({ url, index: current.elementIdentity ? 0 : index, ...(siblings.length > 1 ? { ambiguousUrl: true } : {}),
+      ...(current.elementIdentity ? { element: current.elementIdentity } : {}) });
     current = byId.get(current.parentFrameId);
   }
   return current ? path : null;
 }
 
-function stableFrameLocation(value) {
+function stableFrameLocation(value, volatileParameters = []) {
   const normalized = normalizeFrameUrl(value);
   if (!normalized) return null;
   try {
     const url = new URL(normalized);
-    // Session/query tokens on embed URLs commonly change on every reload.
-    // They are useful for an exact match first, but origin+path is the safe
-    // secondary identity when it identifies one and only one frame route.
-    url.search = '';
+    // Query parameters can identify different documents. Relax only parameters
+    // explicitly declared volatile by this locator.
+    for (const name of volatileParameters) url.searchParams.delete(name);
     return url.href;
   } catch {
     return null;
@@ -1080,16 +1361,21 @@ function sameFramePath(left, right) {
   return Array.isArray(left)
     && Array.isArray(right)
     && left.length === right.length
-    && left.every((part, index) => part.url === right[index]?.url && part.index === right[index]?.index);
+    && left.every((part, index) => part.url === right[index]?.url
+      && (part.element
+        ? part.element.attribute === right[index]?.element?.attribute && part.element.value === right[index]?.element?.value
+        : !right[index]?.ambiguousUrl && part.index === right[index]?.index));
 }
 
-function sameRelaxedFramePath(left, right) {
+function sameRelaxedFramePath(left, right, volatileParameters = []) {
   return Array.isArray(left)
     && Array.isArray(right)
     && left.length === right.length
     && left.every((part, index) => (
-      part.index === right[index]?.index
-      && stableFrameLocation(part.url) === stableFrameLocation(right[index]?.url)
+      (part.element
+        ? part.element.attribute === right[index]?.element?.attribute && part.element.value === right[index]?.element?.value
+        : !right[index]?.ambiguousUrl && part.index === right[index]?.index)
+      && stableFrameLocation(part.url, volatileParameters) === stableFrameLocation(right[index]?.url, volatileParameters)
     ));
 }
 
@@ -1097,7 +1383,7 @@ function resolveLocatorFrame(locator, frames) {
   if (locator.framePath?.length) {
     const exact = frames.filter((frame) => sameFramePath(locator.framePath, framePathForFrame(frame.frameId, frames)));
     if (exact.length === 1) return exact[0].frameId;
-    const relaxed = frames.filter((frame) => sameRelaxedFramePath(locator.framePath, framePathForFrame(frame.frameId, frames)));
+    const relaxed = frames.filter((frame) => sameRelaxedFramePath(locator.framePath, framePathForFrame(frame.frameId, frames), locator.frameVolatileParameters));
     if (relaxed.length === 1) return relaxed[0].frameId;
     // A saved path is stronger evidence than Chrome's transient frame id.  Do
     // not silently run a selector in a possibly unrelated frame after a
@@ -1107,15 +1393,76 @@ function resolveLocatorFrame(locator, frames) {
   if (locator.frameUrl) {
     const exact = frames.filter((frame) => frame.frameId !== 0 && normalizeFrameUrl(frame.url) === locator.frameUrl);
     if (exact.length === 1) return exact[0].frameId;
-    const stable = stableFrameLocation(locator.frameUrl);
+    const stable = stableFrameLocation(locator.frameUrl, locator.frameVolatileParameters);
     const relaxed = frames.filter((frame) => (
-      frame.frameId !== 0 && stableFrameLocation(frame.url) === stable
+      frame.frameId !== 0 && stableFrameLocation(frame.url, locator.frameVolatileParameters) === stable
     ));
     // A URL-only Reference descriptor is safe only if it names exactly one
     // current subframe. Duplicate embeds remain a visible selection failure.
     return relaxed.length === 1 ? relaxed[0].frameId : -1;
   }
-  return Number.isInteger(locator.frameId) ? locator.frameId : 0;
+  // A saved subframe ID alone cannot survive a document reload. Preserve the
+  // record, but require the user to identify that frame again before capture.
+  return Number.isInteger(locator.frameId) && locator.frameId !== 0 ? -1 : 0;
+}
+
+// Identify the actual parent iframe by Window identity, including cross-origin
+// frames. Messages carry a private random token and never change page DOM.
+async function collectStableFrameDescriptors(tabId, frames) {
+  if (!frames.some((frame) => frame.frameId !== 0)) return frames;
+  const token = crypto.randomUUID();
+  try {
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: (captureToken) => {
+      const records = new Map();
+      const elements = [...document.querySelectorAll('iframe,frame')];
+      const names = ['id', 'name', 'data-frame-id', 'data-testid', 'data-id'];
+      const counts = new Map(names.map((attribute) => [attribute, new Map()]));
+      for (const element of elements) for (const attribute of names) {
+        const value = element.getAttribute(attribute);
+        if (value) counts.get(attribute).set(value, (counts.get(attribute).get(value) || 0) + 1);
+      }
+      const identityByWindow = new Map();
+      for (const element of elements) {
+        let identity = null;
+        for (const attribute of names) {
+          const value = element.getAttribute(attribute);
+          if (value && counts.get(attribute).get(value) === 1) { identity = { attribute, value }; break; }
+        }
+        if (element.contentWindow) identityByWindow.set(element.contentWindow, identity);
+      }
+      const listener = (event) => {
+        if (event.data?.openStillFrameToken !== captureToken) return;
+        if (identityByWindow.has(event.source)) records.set(event.data.marker, identityByWindow.get(event.source));
+      };
+      addEventListener('message', listener);
+      const registry = globalThis.__openStillFrameDescriptors || (globalThis.__openStillFrameDescriptors = new Map());
+      registry.set(captureToken, { records, listener });
+      setTimeout(() => { removeEventListener('message', listener); registry.delete(captureToken); }, 5_000);
+    }, args: [token] });
+    const markers = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: (captureToken) => {
+      const marker = crypto.randomUUID();
+      if (parent !== window) parent.postMessage({ openStillFrameToken: captureToken, marker }, '*');
+      return marker;
+    }, args: [token] });
+    const descriptors = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: async (captureToken) => {
+      // postMessage delivery is queued; give the parent's listener one turn.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const registry = globalThis.__openStillFrameDescriptors;
+      const state = registry?.get(captureToken);
+      if (!state) return [];
+      removeEventListener('message', state.listener);
+      registry.delete(captureToken);
+      return [...state.records.entries()];
+    }, args: [token] });
+    const identityByMarker = new Map(descriptors.flatMap((entry) => Array.isArray(entry.result) ? entry.result : []));
+    const identityByFrame = new Map(markers.map((entry) => [entry.frameId, identityByMarker.get(entry.result)]));
+    return frames.map((frame) => ({ ...frame, ...(identityByFrame.get(frame.frameId)
+      ? { elementIdentity: identityByFrame.get(frame.frameId) } : {}) }));
+  } catch {
+    // A restricted subframe may disallow injection. URL-unique routes remain
+    // usable, while duplicate routes fail closed in framePathForFrame().
+    return frames;
+  }
 }
 
 function cleanRegularExpression(value) {
@@ -1150,8 +1497,12 @@ function hasInvalidConfiguredRegularExpression(value) {
   return !cleanRegularExpression(candidate);
 }
 
+const LEGACY_TRACKING_FIELDS = new Set(['dataAttr', 'compare', 'comparison', 'ignoreWhitespace', 'allowEmpty', 'ignoreEmptyText', 'regexp', 'regex', 'textFilter', 'includeScript', 'includeScripts', 'includeStyle', 'includeStyles', 'keepComments', 'live', 'liveMonitoring', 'delayMilliseconds', 'delay', 'timeoutMilliseconds', 'timeout']);
+function legacyTrackingSettings(value) {
+  return Object.fromEntries(Object.entries(value && typeof value === 'object' ? value : {}).filter(([name]) => LEGACY_TRACKING_FIELDS.has(name)));
+}
 function normalizeTracking(value) {
-  const input = value && typeof value === 'object' ? value : {};
+  const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const requestedDataAttr = String(input.dataAttr ?? input.compare ?? input.comparison ?? 'text').toLowerCase();
   const dataAttr = requestedDataAttr === 'data' || requestedDataAttr === 'html' ? 'data' : 'text';
   const delayMilliseconds = Object.hasOwn(input, 'delayMilliseconds')
@@ -1163,6 +1514,7 @@ function normalizeTracking(value) {
       ? Number(input.timeout) * 1_000
       : CHECK_EXECUTION_TIMEOUT_MS;
   return {
+    ...input,
     dataAttr,
     ignoreWhitespace: input.ignoreWhitespace !== false,
     allowEmpty: input.allowEmpty === true || input.ignoreEmptyText === false,
@@ -1180,18 +1532,19 @@ function normalizeTracking(value) {
   };
 }
 
-function filterCapturedText(text, tracking) {
+async function filterCapturedText(text, tracking, itemTexts = null) {
   const regexp = normalizeTracking(tracking).regexp;
   const source = String(text ?? '');
-  if (!regexp) return source;
-  try {
-    const matches = source.match(new RegExp(regexp.expr, regexp.flags));
-    return matches?.length ? matches.join(' ') : '';
-  } catch {
-    // Stored monitors are normalized before use, but preserve a deterministic
-    // empty result if a browser later rejects a previously valid regexp flag.
-    return '';
-  }
+  if (!regexp) return itemTexts === null ? source : { text: source, itemTexts };
+  await ensureOffscreenDocument();
+  const result = await timeout(chrome.runtime.sendMessage({
+    type: 'filter-captured-text', text: source, regexp, itemTexts, timeoutMilliseconds: 1_500
+  }), 2_500, '정규식 필터 응답 시간이 초과됐습니다. 이전 정상 자료를 유지합니다.');
+  if (!result?.ok) throw new Error(result?.error || '정규식 필터를 완료하지 못했습니다.');
+  return itemTexts === null ? String(result.text ?? '') : {
+    text: String(result.text ?? ''),
+    itemTexts: Array.isArray(result.itemTexts) ? result.itemTexts.map((value) => String(value ?? '')) : []
+  };
 }
 
 function snapshotTextFromItems(items) {
@@ -1203,28 +1556,45 @@ function snapshotHtmlFromItems(items) {
 }
 
 function normalizeSnapshot(value) {
-  if (!value || typeof value !== 'object' || typeof value.exists !== 'boolean') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return null;
   }
-
+  if (Object.hasOwn(value, '$snapshot') || Object.hasOwn(value, 'previewVersion')) {
+    const { $snapshot, previewVersion, ...payload } = value;
+    value = { ...payload, referenceMarkerIgnored: true };
+  }
+  if (value.contentOmitted === true) return { ...value, exists: value.exists !== false, contentOmitted: true, items: [], text: '', html: '', data: '', capturedAt: asIso(value.capturedAt) };
   const matchCount = typeof value.matchCount === 'number'
     ? value.matchCount
     : typeof value.matchCount === 'string' && /^\d+$/.test(value.matchCount.trim())
       ? Number(value.matchCount)
       : Number.NaN;
-  const rawItems = Array.isArray(value.items) ? value.items : [];
+  const rawItems = Array.isArray(value.items) ? value.items.filter((item) => item && typeof item === 'object' && !Array.isArray(item) && (typeof item.text === 'string' || typeof item.html === 'string')) : [];
   const fullItemTexts = rawItems.map((item) => cleanSnapshotText(item?.text, Number.MAX_SAFE_INTEGER));
-  const fullText = rawItems.length
-    ? fullItemTexts.join('\n\n')
-    : cleanSnapshotText(value.text, Number.MAX_SAFE_INTEGER);
+  const fullText = typeof value.text === 'string'
+    ? cleanSnapshotText(value.text, Number.MAX_SAFE_INTEGER)
+    : fullItemTexts.join('\n\n');
   const itemCount = Math.min(rawItems.length, MAX_COLLECTION_ITEMS);
   const separatorLength = Math.max(0, itemCount - 1) * 2;
-  const perItemLimit = itemCount
-    ? Math.max(0, Math.floor(Math.max(0, MAX_SNAPSHOT_CHARS - separatorLength) / itemCount))
-    : 0;
-  const items = rawItems.slice(0, MAX_COLLECTION_ITEMS).map((item) => ({
-    text: cleanSnapshotText(item?.text, perItemLimit)
-  }));
+  let remaining = Math.max(0, MAX_SNAPSHOT_CHARS - separatorLength);
+  let remainingHtml = MAX_SNAPSHOT_CHARS;
+  let itemTruncated = rawItems.length > MAX_COLLECTION_ITEMS;
+  const items = rawItems.slice(0, MAX_COLLECTION_ITEMS).map((item, index) => {
+    const text = fullItemTexts[index].slice(0, remaining);
+    const fullItemHtml = cleanSnapshotHtml(item.html, Number.MAX_SAFE_INTEGER);
+    const itemHtml = fullItemHtml.slice(0, remainingHtml); remainingHtml -= itemHtml.length;
+    remaining -= text.length;
+    if (text.length < fullItemTexts[index].length) itemTruncated = true;
+    return { ...item, text, html: itemHtml,
+      textFingerprint: item.textTruncated && item.textFingerprint || snapshotFingerprint(fullItemTexts[index]),
+      compactTextFingerprint: item.textTruncated && item.compactTextFingerprint || snapshotFingerprint(fullItemTexts[index].replace(/\s/g, '')),
+      tokenTextFingerprint: item.textTruncated && item.tokenTextFingerprint || comparisonTokenFingerprint(fullItemTexts[index]),
+      htmlFingerprint: item.htmlTruncated && item.htmlFingerprint || snapshotFingerprint(fullItemHtml),
+      compactHtmlFingerprint: item.htmlTruncated && item.compactHtmlFingerprint || snapshotFingerprint(fullItemHtml.replace(/\s/g, '')),
+      tokenHtmlFingerprint: item.htmlTruncated && item.tokenHtmlFingerprint || comparisonTokenFingerprint(fullItemHtml),
+      htmlTruncated: item.htmlTruncated === true || fullItemHtml.length > itemHtml.length,
+      textTruncated: item.textTruncated === true || text.length < fullItemTexts[index].length };
+  });
   if (!items.length && fullText) items.push({ text: fullText.slice(0, MAX_SNAPSHOT_CHARS) });
   const fullHtml = cleanSnapshotHtml(
     typeof value.html === 'string' ? value.html : snapshotHtmlFromItems(rawItems),
@@ -1244,29 +1614,41 @@ function normalizeSnapshot(value) {
   // it is deliberately independent from whether there is textual content.
   // An allow-empty monitor must retain its filtered HTML/data even at zero
   // matches so a later structural reappearance can be compared faithfully.
-  const exists = Boolean(value.exists);
+  const exists = typeof value.exists === 'boolean' ? value.exists : Boolean(safeMatchCount || fullText || fullHtml || fullData);
   const retainPayload = exists
     || rawItems.length > 0
     || Boolean(fullText)
     || Boolean(fullHtml)
     || Boolean(fullData);
+  // Older OpenStill snapshots used the same digest algorithm before an
+  // explicit version field existed. Their original digest is still evidence
+  // for a truncated payload; hashing the stored prefix would destroy it.
+  const supportedFingerprints = value.fingerprintVersion === 1 || value.fingerprintVersion == null;
 
   return {
+    ...value,
+    schemaVersion: 1,
+    fingerprintVersion: 1,
     exists,
     matchCount: safeMatchCount,
-    text: retainPayload ? snapshotTextFromItems(items) : '',
+    text: retainPayload ? fullText.slice(0, MAX_SNAPSHOT_CHARS) : '',
     html: retainPayload ? html : '',
     data: retainPayload ? data : '',
     evidenceHtml,
     items: retainPayload ? items : [],
-    textFingerprint: snapshotFingerprint(fullText),
-    compactTextFingerprint: snapshotFingerprint(fullText.replace(/\s/g, '')),
-    tokenTextFingerprint: comparisonTokenFingerprint(fullText),
-    dataFingerprint: snapshotFingerprint(fullData),
-    compactDataFingerprint: snapshotFingerprint(fullData.replace(/\s/g, '')),
-    tokenDataFingerprint: comparisonTokenFingerprint(fullData),
-    textTruncated: fullText.length > MAX_SNAPSHOT_CHARS || rawItems.length > MAX_COLLECTION_ITEMS,
-    dataTruncated: fullData.length > MAX_SNAPSHOT_CHARS,
+    textFingerprint: supportedFingerprints && value.textTruncated && value.textFingerprint || snapshotFingerprint(fullText),
+    compactTextFingerprint: supportedFingerprints && value.textTruncated && value.compactTextFingerprint || snapshotFingerprint(fullText.replace(/\s/g, '')),
+    tokenTextFingerprint: supportedFingerprints && value.textTruncated && value.tokenTextFingerprint || comparisonTokenFingerprint(fullText),
+    dataFingerprint: supportedFingerprints && value.dataTruncated && value.dataFingerprint || snapshotFingerprint(fullData),
+    compactDataFingerprint: supportedFingerprints && value.dataTruncated && value.compactDataFingerprint || snapshotFingerprint(fullData.replace(/\s/g, '')),
+    tokenDataFingerprint: supportedFingerprints && value.dataTruncated && value.tokenDataFingerprint || comparisonTokenFingerprint(fullData),
+    textOriginalLength: Math.max(fullText.length, Number(value.textOriginalLength) || 0),
+    dataOriginalLength: Math.max(fullData.length, Number(value.dataOriginalLength) || 0),
+    textStoredLength: Math.min(fullText.length, MAX_SNAPSHOT_CHARS),
+    dataStoredLength: data.length,
+    textTruncated: value.textTruncated === true || itemTruncated || fullText.length > MAX_SNAPSHOT_CHARS,
+    dataTruncated: value.dataTruncated === true || fullData.length > MAX_SNAPSHOT_CHARS,
+    ...(typeof value.exists !== 'boolean' ? { existsInferred: true } : {}),
     capturedAt: asIso(value.capturedAt, null)
   };
 }
@@ -1277,6 +1659,8 @@ function snapshotsEqual(left, right, tracking = null) {
   // `text` preserves the familiar whitespace-insensitive monitor behaviour,
   // while `data` compares the filtered HTML so a changed href/src is visible.
   const options = normalizeTracking(tracking);
+  const identityComparison = compareSnapshotIdentities(left, right, options);
+  if (identityComparison) return identityComparison.equal;
   const field = options.dataAttr === 'data' ? 'data' : 'text';
   const fingerprintField = field === 'data'
     ? options.ignoreWhitespace ? 'compactDataFingerprint' : 'tokenDataFingerprint'
@@ -1294,6 +1678,31 @@ function snapshotsEqual(left, right, tracking = null) {
   // configured text/data payload; a matched empty element and a missing
   // element with the same payload are not a synthetic content change.
   return Boolean(left && right) && (fingerprintComparable ?? comparable);
+}
+function compareSnapshotIdentities(left, right, tracking = null) {
+  const options = normalizeTracking(tracking); const field = options.dataAttr === 'data' ? 'html' : 'text';
+  const keyOf = (item) => {
+    const explicit = item?.identity?.key ?? item?.identityKey;
+    if (!explicit) return null;
+    const configured = [item.locator, ...(Array.isArray(item.locators) ? item.locators : [])];
+    const volatile = new Set(configured.flatMap((locator) => Array.isArray(locator?.frameVolatileParameters) ? locator.frameVolatileParameters.filter((name) => typeof name === 'string') : []));
+    const stableUrl = (value) => {
+      if (!volatile.size) return value ?? '';
+      try { const url = new URL(value); for (const parameter of volatile) url.searchParams.delete(parameter); return url.href; } catch { return value ?? ''; }
+    };
+    const frame = item.frame;
+    const scope = frame ? JSON.stringify([stableUrl(frame.url), (Array.isArray(frame.path) ? frame.path : []).map((part) => [stableUrl(part.url), part.element?.attribute ?? '', part.element?.value ?? ''])]) : '';
+    return `identity:${scope}:${explicit}`;
+  };
+  const oldItems = left?.items || []; const newItems = right?.items || [];
+  if ((!oldItems.length && !newItems.length) || oldItems.some((item) => !keyOf(item)) || newItems.some((item) => !keyOf(item))) return null;
+  const valueOf = (item) => options.ignoreWhitespace ? String(item[field] || '').replace(/\s/g, '') : comparisonTokens(item[field]).join('\u0000');
+  const entries = (items) => items.map((item) => keyOf(item) + '\u0000' + (item[field + 'Truncated']
+    ? item[(options.ignoreWhitespace ? 'compact' : 'token') + (field === 'text' ? 'Text' : 'Html') + 'Fingerprint'] || item[field + 'Fingerprint']
+    : snapshotFingerprint(valueOf(item)))).sort();
+  const oldValues = entries(oldItems); const newValues = entries(newItems);
+  return { equal: oldValues.length === newValues.length && oldValues.every((value, index) => value === newValues[index]),
+    orderChanged: oldItems.map(keyOf).join('\u0000') !== newItems.map(keyOf).join('\u0000') };
 }
 
 function normalizeMonitor(value) {
@@ -1325,25 +1734,35 @@ function normalizeMonitor(value) {
   const url = isReferenceRecord
     ? normalizeUrl(referenceSelectionUri(referenceConfig)) ?? normalizeUrl(value.uri ?? value.url)
     : normalizeUrl(value.url);
-  const locators = usesReferenceSelection
+  let locators = usesReferenceSelection
     ? referenceSelection?.ok ? cleanLocators(referenceSelection.locators) : null
     : cleanLocators(value.locators ?? value.selectors);
-  const selectors = locators ? displaySelectorsForLocators(locators) : null;
+  const repairIssues = [...(Array.isArray(value.recoveryIssues) ? value.recoveryIssues : [])];
+  if (!locators) {
+    const source = usesReferenceSelection ? referenceSelection?.locators : value.locators ?? value.selectors;
+    locators = (Array.isArray(source) ? source : [source]).map((item) => cleanLocator(item)).filter(Boolean).slice(0, MAX_SELECTORS_PER_MONITOR);
+    repairIssues.push('선택자 일부가 손상되어 실행을 일시정지했습니다.');
+  }
+  const selectors = displaySelectorsForLocators(locators);
   // Pre-manual-mode monitors always used an interval. Newer records retain a
   // reference-style descriptor so RANDOM, CRON, and LIVE survive export and
   // worker restarts without being flattened into an hour count.
-  const schedule = normalizeScheduleDescriptor(
+  let schedule = normalizeScheduleDescriptor(
     value,
     isReferenceRecord ? SCHEDULE_MODE_MANUAL : SCHEDULE_MODE_INTERVAL
   );
+  if (!schedule || schedule.type === SCHEDULE_MODE_CRON && !parseCronExpression(schedule.params.expr)) {
+    schedule = normalizeScheduleDescriptor({ schedule: { ...(parseScheduleObject(value.schedule) || {}), type: SCHEDULE_MODE_MANUAL } }, SCHEDULE_MODE_MANUAL);
+    repairIssues.push('일정이 손상되어 수동 확인으로 복구했습니다.');
+  }
   const scheduleMode = schedule?.type;
   const intervalHours = scheduleMode === SCHEDULE_MODE_INTERVAL
     ? schedule.params.interval / 3_600
     : clampInterval(value.intervalHours) ?? MIN_INTERVAL_HOURS;
-  if (!url || !locators || !selectors || !schedule) {
+  if (!url) {
     return null;
   }
-  const createdAt = asIso(value.createdAt ?? (isReferenceRecord ? value.ts : undefined), nowIso());
+  const createdAt = asIso(value.createdAt ?? (isReferenceRecord ? value.ts : undefined), '1970-01-01T00:00:00.000Z');
   // A Reference backup does not carry its complete run log. `ts_data` is the
   // last persisted data change, so use it as the best durable lower bound for
   // both the comparison/change timestamp and the next scheduler calculation.
@@ -1352,29 +1771,32 @@ function normalizeMonitor(value) {
   const lastViewedAt = asIso(value.lastViewedAt ?? value.lastReadAt ?? (isReferenceRecord ? value.ts_view : undefined), null);
   const status = VALID_STATUSES.has(value.status) ? value.status : 'ok';
   const trackingSource = value.tracking
-    ?? (isReferenceRecord && referenceConfig ? referenceTrackingFromConfig(referenceConfig) : value);
+    ?? (isReferenceRecord && referenceConfig ? referenceTrackingFromConfig(referenceConfig) : legacyTrackingSettings(value));
   const tracking = normalizeTracking(scheduleMode === SCHEDULE_MODE_LIVE
     ? { ...(trackingSource && typeof trackingSource === 'object' ? trackingSource : {}), live: true }
     : trackingSource);
   const normalizedSnapshot = normalizeSnapshot(value.snapshot);
   // A no-match result is never a baseline. Keeping it here would make the
   // next successful render look like an element deletion/reappearance change.
-  const snapshot = normalizedSnapshot && (normalizedSnapshot.exists || tracking.allowEmpty)
+  let snapshot = normalizedSnapshot && !normalizedSnapshot.contentOmitted && (normalizedSnapshot.exists || tracking.allowEmpty)
     ? normalizedSnapshot
     : null;
   const lastChange = value.lastChange && typeof value.lastChange === 'object'
     ? {
+        ...value.lastChange,
         previous: normalizeSnapshot(value.lastChange.previous),
         current: normalizeSnapshot(value.lastChange.current),
+        id: value.lastChange.id || value.lastChange.detectedAt || null,
         detectedAt: asIso(value.lastChange.detectedAt, null)
       }
     : null;
   const lastErrorSnapshot = normalizeSnapshot(value.lastErrorSnapshot);
-  const history = Array.isArray(value.history)
-    ? value.history.slice(0, MAX_CHANGE_HISTORY).map((entry) => {
+  const recoveredHistory = Array.isArray(value.history)
+    ? value.history.map((entry) => {
         const snapshot = normalizeSnapshot(entry?.snapshot ?? entry);
-        return snapshot && (snapshot.exists || tracking.allowEmpty)
+        return snapshot && (snapshot.exists || tracking.allowEmpty || snapshot.contentUnavailable)
           ? {
+              ...(entry?.snapshot ? entry : {}),
               snapshot,
               capturedAt: asIso(entry?.capturedAt ?? snapshot.capturedAt, null),
               kind: entry?.kind === 'baseline' ? 'baseline' : 'change'
@@ -1382,26 +1804,50 @@ function normalizeMonitor(value) {
           : null;
       }).filter(Boolean)
     : [];
+  const history = recoveredHistory.slice(0, MAX_CHANGE_HISTORY);
   const runs = Array.isArray(value.runs)
-    ? value.runs.slice(0, MAX_RUN_HISTORY).map((entry) => ({
+    ? value.runs.map((entry) => ({
+        ...(entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {}),
         at: asIso(entry?.at ?? entry?.checkedAt, null),
         status: VALID_STATUSES.has(entry?.status) ? entry.status : 'error',
         code: cleanShortText(entry?.code, 80) || null,
         message: cleanShortText(entry?.message ?? entry?.error, 300) || null,
         changed: Boolean(entry?.changed),
         matchCount: Number.isInteger(entry?.matchCount) && entry.matchCount >= 0 ? entry.matchCount : null
-      })).filter((entry) => entry.at)
+      })).filter((entry) => entry.at).slice(0, MAX_RUN_HISTORY)
     : [];
 
   const rawId = value.id ?? value.uuid;
-  const id = (typeof rawId === 'string' || typeof rawId === 'number') && String(rawId)
-    ? String(rawId).slice(0, 100)
-    : createId();
-  const revision = typeof value.revision === 'string' && value.revision.length <= 100
-    ? value.revision
-    : createRevision();
+  const stableKey = snapshotFingerprint(JSON.stringify(value));
+  const id = (typeof rawId === 'string' || typeof rawId === 'number') && String(rawId).trim()
+    ? String(rawId).trim().slice(0, 100)
+    : 'recovered-' + stableKey;
+  const revision = typeof value.revision === 'string' && value.revision.trim() && value.revision.length <= 100
+    ? value.revision.trim()
+    : 'recovered-revision-' + stableKey;
+  if (!snapshot) {
+    const candidate = [lastChange?.current, ...recoveredHistory.map((entry) => entry.snapshot)].find((item) => item && !item.contentOmitted && (item.exists || tracking.allowEmpty));
+    if (candidate) { snapshot = candidate; repairIssues.push('최근 정상 변경/이력에서 기준 내용을 회수했습니다.'); }
+  }
+  const supportedVersion = !(Number(value.schemaVersion) > 1);
+  if (!supportedVersion) repairIssues.push('지원하지 않는 레코드 버전이므로 원본을 보존하고 실행을 중지했습니다.');
+  const repairedEnabled = isReferenceRecord ? Number(value.state) === 40
+    : value.enabled === undefined ? true : value.enabled === true || value.enabled === 'true';
+  const safeRepairs = [...(Array.isArray(value.recoveryRepairs) ? value.recoveryRepairs : [])];
+  for (const field of ['createdAt', 'updatedAt', 'lastCheckedAt', 'lastChangedAt', 'lastViewedAt', 'lastReadAt', 'nextCheckAt']) {
+    if (value[field] != null && asIso(value[field], null) === null) safeRepairs.push(`${field}: 유효하지 않은 날짜를 수리했습니다.`);
+  }
+  if (typeof value.enabled === 'string' && ['true', 'false'].includes(value.enabled.trim())) safeRepairs.push('enabled: 문자열 boolean을 수리했습니다.');
+  if (id !== String(rawId ?? '')) safeRepairs.push('id: 누락되거나 공백이 있는 ID를 안정적으로 수리했습니다.');
+  if (!value.revision || revision !== value.revision) safeRepairs.push('revision: 누락되거나 잘못된 값을 안정적으로 수리했습니다.');
+  if (normalizedSnapshot?.existsInferred) safeRepairs.push('snapshot.exists: 남은 본문과 일치 수에서 추론했습니다.');
+  if (normalizedSnapshot?.referenceMarkerIgnored) safeRepairs.push('snapshot: 외부 레코드의 내부 참조 표식을 제거하고 본문을 보존했습니다.');
+  if (Array.isArray(value.snapshot?.items) && value.snapshot.items.some((item) => !item || typeof item !== 'object' || Array.isArray(item) || !(typeof item.text === 'string' || typeof item.html === 'string'))) safeRepairs.push('snapshot.items: 손상 항목을 격리하고 정상 aggregate 본문을 회수했습니다.');
 
   return {
+    ...value,
+    schemaVersion: supportedVersion ? 1 : value.schemaVersion,
+    ...(!supportedVersion ? { unsupportedOriginal: value.unsupportedOriginal || value } : {}),
     id,
     revision,
     name: cleanText(value.name, 120) || cleanText(value.pageTitle ?? value.title, 120) || new URL(url).hostname,
@@ -1415,9 +1861,9 @@ function normalizeMonitor(value) {
     scheduleMode,
     intervalHours,
     ...(scheduleMode === SCHEDULE_MODE_INTERVAL ? { intervalSeconds: schedule.params.interval } : {}),
-    enabled: isReferenceRecord
-      ? Number(value.state) === 40 // Reference C.STATE_READY
-      : value.enabled !== false,
+    enabled: repairedEnabled && !repairIssues.length,
+    recoveryIssues: [...new Set(repairIssues)],
+    recoveryRepairs: [...new Set(safeRepairs)],
     createdAt,
     updatedAt: asIso(value.updatedAt ?? (isReferenceRecord ? value.ts_mod ?? value.ts : undefined), createdAt),
     lastCheckedAt,
@@ -1441,20 +1887,223 @@ function normalizeMonitor(value) {
 function normalizeSettings(value) {
   return {
     ...DEFAULT_SETTINGS,
-    ...(value && typeof value === 'object' ? { soundEnabled: value.soundEnabled !== false } : {})
+    ...(value && typeof value === 'object' ? { ...value, soundEnabled: value.soundEnabled !== false } : {})
   };
 }
 
 async function getState() {
-  const stored = await chrome.storage.local.get([MONITORS_KEY, SETTINGS_KEY]);
-  const rawMonitors = Array.isArray(stored[MONITORS_KEY]) ? stored[MONITORS_KEY] : [];
-  const normalizedMonitors = rawMonitors.map(normalizeMonitor);
-  const monitors = normalizedMonitors.filter(Boolean);
+  const state = await loadMonitorRepository();
+  const stored = await chrome.storage.local.get(SETTINGS_KEY);
+  return { monitors: [...state.monitors.values()], settings: normalizeSettings(await OpenStillRecordStore.getAux('meta', 'settings') ?? stored[SETTINGS_KEY]), recovery: state.diagnostics };
+}
 
-  return {
-    monitors,
-    settings: normalizeSettings(stored[SETTINGS_KEY])
-  };
+let monitorRepository;
+let repositoryLoading;
+const RECORDS_CHANGED_KEY = 'openStill.records.changed.v1';
+function recordsFromContainer(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object') {
+    for (const key of ['monitors', 'records', 'sieves', 'sieve_backup']) if (Array.isArray(raw[key])) return raw[key];
+    if (raw.url || raw.uri) return [raw];
+    return Object.values(raw).filter((value) => value && typeof value === 'object');
+  }
+  return [];
+}
+async function loadMonitorRepository() {
+  if (monitorRepository) return monitorRepository;
+  if (!repositoryLoading) repositoryLoading = (async () => {
+    const stored = await OpenStillRecordStore.load({ lazy: true });
+    const legacy = stored ? null : (await chrome.storage.local.get(MONITORS_KEY))[MONITORS_KEY];
+    const rawRecords = stored ? stored.monitors : recordsFromContainer(legacy);
+    const monitors = new Map(); const recovery = [...(stored?.recovery || [])]; let repaired = 0;
+    for (let index = 0; index < rawRecords.length; index += 1) {
+      const raw = rawRecords[index]; let monitor;
+      try { monitor = stored && raw?.schemaVersion === 1 ? raw : normalizeMonitor(raw); } catch { monitor = null; }
+      if (!monitor) {
+        recovery.push({ id: 'legacy-invalid-' + index, raw, source: 'legacy', recordIndex: index, error: '레코드 해석 실패' });
+        continue;
+      }
+      if (monitors.has(monitor.id)) {
+        const originalId = monitor.id;
+        monitor = { ...monitor, id: originalId.slice(0, 75) + '-recovered-' + index, recoveredFromId: originalId, enabled: false };
+        repaired += 1;
+      }
+      if (monitor.recoveryIssues?.length || monitor.recoveryRepairs?.length) repaired += 1;
+      monitors.set(monitor.id, monitor);
+    }
+    if (!stored && legacy !== undefined) recovery.unshift({ id: 'legacy-container', source: 'migration-original', raw: legacy, capturedAt: nowIso(), error: Array.isArray(legacy) ? null : '배열이 아닌 원본 컨테이너에서 정상 레코드를 회수했습니다.' });
+    const summaries = new Map([...monitors].map(([id, monitor]) => [id, dashboardMonitorSummary(monitor)]));
+    monitorRepository = { monitors, summaries, recovery, generation: stored?.generation || 0, migrated: Boolean(stored), diagnostics: { sourceCount: rawRecords.length, normalCount: monitors.size, repairedCount: repaired, recoveryPendingCount: recovery.filter((entry) => entry.source !== 'migration-original').length } };
+    return monitorRepository;
+  })().catch((error) => { repositoryLoading = null; throw error; });
+  return repositoryLoading;
+}
+const hydratedMonitorIds = new Map();
+const hydrationInProgress = new Map();
+const repairedMonitorShells = new Map();
+const MAX_HYDRATED_MONITOR_BYTES = 32 * 1024 * 1024;
+async function getMonitorMetadataById(id) { return (await loadMonitorRepository()).monitors.get(id) || null; }
+function monitorBodyBytes(monitor) {
+  const snapshots = new Set([monitor.snapshot, monitor.lastErrorSnapshot, monitor.lastChange?.previous, monitor.lastChange?.current, ...(monitor.history || []).map((entry) => entry.snapshot)].filter(Boolean));
+  let bytes = 0;
+  for (const snapshot of snapshots) {
+    bytes += 2 * (String(snapshot.text || '').length + String(snapshot.html || '').length + String(snapshot.data || '').length);
+    for (const item of snapshot.items || []) bytes += 2 * (String(item.text || '').length + String(item.html || '').length);
+  }
+  return bytes;
+}
+async function trimHydratedMonitors(protectedId) {
+  let bytes = [...hydratedMonitorIds.values()].reduce((sum, size) => sum + size, 0);
+  const repository = await loadMonitorRepository();
+  for (const [id, size] of hydratedMonitorIds) {
+    if (bytes <= MAX_HYDRATED_MONITOR_BYTES) break;
+    if (id === protectedId || checksInProgress.has(id) || typeof captureTasks !== 'undefined' && captureTasks.has(id)) continue;
+    const pendingRepair = repository.recovery.some((entry) => entry.source === 'records' && entry.recordId === id);
+    if (pendingRepair && repairedMonitorShells.has(id)) repository.monitors.set(id, repairedMonitorShells.get(id));
+    else {
+      const envelope = await OpenStillRecordStore.getAux('monitors', id);
+      if (envelope?.record) repository.monitors.set(id, envelope.record);
+      repairedMonitorShells.delete(id);
+    }
+    hydratedMonitorIds.delete(id); bytes -= size;
+  }
+}
+// Read each reference independently: an unreadable history entry must not
+// discard a verified current baseline or the rest of the change history.
+async function hydrateMonitorSnapshotsIndependently(record, { versions = null } = {}) {
+  const cache = new Map(); const references = new Map(); const failed = new Map(); const recovery = new Map();
+  const damagedFields = [];
+  async function read(value, field) {
+    if (!value?.$snapshot) return value;
+    const snapshotId = value.$snapshot;
+    let damage = failed.get(snapshotId);
+    if (!damage) {
+      try {
+        const unpacked = await OpenStillRecordStore.unpack({ snapshot: value }, cache);
+        for (const entry of unpacked._storageRecovery || []) recovery.set(entry.id, entry);
+        references.set(unpacked.snapshot, value);
+        return unpacked.snapshot;
+      } catch (error) {
+        // A failed storage read is retryable, not evidence of damaged data.
+        if (!error.snapshotDamage) throw error;
+        damage = { ...error.snapshotDamage, error: responseError(error), fields: [] };
+        failed.set(snapshotId, damage);
+      }
+    }
+    damage.fields.push(field); damagedFields.push(field);
+    return { exists: Boolean(value.exists), contentOmitted: true, contentUnavailable: true,
+      snapshotId, capturedAt: value.capturedAt || null, matchCount: value.matchCount ?? 0 };
+  }
+  const hydrated = { ...record,
+    snapshot: await read(record.snapshot, 'snapshot'),
+    lastErrorSnapshot: await read(record.lastErrorSnapshot, 'lastErrorSnapshot'),
+    lastChange: record.lastChange ? { ...record.lastChange,
+      previous: await read(record.lastChange.previous, 'lastChange.previous'),
+      current: await read(record.lastChange.current, 'lastChange.current') } : null,
+    history: [] };
+  for (let index = 0; index < (record.history || []).length; index += 1) {
+    const entry = record.history[index];
+    hydrated.history.push({ ...entry, snapshot: await read(entry.snapshot, `history.${index}.snapshot`) });
+  }
+  if (damagedFields.includes('snapshot')) {
+    const usable = (value) => value && !value.contentOmitted && !value.contentUnavailable && (value.exists || normalizeTracking(record.tracking).allowEmpty);
+    hydrated.snapshot = [hydrated.lastChange?.current, ...hydrated.history.map((entry) => entry.snapshot), hydrated.lastChange?.previous].find(usable) || null;
+    if (!hydrated.snapshot && typeof versions === 'function') {
+      for (const envelope of await versions()) {
+        if (!envelope?.record || await OpenStillRecordStore.digest(JSON.stringify(envelope.record)) !== envelope.digest) continue;
+        const candidate = await read(envelope.record.snapshot, 'older.snapshot');
+        if (usable(candidate)) { hydrated.snapshot = candidate; break; }
+      }
+    }
+  }
+  for (const damage of failed.values()) recovery.set('damaged-snapshot-' + damage.snapshotId, {
+    id: 'damaged-snapshot-' + damage.snapshotId, source: 'snapshots', recordId: record.id,
+    snapshotId: damage.snapshotId, raw: damage.raw, copyRaw: damage.copyRaw, fields: damage.fields, error: damage.error });
+  if (damagedFields.length) {
+    hydrated.enabled = false; hydrated.status = 'needs-review';
+    hydrated.lastError = '일부 저장 자료가 손상되어 정상 내용만 회수하고 원본을 복구함에 보관했습니다.';
+    hydrated.recoveryIssues = [...new Set([...(record.recoveryIssues || []), '손상된 저장 내용: ' + damagedFields.join(', ')])];
+  }
+  delete hydrated._storageRecovery;
+  const compact = (snapshot) => references.get(snapshot) || snapshot;
+  const shell = { ...hydrated, snapshot: compact(hydrated.snapshot), lastErrorSnapshot: compact(hydrated.lastErrorSnapshot),
+    lastChange: hydrated.lastChange ? { ...hydrated.lastChange, previous: compact(hydrated.lastChange.previous), current: compact(hydrated.lastChange.current) } : null,
+    history: hydrated.history.map((entry) => ({ ...entry, snapshot: compact(entry.snapshot) })) };
+  return { monitor: hydrated, shell, recovery: [...recovery.values()], damagedFields };
+}
+async function getMonitorById(id) {
+  const repository = await loadMonitorRepository();
+  const monitor = repository.monitors.get(id);
+  if (!monitor) return null;
+  const referenced = monitor.snapshot?.$snapshot || monitor.lastErrorSnapshot?.$snapshot || monitor.lastChange?.previous?.$snapshot || monitor.lastChange?.current?.$snapshot || (monitor.history || []).some((entry) => entry.snapshot?.$snapshot);
+  if (!referenced) return monitor;
+  if (hydrationInProgress.has(id)) return hydrationInProgress.get(id);
+  const operation = (async () => {
+    const restored = await hydrateMonitorSnapshotsIndependently(monitor, { versions: () => OpenStillRecordStore.getAux('versions', id).then((values) => values || []) });
+    const hydrated = restored.monitor;
+    if (restored.recovery.length) {
+      const envelope = await OpenStillRecordStore.getAux('monitors', id);
+      const entries = [{ id: 'damaged-' + id + '-' + repository.generation, source: 'records', recordId: id, raw: envelope,
+        error: hydrated.lastError || '스냅샷 복사본에서 정상 내용을 회수했습니다.' }, ...restored.recovery];
+      for (const entry of entries) {
+        const index = repository.recovery.findIndex((existing) => existing.id === entry.id);
+        if (index === -1) repository.recovery.push(entry); else repository.recovery[index] = entry;
+      }
+      repairedMonitorShells.set(id, restored.shell);
+    }
+    repository.monitors.set(id, hydrated); repository.summaries.set(id, dashboardMonitorSummary(hydrated));
+    hydratedMonitorIds.delete(id); hydratedMonitorIds.set(id, monitorBodyBytes(hydrated));
+    await trimHydratedMonitors(id);
+    return hydrated;
+  })().finally(() => hydrationInProgress.delete(id));
+  hydrationInProgress.set(id, operation); return operation;
+}
+async function getMonitorSummaries() { return [...(await loadMonitorRepository()).summaries.values()]; }
+async function getMonitorSummaryPage(message) {
+  const repository = await loadMonitorRepository();
+  return { ok: true, monitors: [...new Set(message.ids || [])].map((id) => repository.summaries.get(id)).filter(Boolean).map((monitor) => ({ ...monitor, runtime: runtimeStatusForMonitor(monitor) })) };
+}
+async function recoveryStatus() {
+  const state = await loadMonitorRepository();
+  const records = [...state.recovery];
+  for (const key of await OpenStillRecordStore.keysAux('recovery')) {
+    const record = await OpenStillRecordStore.getAux('recovery', key);
+    if (record) { const { raw, ...metadata } = record; records.push(metadata); }
+  }
+  const unique = new Map(records.map((record) => [record.id, record]));
+  const sessions = []; const files = [];
+  for (const key of await OpenStillRecordStore.keysAux('staging')) {
+    if (/^(import|export):[^:]+$/.test(key)) {
+      const entry = await OpenStillRecordStore.getAux('staging', key);
+      if (entry) sessions.push({ id: entry.id, kind: entry.kind, phase: entry.phase, processed: entry.sourceCount,
+        pending: entry.preparedCount || entry.preparedIds?.length || 0, progress: entry.progress });
+    } else if (key.startsWith('import-file:')) {
+      const entry = await OpenStillRecordStore.getAux('staging', key);
+      if (entry) files.push({ id: key, sessionId: entry.sessionId || key.split(':')[1], fileIndex: entry.fileIndex ?? Number(key.split(':')[2]), name: entry.source, size: entry.raw?.size, phase: entry.phase });
+    }
+  }
+  return { ok: true, ...state.diagnostics, runtime: await getRuntimeStatus(), records: [...unique.values()].map(({ raw, ...record }) => record),
+    sessions: sessions.map((session) => ({ ...session, files: files.filter((file) => file.sessionId === session.id) })) };
+}
+async function restoreRecoveryRecord(message) {
+  const recovery = await OpenStillRecordStore.getAux('recovery', message.id);
+  if (!recovery) return { ok: false, error: '보관된 원본을 찾지 못했습니다.' };
+  const rawRecords = recovery.raw?.record ? [recovery.raw] : recordsFromContainer(recovery.raw);
+  const monitors = [];
+  for (const raw of rawRecords) {
+    const envelope = raw?.record && typeof raw.record === 'object' ? raw : null;
+    const record = envelope?.record || raw;
+    if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
+    const restored = await hydrateMonitorSnapshotsIndependently(record);
+    const monitor = restored.monitor;
+    if (envelope?.digest && await OpenStillRecordStore.digest(JSON.stringify(envelope.record)) !== envelope.digest) {
+      monitor.enabled = false; monitor.status = 'needs-review';
+      monitor.recoveryIssues = [...new Set([...(monitor.recoveryIssues || []), '원본 레코드 지문이 일치하지 않아 실행을 정지한 상태로 회수했습니다.'])];
+    }
+    monitors.push(monitor);
+  }
+  if (!monitors.length) return { ok: false, error: '이 원본에는 회수할 수 있는 추적 레코드가 없습니다.' };
+  return importMonitors({ monitors, mode: 'merge' });
 }
 
 function dashboardSnapshotPreview(snapshot) {
@@ -1517,7 +2166,7 @@ async function startDashboardLoad() {
   const state = await getState();
   const id = createId();
   dashboardLoadSessions.set(id, {
-    monitors: state.monitors,
+    monitors: await getMonitorSummaries(),
     settings: state.settings,
     expiresAt: Date.now() + DASHBOARD_SESSION_TTL_MS
   });
@@ -1536,7 +2185,7 @@ function getDashboardLoadPage(message) {
   let responseBytes = 256;
   const end = Math.min(session.monitors.length, offset + pageSize);
   for (let index = offset; index < end; index += 1) {
-    const summary = dashboardMonitorSummary(session.monitors[index]);
+    const summary = { ...session.monitors[index], runtime: runtimeStatusForMonitor(session.monitors[index]) };
     const summaryBytes = utf8ByteLength(JSON.stringify(summary)) + (monitors.length ? 1 : 0);
     if (monitors.length && responseBytes + summaryBytes > MAX_DASHBOARD_LOAD_PAGE_BYTES) break;
     monitors.push(summary);
@@ -1557,13 +2206,26 @@ function finishDashboardLoad(message) {
 }
 
 async function getMonitorDetail(id) {
-  const monitor = (await getMonitors()).find((item) => item.id === id);
+  const monitor = await getMonitorById(id);
   if (!monitor) return { ok: false, error: '모니터를 찾을 수 없습니다.' };
+  const serialized = JSON.stringify(monitor);
+  if (utf8ByteLength(serialized) > 8 * 1024 * 1024) {
+    const detailToken = createId();
+    await OpenStillRecordStore.putAux('staging', 'detail:' + detailToken, { kind: 'detail', id, json: serialized, expiresAt: Date.now() + DASHBOARD_SESSION_TTL_MS });
+    return { ok: true, fragmented: true, id, revision: monitor.revision, detailToken, fragmentCount: Math.ceil(serialized.length / EXPORT_RECORD_FRAGMENT_CHARS) };
+  }
   return { ok: true, monitor };
+}
+async function getMonitorDetailFragment(message) {
+  const staged = await OpenStillRecordStore.getAux('staging', 'detail:' + message.detailToken);
+  if (!staged || staged.id !== message.id || staged.expiresAt < Date.now()) return { ok: false, reason: 'expired', error: '상세 자료를 다시 불러와 주세요.' };
+  const serialized = staged.json; const index = Number(message.fragmentIndex);
+  if (!Number.isSafeInteger(index) || index < 0 || index * EXPORT_RECORD_FRAGMENT_CHARS >= serialized.length) return { ok: false, error: '조각 번호가 올바르지 않습니다.' };
+  return { ok: true, payload: serialized.slice(index * EXPORT_RECORD_FRAGMENT_CHARS, (index + 1) * EXPORT_RECORD_FRAGMENT_CHARS) };
 }
 
 async function getPopupState() {
-  const monitors = await getMonitors();
+  const monitors = await getMonitorSummaries();
   const needsAttention = (monitor) => (monitor.enabled || monitor.status === 'permission-needed')
     && ['needs-review', 'error', 'permission-needed'].includes(monitor.status);
   const changed = monitors.filter((monitor) => monitor.unread);
@@ -1579,6 +2241,7 @@ async function getPopupState() {
       name: monitor.name,
       url: monitor.url,
       status: monitor.status,
+      enabled: monitor.enabled,
       unread: monitor.unread,
       lastChangedAt: monitor.lastChangedAt
     }));
@@ -1591,28 +2254,17 @@ async function getPopupState() {
   };
 }
 
-async function startExportSession() {
-  pruneTransientSessions();
-  const monitors = await readMonitorsForExport();
-  const id = createId();
-  exportSessions.set(id, {
-    monitors,
-    serializedRecords: new Map(),
-    expiresAt: Date.now() + DASHBOARD_SESSION_TTL_MS
-  });
-  return { ok: true, id, total: monitors.length };
-}
-
 function exportHistoryEntryForTransfer(entry, index) {
   if (index === 0 || !entry || typeof entry !== 'object') return entry;
   return {
     kind: entry.kind === 'baseline' ? 'baseline' : 'change',
     capturedAt: entry.capturedAt ?? entry.snapshot?.capturedAt ?? null,
-    snapshot: { exists: entry.snapshot?.exists !== false }
+    snapshot: { exists: entry.snapshot?.exists !== false, contentOmitted: true }
   };
 }
 
 function exportMonitorRecordForTransfer(monitor) {
+  if (Number(monitor?.schemaVersion) > 1) return monitor.unsupportedOriginal || monitor;
   if (!monitor || typeof monitor !== 'object' || !Array.isArray(monitor.history)) return monitor;
   return {
     ...monitor,
@@ -1624,85 +2276,60 @@ function serializedExportRecord(monitor) {
   return JSON.stringify(exportMonitorRecordForTransfer(monitor));
 }
 
-function exportFragmentRecordForSession(session, index) {
-  if (session.serializedRecords.has(index)) return session.serializedRecords.get(index);
-  const record = serializedExportRecord(session.monitors[index]);
-  session.serializedRecords.set(index, record);
-  return record;
-}
-
-function getExportSessionAndIndex(message) {
-  pruneTransientSessions();
-  const session = exportSessions.get(message?.id);
-  const index = Math.floor(Number(message?.index));
-  if (!session) return { error: { ok: false, reason: 'expired', error: '내보내기 데이터를 다시 준비해 주세요.' } };
-  if (!Number.isInteger(index) || index < 0 || index >= session.monitors.length) {
-    return { error: { ok: false, error: '내보낼 추적을 찾을 수 없습니다.' } };
-  }
-  session.expiresAt = Date.now() + DASHBOARD_SESSION_TTL_MS;
-  return { session, index };
-}
-
-function getExportMonitor(message) {
-  const target = getExportSessionAndIndex(message);
-  if (target.error) return target.error;
-  const record = serializedExportRecord(target.session.monitors[target.index]);
-  if (utf8ByteLength(record) < MAX_EXPORT_DIRECT_RECORD_BYTES) {
-    return { ok: true, record };
-  }
-  target.session.serializedRecords.set(target.index, record);
-  return {
-    ok: true,
-    fragmented: true,
-    recordId: `${message.id}:${target.index}`,
-    fragmentCount: Math.ceil(record.length / EXPORT_RECORD_FRAGMENT_CHARS)
-  };
-}
-
-function getExportMonitorFragment(message) {
-  const target = getExportSessionAndIndex(message);
-  if (target.error) return target.error;
-  const fragmentIndex = Math.floor(Number(message?.fragmentIndex));
-  const record = exportFragmentRecordForSession(target.session, target.index);
-  const fragmentCount = Math.ceil(record.length / EXPORT_RECORD_FRAGMENT_CHARS);
-  if (!Number.isInteger(fragmentIndex) || fragmentIndex < 0 || fragmentIndex >= fragmentCount) {
-    return { ok: false, error: '내보낼 추적 조각을 찾을 수 없습니다.' };
-  }
-  const start = fragmentIndex * EXPORT_RECORD_FRAGMENT_CHARS;
-  const response = {
-    ok: true,
-    payload: record.slice(start, start + EXPORT_RECORD_FRAGMENT_CHARS),
-    fragmentIndex,
-    fragmentCount
-  };
-  if (fragmentIndex === fragmentCount - 1) target.session.serializedRecords.delete(target.index);
-  return response;
-}
-
-function finishExportSession(message) {
-  const session = exportSessions.get(message?.id);
-  if (session?.serializedRecords) session.serializedRecords.clear();
-  exportSessions.delete(message?.id);
-  return { ok: true };
-}
-
-function touchExportSession(message) {
-  pruneTransientSessions();
-  const session = exportSessions.get(message?.id);
-  if (!session) return { ok: false, reason: 'expired', error: '내보내기 작업이 만료되었습니다. 다시 시도해 주세요.' };
-  session.expiresAt = Date.now() + DASHBOARD_SESSION_TTL_MS;
-  return { ok: true };
-}
-
 async function getMonitors() {
-  return (await getState()).monitors;
+  return [...(await loadMonitorRepository()).monitors.values()];
 }
 
-function mutateMonitors(mutator) {
+function mutateMonitors(mutator, options = {}) {
   const operation = storageQueue.catch(() => undefined).then(async () => {
-    const state = await getState();
-    const result = await mutator(state.monitors);
-    await chrome.storage.local.set({ [MONITORS_KEY]: state.monitors });
+    const repository = await loadMonitorRepository();
+    const proxies = new WeakMap(); const originals = new WeakMap(); const touched = new Set();
+    const monitors = [...repository.monitors.values()].map((monitor) => {
+      const copy = { ...monitor };
+      const proxy = new Proxy(copy, {
+        set(target, key, value) { if (target[key] !== value) touched.add(monitor.id); target[key] = value; return true; },
+        deleteProperty(target, key) { touched.add(monitor.id); delete target[key]; return true; }
+      });
+      proxies.set(proxy, copy); originals.set(proxy, monitor); return proxy;
+    });
+    const result = await mutator(monitors);
+    if (result?.ok === false) return result;
+    const next = new Map(); const changed = [];
+    const recoveredIds = new Set(repository.recovery.filter((entry) => entry.source === 'records').map((entry) => entry.recordId));
+    for (const value of monitors) {
+      if (!value || typeof value.id !== 'string' || !value.id.trim() || next.has(value.id)) throw new Error('저장할 추적 ID가 중복되거나 비어 있습니다.');
+      const original = originals.get(value);
+      const monitor = original && !touched.has(original.id) ? original : { ...(proxies.get(value) || value), schemaVersion: value.schemaVersion ?? 1 };
+      if (original && Number(original.schemaVersion) > 1 && touched.has(original.id)) throw new Error('지원하지 않는 버전의 원본은 수정할 수 없습니다.');
+      const needsWrite = !repository.migrated || monitor !== repository.monitors.get(monitor.id) || recoveredIds.has(monitor.id);
+      const storedMonitor = needsWrite ? await OpenStillRecordStore.stageMonitor(monitor, { allowReferences: true }) : monitor;
+      next.set(monitor.id, storedMonitor);
+      if (needsWrite) changed.push(storedMonitor);
+    }
+    const deletedIds = [...new Set([...repository.monitors.keys()].filter((id) => !next.has(id)).concat(repository.recovery.filter((entry) => entry.source === 'records' && !next.has(entry.recordId)).map((entry) => entry.recordId)))];
+    if (!changed.length && !deletedIds.length && repository.migrated && !repository.recovery.length && options.settings === undefined && !options.operationId) return result;
+    const generation = repository.generation + 1;
+    const mutationOperation = options.operationId ? { id: options.operationId, type: options.type } : options.operation === false ? null : typeof activeMutationOperation !== 'undefined' && !activeMutationOperation?.committed ? activeMutationOperation : null;
+    await OpenStillRecordStore.commit({ changed, deletedIds, recovery: repository.recovery, generation,
+      deletedMonitors: deletedIds.map((id) => repository.monitors.get(id)).filter(Boolean),
+      settings: options.settings,
+      operation: mutationOperation ? { id: mutationOperation.id, type: mutationOperation.type, committed: true, result: result == null ? { ok: true } : compactMutationResult(result), committedAt: nowIso() } : null });
+    repository.monitors = next;
+    for (const monitor of changed) {
+      repository.summaries.set(monitor.id, dashboardMonitorSummary(monitor));
+      const envelope = await OpenStillRecordStore.getAux('monitors', monitor.id);
+      if (envelope?.record) repository.monitors.set(monitor.id, envelope.record);
+      hydratedMonitorIds.delete(monitor.id);
+      repairedMonitorShells.delete(monitor.id);
+    }
+    for (const id of deletedIds) { repository.summaries.delete(id); repairedMonitorShells.delete(id); }
+    repository.generation = generation; repository.migrated = true; repository.recovery = [];
+    repository.diagnostics.normalCount = next.size;
+    repository.diagnostics.repairedCount = [...next.values()].filter((monitor) => monitor.recoveryIssues?.length || monitor.recoveryRepairs?.length).length;
+    if (mutationOperation) { mutationOperation.committed = true; mutationOperation.result = result; }
+    if (options.operationId && typeof activeMutationOperation !== 'undefined' && activeMutationOperation) { activeMutationOperation.committed = true; activeMutationOperation.result = result; }
+    // The transaction is committed even if the lightweight UI notification fails.
+    await chrome.storage.local.set({ [RECORDS_CHANGED_KEY]: { generation, ids: changed.map((monitor) => monitor.id), deletedIds } }).catch(() => undefined);
     return result;
   });
 
@@ -1711,31 +2338,17 @@ function mutateMonitors(mutator) {
 }
 
 function migrateLegacyScheduleModes() {
-  const operation = storageQueue.catch(() => undefined).then(async () => {
-    const stored = await chrome.storage.local.get(MONITORS_KEY);
-    const rawMonitors = stored[MONITORS_KEY];
-    if (!Array.isArray(rawMonitors) || !rawMonitors.some((monitor) => (
-      monitor && typeof monitor === 'object' && !Object.hasOwn(monitor, 'scheduleMode')
-    ))) {
-      return false;
-    }
-
-    // Older releases only had intervalHours, which meant automatic scheduling.
-    // Persist that explicit meaning once so the new default applies only to new
-    // trackers rather than silently stopping existing schedules.
-    const monitors = rawMonitors.map(normalizeMonitor).filter(Boolean);
-    await chrome.storage.local.set({ [MONITORS_KEY]: monitors });
-    return true;
-  });
-
-  storageQueue = operation.catch(() => undefined);
-  return operation;
+  return persistNormalizedMonitorRepairs();
 }
 
 async function updateSettings(settingsPatch) {
   const state = await getState();
   const settings = normalizeSettings({ ...state.settings, ...settingsPatch });
-  await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+  const currentOperation = activeMutationOperation?.type === 'save-settings' ? activeMutationOperation : null;
+  const result = { ok: true, committed: true, settings };
+  await OpenStillRecordStore.commitAux([['meta', 'settings', settings], ...(currentOperation ? [['operations', currentOperation.id, { id: currentOperation.id, type: currentOperation.type, committed: true, result }]] : [])]);
+  if (currentOperation) { currentOperation.committed = true; currentOperation.result = result; }
+  await chrome.storage.local.set({ [SETTINGS_KEY]: settings }).catch(() => undefined);
   return settings;
 }
 
@@ -1838,8 +2451,8 @@ async function ensureOffscreenDocument() {
   if (!offscreenCreation) {
     offscreenCreation = chrome.offscreen.createDocument({
       url: 'offscreen.html',
-      reasons: ['DOM_PARSER', 'AUDIO_PLAYBACK'],
-      justification: 'OpenStill validates CSS selectors and plays a local alert tone.'
+      reasons: ['DOM_PARSER', 'AUDIO_PLAYBACK', 'WORKERS'],
+      justification: 'OpenStill validates selectors, runs interruptible text filters, and plays a local alert tone.'
     }).catch(async (error) => {
       const contextsAfterFailure = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
       if (!contextsAfterFailure.some((context) => context.documentUrl === offscreenUrl)) {
@@ -2089,18 +2702,14 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       op,
       fields: fields.length || hasExplicitFields ? fields : [{ type: 'text' }],
       fieldsSpecified: hasExplicitFields,
+      identityAttribute: typeof raw.identityAttribute === 'string' ? raw.identityAttribute : null,
       legacy: typeof value === 'string'
     };
   };
 
   const locators = (Array.isArray(rawLocators) ? rawLocators : []).map(locatorOf).filter(Boolean);
   const includeLocators = locators.filter((locator) => locator.op === 'include');
-  // The reference content-world locator keeps this flag after the first
-  // successfully evaluated XCSS expression. Subsequent CSS/XPath captures in
-  // that same frame keep declarative shadow serialization as well; resetting
-  // it per call makes data-mode snapshots depend on monitor order.
-  const xcssSerializerStateKey = '__openStillCaptureUsesExtendedCss';
-  let usesExtendedCss = globalThis[xcssSerializerStateKey] === true;
+  const usesExtendedCss = locators.some((locator) => locator.type === 'xcss');
   const unique = (items) => [...new Set(items)];
   const shadowFor = (element) => {
     if (element?.nodeType !== Node.ELEMENT_NODE) return null;
@@ -2250,18 +2859,14 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const matches = [];
     for (let node = iterator.iterateNext(); node; node = iterator.iterateNext()) {
       if (node.nodeType === Node.ATTRIBUTE_NODE && node.ownerElement) {
-        // Attribute nodes are only promoted to their owner for an XPath
-        // *exclude* below.  An XPath include operates on the raw node in the
-        // reference filter and therefore cannot turn `//@href` into a whole
-        // element include.
         matches.push({ element: node.ownerElement, attributeName: node.name, attributeNode: true });
       } else if (node.nodeType === Node.ELEMENT_NODE) {
         matches.push({ element: node });
       } else {
-        // Preserve the locator's raw match count for text/comment/document
-        // XPath results, while correctly leaving them without an element
-        // marker. jQuery marker operations in the reference are element-only.
-        matches.push({ element: null, nonElementNode: true });
+        if (locator.op === 'include') {
+          throw new Error('XPath include must select elements or attributes (for example //a or //a/@href); text(), comment(), and document results are unsupported.');
+        }
+        matches.push({ element: null, selectedNode: node, nonElementNode: true });
       }
     }
     const seen = new Map();
@@ -2295,11 +2900,15 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : position & Node.DOCUMENT_POSITION_PRECEDING ? 1 : 0;
   };
 
+  const originalNodes = new WeakMap();
   const fieldValues = (element, fields) => fields.filter((field) => field.type !== 'text').map((field) => {
     try {
       return field.type === 'attribute'
         ? element.hasAttribute(field.name) ? element.getAttribute(field.name) || '' : 'undefined'
-        : element[field.name] || '';
+        : (() => {
+          const value = (originalNodes.get(element) || element)[field.name];
+          return value == null ? '' : ['string', 'number', 'boolean', 'bigint'].includes(typeof value) ? value : '';
+        })();
     } catch { return ''; }
   }).map(String);
 
@@ -2377,8 +2986,11 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       if (node.nodeType === Node.COMMENT_NODE) return targetDocument.createComment(node.nodeValue || '');
       if (node.nodeType !== Node.ELEMENT_NODE) return null;
       const clone = targetDocument.importNode(node, false);
+      originalNodes.set(clone, node);
       if (insideShadow) clone.__openStillCaptureShadowContext = true;
-      [...node.childNodes].forEach((child) => { const next = copy(child, insideShadow); if (next) clone.append(next); });
+      const sourceChildren = node.localName === 'template' ? node.content.childNodes : node.childNodes;
+      const targetChildren = clone.localName === 'template' ? clone.content : clone;
+      [...sourceChildren].forEach((child) => { const next = copy(child, insideShadow); if (next) targetChildren.append(next); });
       // The clone must retain a real, open shadow tree. CSS/XPath never cross
       // it, while XCSS can query it exactly as it would the source's closed or
       // open tree. Serialization decides separately whether to emit it.
@@ -2396,6 +3008,16 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const rootCopy = copy(document.documentElement);
     if (!rootCopy) return null;
     targetDocument.replaceChild(rootCopy, targetDocument.documentElement);
+    // Resource context belongs only to the detached copy. Reading the page's
+    // baseURI does not insert nodes or trigger its MutationObservers.
+    if (!/^(?:data|about):/i.test(String(document.baseURI || ''))) {
+      let base = targetDocument.querySelector('base');
+      if (!base) {
+        base = targetDocument.createElement('base');
+        targetDocument.querySelector('head')?.prepend(base);
+      }
+      base?.setAttribute('href', String(document.baseURI || ''));
+    }
     return { targetDocument, rootCopy };
   };
 
@@ -2499,7 +3121,7 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       // The declarative-shadow serializer has an element/text-only contract.
       // Comments remain available to CSS/XPath filtering above, but never
       // appear in an XCSS HTML snapshot.
-      if (node.nodeType === Node.COMMENT_NODE) return '';
+      if (node.nodeType === Node.COMMENT_NODE) return keepComments ? `<!--${node.nodeValue || ''}-->` : '';
       if (node.nodeType !== Node.ELEMENT_NODE) {
         const holder = targetDocument.createElement('div');
         holder.append(node.cloneNode(true));
@@ -2525,28 +3147,8 @@ async function captureReferenceRenderedDocumentCollection(...args) {
         + lightChildren.map(serializeWithShadow).join('')
         + shell.slice(closingStart);
     };
-    return {
-      html: (usesExtendedCss ? serializeWithShadow(rootCopy) : rootCopy.outerHTML).trim().replace(/\s*\n+(\s*\n+)*/g, '\n'),
-      text
-    };
-  };
-
-  const ensureCaptureBase = () => {
-    if (/^(?:data|about):/i.test(String(document.baseURI || location?.protocol || ''))) return null;
-    let base = document.getElementsByTagName('base')[0] || null;
-    if (!base) {
-      base = document.createElement('base');
-      const head = document.getElementsByTagName('head')[0];
-      if (head) head.prepend(base);
-    }
-    try {
-      const href = String(document.baseURI || '');
-      // Rewriting an identical attribute still emits a MutationObserver
-      // record in Chromium. Capture may run under a live observer, so keep
-      // the reference base normalization idempotent after its first write.
-      if (base.getAttribute('href') !== href) base.setAttribute('href', href);
-    } catch { /* preserve the page's original base on malformed URLs */ }
-    return base;
+    const serialize = (node) => (usesExtendedCss ? serializeWithShadow(node) : node.outerHTML).trim().replace(/\s*\n+(\s*\n+)*/g, '\n');
+    return { html: serialize(rootCopy), text, itemHtml: serialize };
   };
 
   const makeErrorEvidence = () => {
@@ -2607,10 +3209,6 @@ async function captureReferenceRenderedDocumentCollection(...args) {
   };
 
   const capture = () => {
-    // The base is part of the source document before selectors run, so a
-    // locator targeting `base` observes the same document shape as the saved
-    // filtered snapshot.
-    ensureCaptureBase();
     const captureClone = cloneCaptureDocument();
     if (!captureClone) return { roots: [], matchCount: 0, items: [], text: '', html: '', selectorMatches: [] };
     const { targetDocument } = captureClone;
@@ -2619,6 +3217,17 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const automaticallyIncluded = new Set();
     const excludedAttributes = new Map();
     const fields = new Map();
+    const sourcesByElement = new Map();
+    const mergeFields = (element, nextFields) => {
+      const previous = fields.get(element)?.fields || [];
+      const keys = new Set(previous.map((field) => `${field.type}:${field.name || ''}`));
+      const combined = [...previous];
+      for (const field of nextFields) {
+        const key = `${field.type}:${field.name || ''}`;
+        if (!keys.has(key)) { keys.add(key); combined.push({ ...field }); }
+      }
+      fields.set(element, { fields: combined });
+    };
     const structuralContext = new Set();
     const markLightStructuralContext = (element) => {
       // CSS/XPath `markInclude()` marks every light-DOM parent with
@@ -2663,39 +3272,31 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const selectorMatches = [];
     for (const locator of locators) {
       const matches = select(locator, targetDocument);
-      if (locator.type === 'xcss') {
-        usesExtendedCss = true;
-        globalThis[xcssSerializerStateKey] = true;
-      }
       selectorMatches.push(locator.legacy
         ? { selector: locator.expr, matchCount: matches.length }
         : { type: locator.type, expr: locator.expr, op: locator.op, matchCount: matches.length });
-      matches.forEach(({ element, attributeName }) => {
+      matches.forEach(({ element, attributeName, selectedNode }) => {
+        if (selectedNode && locator.op === 'exclude') selectedNode.remove();
         if (!element) return;
         if (attributeName) {
           if (locator.op === 'exclude') {
             const names = excludedAttributes.get(element) || new Set();
             names.add(attributeName);
             excludedAttributes.set(element, names);
+            return;
           }
-          // XPath attribute includes do not make the owner an include. This
-          // distinction is what lets XPath attribute exclusions work without
-          // giving the attribute form a different CSS/XCSS selection reach.
-          return;
+          mergeFields(element, [{ type: 'attribute', name: attributeName }]);
         }
         (locator.op === 'include' ? included : excluded).add(element);
         if (locator.op === 'include') {
+          const sources = sourcesByElement.get(element) || [];
+          sources.push(locator);
+          sourcesByElement.set(element, sources);
           if (locator.type === 'xcss') markXcssStructuralContext(element);
           else markLightStructuralContext(element);
         }
-        if (locator.op === 'include' && locator.fieldsSpecified) {
-          // An explicit field list is a per-node mode override. A later
-          // omitted list deliberately leaves a preceding explicit [] or text
-          // mode intact instead of flattening it back to default text.
-          const copiedFields = locator.fields.map((field) => ({ ...field }));
-          fields.set(element, {
-            fields: copiedFields
-          });
+        if (locator.op === 'include' && !attributeName) {
+          mergeFields(element, locator.fields);
         }
       });
     }
@@ -2733,29 +3334,59 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       automaticallyIncluded.add(element);
       markLightStructuralContext(element);
     });
-    const rootCandidates = [...included, ...automaticallyIncluded];
-    const roots = rootCandidates
-      .filter((element) => !rootCandidates.some((candidate) => candidate !== element && containsAcrossShadow(candidate, element)))
-      .sort(compare);
+    const rootsFor = (candidates) => {
+      const membership = new Set(candidates);
+      return [...membership].filter((element) => {
+        for (let parent = parentAcrossShadow(element); parent; parent = parentAcrossShadow(parent)) {
+          if (membership.has(parent)) return false;
+        }
+        return true;
+      }).sort(compare);
+    };
+    const roots = rootsFor([...included, ...automaticallyIncluded]);
     // Automatic base/style/script retention is structural context, not a user
     // selector match. Keep its markup without turning a zero-match locator
     // into a false successful match count.
-    const matchedRoots = [...included]
-      .filter((element) => ![...included].some((candidate) => candidate !== element && containsAcrossShadow(candidate, element)))
-      .sort(compare);
+    const matchedRoots = rootsFor(included);
     // Text is produced by one traversal of the filtered document. Joining
     // per-root strings invents blank boundaries that do not exist in the DOM
     // and turns harmless wrapper/list changes into alerts.
     const filtered = makeHtml(captureClone, included, excluded, automaticallyIncluded, excludedAttributes, fields, structuralContext);
     const text = filtered.text;
-    const items = text ? [{ text }] : [];
+    const identityFor = (element, sources) => {
+      const custom = sources.map((locator) => locator.identityAttribute).filter(Boolean);
+      for (const attribute of [...custom, 'data-post-id', 'data-article-id']) {
+        const value = element.getAttribute(attribute);
+        if (value) return { kind: 'attribute', attribute, value, key: `attr:${attribute}:${value}` };
+      }
+      const bookmark = element.matches('a[rel~="bookmark"]') ? element : element.querySelector('a[rel~="bookmark"]');
+      const anchors = element.matches('a[href]') ? [element] : [...element.querySelectorAll('a[href]')];
+      const urls = [...new Set(anchors.map((anchor) => anchor.getAttribute('href')).filter(Boolean))];
+      const value = bookmark?.getAttribute('href') || (urls.length === 1 ? urls[0] : null);
+      if (value) return { kind: 'permalink', value, key: `url:${value}` };
+      for (const attribute of ['data-id', 'id']) {
+        const attributeValue = element.getAttribute(attribute);
+        if (attributeValue) return { kind: 'attribute', attribute, value: attributeValue, key: `attr:${attribute}:${attributeValue}` };
+      }
+      return null;
+    };
+    const items = matchedRoots.filter((element) => element.parentNode || element === targetDocument.documentElement)
+      .map((element, originalIndex) => {
+        const sources = sourcesByElement.get(element) || [];
+        const identity = identityFor(element, sources);
+        return {
+          text: writeText(element), html: filtered.itemHtml(element),
+          ...(identity ? { identity } : {}), originalIndex,
+          locator: sources[0] ? { type: sources[0].type, expr: sources[0].expr, op: sources[0].op } : null,
+          locators: sources.map((locator) => ({ type: locator.type, expr: locator.expr, op: locator.op, fields: locator.fields })),
+          frame: { url: String(location.href || document.URL || '') }
+        };
+      });
     const html = filtered.html;
     return { roots, matchCount: matchedRoots.length, items, text, html, selectorMatches };
   };
 
-  // Reference live.js disconnects its observer before calling the filter. The
-  // clone pipeline can normalize the source <base>, so do the same around the
-  // complete live capture transaction to avoid feeding that write back in.
+  // Pause only this observer during extraction; capture never writes page DOM.
   liveObserverRecord?.pause?.();
   try {
     if (!includeLocators.length) return { ok: true, exists: false, matchCount: 0, items: [], html: '', data: '', selectorMatches: [] };
@@ -2765,11 +3396,7 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const configuredDelay = Math.max(0, Math.min(60_000, Number(captureOptions?.delayMilliseconds) || 0));
     if (configuredDelay) await new Promise((resolve) => setTimeout(resolve, configuredDelay));
     let result = capture();
-    // The reference frame filter appends HTML before deciding whether an
-    // empty-text retry is needed. Preserve every attempt in data mode rather
-    // than silently replacing an earlier structural snapshot with the final
-    // retry's markup.
-    let capturedData = result.html;
+    const attempts = [{ matchCount: result.matchCount, textLength: result.text.length }];
     // HTML/data comparison still needs a nonempty selected text result to
     // distinguish a real page from a broken selection, but the reference
     // runner limits that mode to two delayed retries rather than waiting the
@@ -2777,10 +3404,10 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     const retryLimit = captureOptions?.dataAttr === 'data'
       ? Math.min(1, Math.max(0, Number(emptyRetryCount) || 0))
       : Math.max(0, Number(emptyRetryCount) || 0);
-    for (let attempt = 0; !captureOptions?.live && !result.text && attempt <= retryLimit; attempt += 1) {
+    for (let attempt = 0; !captureOptions?.live && !result.text && attempt < retryLimit; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(emptyRetryDelayMilliseconds) || 0)));
       result = capture();
-      capturedData += result.html;
+      attempts.push({ matchCount: result.matchCount, textLength: result.text.length });
     }
     const exists = captureOptions?.allowEmpty ? result.matchCount > 0 : Boolean(result.text);
     // Empty selection evidence must show the whole rendered page, not merely
@@ -2798,9 +3425,15 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       items: result.items,
       text: result.text,
       html: result.html,
-      data: capturedData,
+      data: result.html,
       errorHtml,
-      selectorMatches: result.selectorMatches
+      selectorMatches: result.selectorMatches,
+      captureAttempts: attempts,
+      captureQuality: {
+        status: includeLocators.length > 1 && result.selectorMatches.some((match) => match.op !== 'exclude' && match.matchCount === 0)
+          ? 'partial' : 'complete',
+        missingLocators: result.selectorMatches.filter((match) => match.op !== 'exclude' && match.matchCount === 0)
+      }
     };
   } catch (error) {
     return { ok: false, error: 'Selector capture could not be evaluated: ' + error.message };
@@ -3092,17 +3725,17 @@ async function inspectLegacyRenderedDocumentCollection(selectors, minimumWaitMil
 function captureSanitizedErrorEvidenceDocument() {
   try {
     const baseURI = String(document.baseURI || '');
+    const clonedDocument = document.cloneNode(true);
     if (!/^(?:data:|about:)/.test(baseURI)) {
-      let base = document.getElementsByTagName('base')[0] || null;
+      let base = clonedDocument.getElementsByTagName('base')[0] || null;
       if (!base) {
-        base = document.createElement('base');
-        const head = document.getElementsByTagName('head')[0];
+        base = clonedDocument.createElement('base');
+        const head = clonedDocument.getElementsByTagName('head')[0];
         if (head) head.prepend(base);
       }
       base?.setAttribute('href', baseURI);
     }
 
-    const clonedDocument = document.cloneNode(true);
     const root = clonedDocument.documentElement;
     if (!root) return { ok: true, html: '' };
     const selfAndDescendants = (selector) => {
@@ -3144,12 +3777,16 @@ function captureSanitizedErrorEvidenceDocument() {
   }
 }
 
-async function captureRenderedSnapshot(monitor, existingTabId = null, { live = false, frameId: liveFrameId = null } = {}) {
+async function captureRenderedSnapshot(monitor, existingTabId = null, { live = false, frameId: liveFrameId = null, job = null } = {}) {
   // Pinned tabs are Chrome's favicon-only, leftmost tab UI. They make a
   // scheduled check visible without taking focus or leaving a titled tab in
   // the strip; a live watcher passes its extension-owned tab, which this
   // function deliberately leaves open after reusing the same capture path.
   const ownsTab = !Number.isInteger(existingTabId);
+  const assertActive = () => {
+    if (job?.cancelled || job?.signal?.aborted || job?.isCancelled?.()) throw new Error('캡처 작업이 취소됐습니다.');
+  };
+  assertActive();
   const tab = ownsTab ? await chrome.tabs.create({
     url: monitor.url,
     active: false,
@@ -3159,29 +3796,28 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
   if (!Number.isInteger(tab?.id)) {
     throw new Error('Could not create a background tab for checking.');
   }
-
   let ready;
   try {
+    if (ownsTab) {
+      if (job) job.ownedTabId = tab.id;
+      await job?.onTabCreated?.(tab.id);
+    }
     if (ownsTab) {
       ready = waitForRenderedTab(tab.id);
       await ready.promise;
     }
-    const requestedLiveFrame = live && Number.isInteger(liveFrameId) ? liveFrameId : null;
+    assertActive();
     let frames = [{ frameId: 0, parentFrameId: -1 }];
-    if (monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length)
-      || (requestedLiveFrame !== null && requestedLiveFrame !== 0)) {
+    if (monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length || locator.frameUrl)) {
       if (typeof chrome.webNavigation?.getAllFrames !== 'function') throw new Error('Subframe selector capture is unavailable.');
       frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
+      frames = await collectStableFrameDescriptors(tab.id, frames);
     }
     const frameById = new Map(frames.map((frame) => [frame.frameId, frame]));
     const frameGroups = new Map();
     const savedFrameOrder = new Map();
     for (const locator of monitor.locators) {
       const frameId = resolveLocatorFrame(locator, frames);
-      // Reference live_init places one independent watcher in every selected
-      // frame. A frame mutation filters only that frame rather than rebuilding
-      // a cross-frame aggregate for every event.
-      if (requestedLiveFrame !== null && frameId !== requestedLiveFrame) continue;
       if (!frameGroups.has(frameId)) frameGroups.set(frameId, []);
       frameGroups.get(frameId).push(locator);
       // Reference Runner orders selected frame configurations by their saved
@@ -3194,6 +3830,7 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
     }
     const requestedFrameIds = [...frameGroups.keys()];
     for (const frameId of requestedFrameIds) {
+      if (frameId === -1) throw new Error('저장된 iframe을 명확하게 식별하지 못했습니다. 이전 정상 자료를 유지하며, 선택기로 프레임을 다시 지정해야 합니다.');
       if (!frameById.has(frameId)) throw new Error(`The configured frame (${frameId}) is not available on this page.`);
     }
     const captures = [];
@@ -3204,6 +3841,7 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
         - (savedFrameOrder.get(left.frameId) ?? left.frameId)
       ) || right.frameId - left.frameId);
     for (let frameIndex = 0; frameIndex < orderedFrames.length; frameIndex += 1) {
+      assertActive();
       const frame = orderedFrames[frameIndex];
       // Page settling and a configured delay apply once to the complete
       // capture transaction, before the innermost configured frame. Repeating
@@ -3233,11 +3871,15 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
       }
       const frameResult = execution[0]?.result;
       if (!frameResult?.ok) throw new Error(frameResult?.error || `Could not inspect frame ${frame.frameId}.`);
-      captures.push({ frameId: frame.frameId, result: frameResult });
+      captures.push({ frameId: frame.frameId, frame, result: frameResult });
     }
+    const frameDescriptor = (frameId, frame = {}) => ({
+      url: normalizeFrameUrl(frame.url) || (frameId === 0 ? monitor.url : ''),
+      path: framePathForFrame(frameId, frames) || []
+    });
     const result = {
       ok: true,
-      selectorMatches: captures.flatMap(({ frameId, result }) => (result.selectorMatches || []).map((match) => ({ ...match, frameId })))
+      selectorMatches: captures.flatMap(({ frameId, frame, result }) => (result.selectorMatches || []).map((match) => ({ ...match, frameId, frame: frameDescriptor(frameId, frame) })))
     };
     // The reference runner appends each configured frame's filtered document
     // text in capture order. Keep one aggregate item so snapshot normalization
@@ -3253,7 +3895,12 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
         : '';
     }).join('');
     result.text = rawText;
-    result.items = result.text ? [{ text: result.text }] : [];
+    result.items = captures.flatMap(({ frameId, frame, result: frameResult }) => (
+      Array.isArray(frameResult.items) ? frameResult.items.map((item) => ({
+        ...item, frame: { ...(item.frame || {}), ...frameDescriptor(frameId, frame), frameId }
+      })) : []
+    ));
+    if (!result.items.length && result.text) result.items = [{ text: result.text }];
     // The reference runner appends each filtered frame document directly to
     // `result.data` (`result.data += html`).  Preserve that byte order rather
     // than wrapping nested <html> documents in dashboard-only markup: wrapper
@@ -3270,12 +3917,13 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
     result.matchCount = captures.reduce((total, { result: frameResult }) => (
       total + (Number.isInteger(frameResult.matchCount) ? frameResult.matchCount : Array.isArray(frameResult.items) ? frameResult.items.length : 0)
     ), 0);
-    const filteredText = filterCapturedText(rawText, monitor.tracking);
+    const filtered = await filterCapturedText(rawText, monitor.tracking, result.items.map((item) => item.text));
+    const filteredText = filtered.text;
+    assertActive();
     if (normalizeTracking(monitor.tracking).regexp) {
-      // A regular-expression monitor observes the matched aggregate, not each
-      // original DOM root.  Keep one ordered item so snapshot normalization
-      // cannot reconstruct the unfiltered text from the old root list.
-      result.items = [{ text: filteredText }];
+      // Filter the aggregate and roots in the same disposable worker. Keep
+      // root identity while aggregate text remains the comparison payload.
+      result.items = result.items.map((item, index) => ({ ...item, text: filtered.itemTexts[index] ?? '' }));
     }
     result.text = filteredText;
     // The reference content observer performs its nonempty gate before the
@@ -3312,13 +3960,22 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
     }
 
     const snapshot = normalizeSnapshot({
+      captureVersion: 2,
       exists: Boolean(result.exists),
       matchCount: Number.isInteger(result.matchCount) ? result.matchCount : 0,
       items: result.items,
-      text: Array.isArray(result.items) ? result.items.map((item) => item.text).join('\n\n') : '',
+      text: result.text,
       html: result.html,
       data: result.data ?? result.html,
       evidenceHtml: result.errorHtml,
+      selectorMatches: result.selectorMatches,
+      captureAttempts: captures.flatMap(({ frameId, result: frameResult }) => (frameResult.captureAttempts || []).map((attempt) => ({ ...attempt, frameId }))),
+      captureQuality: {
+        status: captures.some(({ result: frameResult }) => frameResult.captureQuality?.status === 'partial')
+          || (monitor.locators.filter((locator) => locator.op !== 'exclude').length > 1
+            && result.selectorMatches.some((match) => match.op !== 'exclude' && match.matchCount === 0)) ? 'partial' : 'complete',
+        missingLocators: result.selectorMatches.filter((match) => match.op !== 'exclude' && match.matchCount === 0)
+      },
       capturedAt: nowIso()
     });
     if (!snapshot) {
@@ -3352,7 +4009,7 @@ async function captureRenderedSnapshot(monitor, existingTabId = null, { live = f
 // into the monitored page.  It observes only; the service worker always makes
 // the actual typed-locator capture, so live and scheduled checks share one
 // filtering, frame, retry, and comparison implementation.
-function installLiveMutationObserver(monitorId, revision) {
+function installLiveMutationObserver(monitorId, revision, options = {}) {
   const registryKey = '__openStillLiveMutationObservers';
   const registry = globalThis[registryKey] || (globalThis[registryKey] = new Map());
   const existing = registry.get(monitorId);
@@ -3361,6 +4018,8 @@ function installLiveMutationObserver(monitorId, revision) {
   }
   existing?.observer?.disconnect();
   if (existing?.shadowRescanTimer) clearInterval(existing.shadowRescanTimer);
+  if (existing?.propertyTimer) clearInterval(existing.propertyTimer);
+  if (existing?.notify) { document.removeEventListener('input', existing.notify, true); document.removeEventListener('change', existing.notify, true); }
 
   const notify = () => {
     try {
@@ -3379,7 +4038,6 @@ function installLiveMutationObserver(monitorId, revision) {
   let paused = false;
   const observerOptions = {
     attributes: true,
-    attributeFilter: ['class', 'id', 'name', 'value', 'src', 'href'],
     childList: true,
     characterData: true,
     subtree: true
@@ -3447,12 +4105,29 @@ function installLiveMutationObserver(monitorId, revision) {
   // Attaching a shadow root itself is not a MutationObserver record. Rescan
   // hosts at a modest cadence so a component which creates a *closed* root
   // after live monitoring starts is enrolled before its next internal change.
-  const shadowRescanTimer = setInterval(() => discoverShadowRoots(document.documentElement), 1_500);
+  const shadowRescanTimer = setInterval(() => {
+    let removed = false;
+    for (const observed of [...observedRoots]) {
+      if (observed.isConnected === false || observed.host?.isConnected === false) { observedRoots.delete(observed); removed = true; }
+    }
+    if (removed && !paused) { observer.disconnect(); observedRoots.forEach((observed) => observer.observe(observed, observerOptions)); }
+    const priorCount = observedRoots.size;
+    observeRoot(document.documentElement);
+    for (const observed of [...observedRoots]) {
+      observed.querySelectorAll?.('*').forEach((element) => { if (!isPickerHost(element)) observeRoot(shadowFor(element)); });
+    }
+    if (removed || observedRoots.size !== priorCount) notify();
+  }, 10_000);
+  document.addEventListener('input', notify, true);
+  document.addEventListener('change', notify, true);
+  const propertyTimer = options.propertyPolling ? setInterval(notify, 15_000) : null;
   const record = {
     revision,
     observer,
     observedRoots,
     shadowRescanTimer,
+    propertyTimer,
+    notify,
     pause,
     resume
   };
@@ -3461,6 +4136,9 @@ function installLiveMutationObserver(monitorId, revision) {
     if (registry.get(monitorId) !== record) return;
     observer.disconnect();
     clearInterval(shadowRescanTimer);
+    if (propertyTimer) clearInterval(propertyTimer);
+    document.removeEventListener('input', notify, true);
+    document.removeEventListener('change', notify, true);
     registry.delete(monitorId);
   }, { once: true });
   return { ok: true, reused: false };
@@ -3472,12 +4150,19 @@ function removeLiveMutationObserver(monitorId) {
   record?.observer?.disconnect();
   if (record?.timer) clearTimeout(record.timer);
   if (record?.shadowRescanTimer) clearInterval(record.shadowRescanTimer);
+  if (record?.propertyTimer) clearInterval(record.propertyTimer);
+  if (record?.notify) { document.removeEventListener('input', record.notify, true); document.removeEventListener('change', record.notify, true); }
   registry?.delete(monitorId);
   return { ok: true };
 }
 
+function inspectLiveMutationObserver(monitorId, revision) {
+  const record = globalThis.__openStillLiveMutationObservers?.get(monitorId);
+  return { ok: Boolean(record?.observer && record.revision === revision), revision: record?.revision || null };
+}
+
 async function refreshBadge(monitors = null) {
-  const list = monitors ?? await getMonitors();
+  const list = monitors ?? (typeof getMonitorSummaries === 'function' ? await getMonitorSummaries() : await getMonitors());
   const unreadCount = list.filter((monitor) => monitor.unread).length;
   await chrome.action.setBadgeBackgroundColor({ color: '#EF6A5B' });
   await chrome.action.setBadgeText({ text: unreadCount ? String(unreadCount) : '' });
@@ -3520,22 +4205,21 @@ function dueTimestamp(monitor) {
 
 async function scheduleNextAlarm() {
   const operation = alarmQueue.catch(() => undefined).then(async () => {
-    const monitors = await getMonitors();
+    const monitors = typeof getMonitorSummaries === 'function' ? await getMonitorSummaries() : await getMonitors();
     const enabled = monitors
       .filter((monitor) => monitor.enabled && isAutomaticSchedule(monitor))
-      .map((monitor) => ({ monitor, due: dueTimestamp(monitor) }))
+      .map((monitor) => ({ monitor, due: Math.max(dueTimestamp(monitor), storageFailureBackoff.get(monitor.id)?.retryAt || 0) }))
       .filter(({ due }) => Number.isFinite(due));
     if (precisionScheduleTimer !== null) {
       clearTimeout(precisionScheduleTimer);
       precisionScheduleTimer = null;
     }
-    await chrome.alarms.clear(ALARM_NAME);
-
     if (!enabled.length) {
+      await chrome.alarms.clear(ALARM_NAME);
       return;
     }
 
-    const nextDue = Math.min(...enabled.map(({ due }) => due));
+    const nextDue = enabled.reduce((earliest, entry) => Math.min(earliest, entry.due), Infinity);
     const now = Date.now();
     const delay = Math.max(0, nextDue - now);
     if (delay < MIN_CHROME_ALARM_DELAY_MS) {
@@ -3625,7 +4309,7 @@ async function setCheckFailure(id, expectedRevision, status, errorMessage, sourc
       changed: false
     });
     return monitor;
-  });
+  }, { operation: false });
 }
 
 function statusForStoredSnapshot(snapshot, tracking = null) {
@@ -3650,6 +4334,16 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
   // be rendered. Keep the last successful snapshot so a later reappearance is
   // compared against real content instead of producing a false change.
   const tracking = normalizeTracking(monitor.tracking);
+  const selectorMatchKey = (entry) => JSON.stringify([entry.frameId || 0, entry.locatorKey || entry.key || entry.expr, entry.type, entry.op]);
+  const priorMatches = new Map((monitor.snapshot?.selectorMatches || []).map((entry) => [selectorMatchKey(entry), entry.matchCount]));
+  const lostSelection = (nextSnapshot?.selectorMatches || []).some((entry) => entry.op !== 'exclude' && (priorMatches.get(selectorMatchKey(entry)) || 0) > 0 && entry.matchCount === 0);
+  if (nextSnapshot?.captureQuality === 'partial' || nextSnapshot?.captureQuality?.status === 'partial' || lostSelection && !(tracking.allowEmpty && (nextSnapshot.selectorMatches || []).filter((entry) => entry.op !== 'exclude').length === 1)) {
+    monitor.status = 'needs-review';
+    monitor.lastReviewAt = checkedAt;
+    monitor.lastError = '일부 선택 영역을 찾지 못했습니다. 이전 정상 기준값을 유지합니다.';
+    monitor.lastErrorSnapshot = nextSnapshot;
+    return { changed: false, needsReview: true, partial: true };
+  }
   if (!nextSnapshot.exists && !tracking.allowEmpty) {
     monitor.status = 'needs-review';
     monitor.lastReviewAt = checkedAt;
@@ -3659,6 +4353,7 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
   }
 
   const previous = monitor.snapshot;
+  const identityComparison = previous && typeof compareSnapshotIdentities === 'function' ? compareSnapshotIdentities(previous, nextSnapshot, tracking) : null;
   const changed = Boolean(previous) && !snapshotsEqual(previous, nextSnapshot, tracking);
   // The reference runner only persists a baseline on the first successful
   // capture or a real filtered-text change. An equal re-render must not churn
@@ -3666,6 +4361,12 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
   if (!previous || changed) {
     monitor.snapshot = nextSnapshot;
     appendSnapshotHistory(monitor, nextSnapshot, previous ? 'change' : 'baseline');
+  } else if (Number(nextSnapshot.captureVersion) > Number(previous.captureVersion || 0)) {
+    // Upgrade extraction metadata without manufacturing a content change.
+    monitor.snapshot = nextSnapshot;
+  } else if (identityComparison?.orderChanged) {
+    monitor.snapshot = nextSnapshot;
+    monitor.lastOrderChangedAt = checkedAt;
   }
   monitor.lastError = null;
   monitor.lastErrorSnapshot = null;
@@ -3674,6 +4375,7 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
   if (changed) {
     monitor.lastChangedAt = checkedAt;
     monitor.lastChange = {
+      id: createRevision(),
       previous,
       current: nextSnapshot,
       detectedAt: checkedAt
@@ -3689,7 +4391,7 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
     monitor.status = monitor.unread ? 'changed' : statusForStoredSnapshot(monitor.snapshot, tracking);
   }
 
-  return { changed, needsReview: false };
+  return { changed, needsReview: false, orderChanged: Boolean(identityComparison?.orderChanged) };
 }
 
 function liveRawTextOf(snapshot) {
@@ -3703,21 +4405,26 @@ async function checkMonitorWithCapture(id, capture, {
   reschedule = true,
   source = 'manual',
   liveFrameId = 0,
-  liveTabId = null
+  liveTabId = null,
+  job = null
 } = {}) {
   if (checksInProgress.has(id)) {
     return { ok: false, reason: 'checking', error: '이미 확인 중입니다.' };
   }
 
   checksInProgress.add(id);
+  let captureToRetry = null;
   try {
-    const monitor = (await getMonitors()).find((item) => item.id === id);
+    const monitor = typeof getMonitorById === 'function' ? await getMonitorById(id) : (await getMonitors()).find((item) => item.id === id);
     if (!monitor) {
       return { ok: false, error: '모니터를 찾을 수 없습니다.' };
     }
     if (!monitor.enabled) {
+      forgetPendingCapture(id);
       return { ok: false, reason: 'disabled', error: '일시정지된 모니터입니다.' };
     }
+    const pendingCapture = pendingSnapshotCommits.get(id);
+    if (pendingCapture && pendingCapture.revision !== monitor.revision) forgetPendingCapture(id);
     if (!await hasSitePermission(monitor.url)) {
       await setCheckFailure(id, monitor.revision, 'permission-needed', '이 사이트의 접근 권한이 필요합니다.', source);
       return { ok: false, reason: 'permission', error: '이 사이트의 접근 권한이 필요합니다.' };
@@ -3725,34 +4432,36 @@ async function checkMonitorWithCapture(id, capture, {
 
     let nextSnapshot;
     try {
-      // The reference live runner gives page loading a timeout, but mutation
-      // callbacks themselves filter immediately. Do not impose scheduled
-      // capture delay/timeout semantics on a live event.
-      if (source === 'live') {
-        nextSnapshot = await capture(monitor);
-      } else {
-        const captureTimeout = monitor.tracking?.timeoutMilliseconds ?? CHECK_EXECUTION_TIMEOUT_MS;
-        nextSnapshot = await timeout(
-          capture(monitor),
-          captureTimeout,
-          'The page capture exceeded its allowed time.'
-        );
+      const captureTimeout = monitor.tracking?.timeoutMilliseconds ?? CHECK_EXECUTION_TIMEOUT_MS;
+      const retryPending = pendingCapture?.revision === monitor.revision;
+      if (retryPending) source = pendingCapture.source;
+      const underlying = retryPending ? Promise.resolve(pendingCapture.snapshot) : Promise.resolve().then(() => capture(monitor, job));
+      try {
+        nextSnapshot = await timeout(underlying, captureTimeout, 'The page capture exceeded its allowed time.');
+      } catch (error) {
+        if (job) {
+          job.draining = underlying.finally(() => { job.finished = true; checksInProgress.delete(id); });
+          job.draining.catch(() => undefined);
+          await job.cancel().catch(() => undefined);
+          if (source === 'live') {
+            const liveSession = liveSessions.get(id);
+            if (liveSession?.tabId === liveTabId && liveSession.ownedTab) await detachLiveSession(id).catch(() => undefined);
+          }
+        }
+        throw error;
       }
+      captureToRetry = { revision: monitor.revision, snapshot: nextSnapshot, checkedAt: retryPending ? pendingCapture.checkedAt : nowIso(), source };
     } catch (error) {
       const message = responseError(error);
       await setCheckFailure(id, monitor.revision, 'error', message, source);
       return { ok: false, error: message };
     }
 
+    let pendingLiveCache = null;
     if (source === 'live') {
-      // The reference live content observer deliberately suppresses empty
-      // filter results and uses filtered text—not HTML/data mode—as its
-      // deduplication key. A transient disappearance therefore waits for a
-      // later nonempty mutation instead of rewriting the saved baseline.
-      const rawText = liveRawTextOf(nextSnapshot);
-      if (!rawText) {
-        return { ok: true, liveNoop: true, empty: true };
-      }
+      // Dedupe uses the same complete comparison semantics as persisted
+      // snapshots, including links, attributes and data-only changes.
+      const rawText = JSON.stringify([nextSnapshot?.exists, nextSnapshot?.textFingerprint || snapshotFingerprint(nextSnapshot?.text || ''), nextSnapshot?.dataFingerprint || snapshotFingerprint(nextSnapshot?.data || ''), snapshotFingerprint(JSON.stringify(nextSnapshot?.items?.map((item) => [item.identity, item.permalink]) || []))]);
       const session = liveSessions.get(id);
       const expectedSession = session
         && session.revision === monitor.revision
@@ -3763,16 +4472,11 @@ async function checkMonitorWithCapture(id, capture, {
         if (session.rawTextByFrame.get(frameId) === rawText) {
           return { ok: true, liveNoop: true, unchanged: true };
         }
-        // Content advances lastResult before the runner applies regexp or
-        // persists its comparison result, so cache this raw frame value now.
-        session.rawTextByFrame.set(frameId, rawText);
+        pendingLiveCache = { session, frameId, rawText };
       }
-      // A raw nonempty regexp miss is a successful empty comparison in live
-      // mode, not the scheduled selection-empty/review condition.
-      if (nextSnapshot && !nextSnapshot.exists) nextSnapshot.exists = true;
     }
 
-    const checkedAt = nowIso();
+    const checkedAt = captureToRetry?.checkedAt || nowIso();
     const result = await mutateMonitors((monitors) => {
       const current = monitors.find((item) => item.id === id);
       if (!current || !current.enabled || current.revision !== monitor.revision) {
@@ -3809,6 +4513,7 @@ async function checkMonitorWithCapture(id, capture, {
       const recordOutcome = source !== 'live'
         || !hadSnapshot
         || applied.changed
+        || applied.orderChanged
         || applied.needsReview
         || previousStatus !== current.status
         || previousError !== current.lastError
@@ -3819,7 +4524,7 @@ async function checkMonitorWithCapture(id, capture, {
         appendRunHistory(current, {
           at: checkedAt,
           status: applied.needsReview ? 'needs-review' : applied.changed ? 'changed' : 'ok',
-          code: applied.needsReview ? 'selection-empty' : null,
+          code: applied.needsReview ? 'selection-empty' : applied.orderChanged ? 'order-changed' : null,
           message: applied.needsReview ? current.lastError : null,
           changed: applied.changed,
           matchCount: nextSnapshot.matchCount
@@ -3827,17 +4532,35 @@ async function checkMonitorWithCapture(id, capture, {
       }
 
       return { ok: true, ...applied, liveNoop: source === 'live' && !recordOutcome, monitor: { ...current } };
-    });
+    }, { operation: false });
 
-    if (result?.changed) {
-      await announceChange(result.monitor);
+    if (result?.ok) {
+      forgetPendingCapture(id);
+      const hadBackoff = storageFailureBackoff.delete(id);
+      if (pendingLiveCache && liveSessions.get(id) === pendingLiveCache.session) pendingLiveCache.session.rawTextByFrame.set(pendingLiveCache.frameId, pendingLiveCache.rawText);
+      if (hadBackoff) await mutateRuntimeState((state) => { delete state.backoff[id]; }).catch(() => undefined);
+    } else if (result?.reason === 'outdated') {
+      forgetPendingCapture(id);
+    } else if (source === 'live' && liveSessions.get(id)?.revision === monitor.revision) {
+      queueLiveDirtyFrame(id, liveTabId, monitor.revision, liveFrameId);
     }
-    await refreshBadge();
-    return result;
+    return afterMonitorCommit(result, [
+      ...(result?.changed ? [['notification', () => announceChange(result.monitor)]] : []),
+      ['badge', () => refreshBadge()]
+    ]);
   } catch (error) {
+    const prior = storageFailureBackoff.get(id);
+    const attempts = Math.min(8, (prior?.attempts || 0) + 1);
+    const backoff = { attempts, retryAt: Date.now() + Math.min(15 * 60_000, 5_000 * (2 ** (attempts - 1))) };
+    storageFailureBackoff.set(id, backoff);
+    pauseQueueForStorage(backoff.retryAt - Date.now());
+    if (captureToRetry) rememberPendingCapture(id, captureToRetry);
+    const liveSession = liveSessions.get(id);
+    if (source === 'live' && liveSession && (!Number.isInteger(liveTabId) || liveSession.tabId === liveTabId)) queueLiveDirtyFrame(id, liveSession.tabId, liveSession.revision, liveFrameId);
+    await mutateRuntimeState((state) => { state.backoff[id] = backoff; state.storageRetryAt = storageUnavailableUntil; }).catch(() => undefined);
     return { ok: false, error: responseError(error) };
   } finally {
-    checksInProgress.delete(id);
+    if (!job?.draining || job.finished) checksInProgress.delete(id);
     if (reschedule) {
       await scheduleNextAlarm().catch((error) => console.warn('OpenStill could not reschedule checks.', error));
     }
@@ -3845,18 +4568,22 @@ async function checkMonitorWithCapture(id, capture, {
 }
 
 async function checkMonitor(id, options = {}) {
-  return checkMonitorWithCapture(id, (monitor) => captureRenderedSnapshot(monitor), options);
+  const monitor = typeof getMonitorMetadataById === 'function' ? await getMonitorMetadataById(id) : typeof getMonitorById === 'function' ? await getMonitorById(id) : (await getMonitors()).find((item) => item.id === id);
+  if (!monitor) return { ok: false, reason: 'missing', error: '모니터를 찾을 수 없습니다.' };
+  return enqueueCaptureTask(id, monitor.url, options.source || 'manual', (job) => checkMonitorWithCapture(id, (current) => captureRenderedSnapshot(current, null, { job }), { ...options, job }));
 }
 
 async function checkMonitorInOpenTab(id, tabId, options = {}) {
-  return checkMonitorWithCapture(
+  const monitor = typeof getMonitorMetadataById === 'function' ? await getMonitorMetadataById(id) : typeof getMonitorById === 'function' ? await getMonitorById(id) : (await getMonitors()).find((item) => item.id === id);
+  if (!monitor) return { ok: false, reason: 'missing', error: '모니터를 찾을 수 없습니다.' };
+  return enqueueCaptureTask(id, monitor.url, options.source || 'live', (job) => checkMonitorWithCapture(
     id,
     (monitor) => captureRenderedSnapshot(monitor, tabId, {
       live: options.source === 'live',
-      frameId: options.liveFrameId
+      job
     }),
-    { ...options, liveTabId: tabId }
-  );
+    { ...options, liveTabId: tabId, job }
+  ));
 }
 
 function tabMatchesMonitor(tab, monitor) {
@@ -3875,7 +4602,7 @@ function normalizeLiveOwnedTabs(value) {
     const revision = String(entry?.revision || '').trim();
     const url = normalizeUrl(entry?.url);
     if (id && Number.isInteger(tabId) && tabId >= 0 && revision && url) {
-      result[id] = { tabId, revision, url };
+      result[id] = { ...entry, tabId, revision, url };
     }
   }
   return result;
@@ -3883,10 +4610,11 @@ function normalizeLiveOwnedTabs(value) {
 
 async function mutateLiveOwnedTabs(mutator) {
   const operation = liveOwnershipQueue.catch(() => undefined).then(async () => {
-    const stored = await chrome.storage.session.get(LIVE_CONTROLLED_TABS_KEY);
-    const owned = normalizeLiveOwnedTabs(stored?.[LIVE_CONTROLLED_TABS_KEY]);
+    const stored = await chrome.storage.local.get(LIVE_CONTROLLED_TABS_KEY);
+    const legacy = !stored?.[LIVE_CONTROLLED_TABS_KEY] && chrome.storage.session ? await chrome.storage.session.get(LIVE_CONTROLLED_TABS_KEY) : null;
+    const owned = normalizeLiveOwnedTabs(stored?.[LIVE_CONTROLLED_TABS_KEY] || legacy?.[LIVE_CONTROLLED_TABS_KEY]);
     const value = await mutator(owned);
-    await chrome.storage.session.set({ [LIVE_CONTROLLED_TABS_KEY]: owned });
+    await chrome.storage.local.set({ [LIVE_CONTROLLED_TABS_KEY]: owned });
     return value;
   });
   liveOwnershipQueue = operation.catch(() => undefined);
@@ -3895,13 +4623,14 @@ async function mutateLiveOwnedTabs(mutator) {
 
 async function getLiveOwnedTabs() {
   await liveOwnershipQueue.catch(() => undefined);
-  const stored = await chrome.storage.session.get(LIVE_CONTROLLED_TABS_KEY);
+  const stored = await chrome.storage.local.get(LIVE_CONTROLLED_TABS_KEY);
   return normalizeLiveOwnedTabs(stored?.[LIVE_CONTROLLED_TABS_KEY]);
 }
 
-async function rememberLiveControlledTab(monitor, tabId) {
+async function rememberLiveControlledTab(monitor, tabId, stage = 'loading') {
+  const sessionId = await runtimeSessionId();
   return mutateLiveOwnedTabs((owned) => {
-    owned[monitor.id] = { tabId, revision: monitor.revision, url: monitor.url };
+    owned[monitor.id] = { tabId, revision: monitor.revision, url: monitor.url, stage, sessionId, createdAt: nowIso(), ownerToken: createRevision() };
   });
 }
 
@@ -3939,17 +4668,23 @@ async function adoptLiveControlledSession(monitor) {
   const entry = owned[monitor.id];
   if (!entry) return null;
 
+  const tab = await tabById(entry.tabId);
+  if (!tab) { await forgetLiveControlledTab(monitor.id, entry.tabId); return null; }
+  // Tab identifiers can be reused after a browser restart. A durable record
+  // alone is never permission to close or inject into a candidate user tab.
+  if (entry.sessionId !== await runtimeSessionId()) {
+    await mutateLiveOwnedTabs((all) => { if (all[monitor.id]) all[monitor.id].stage = 'ownership-unverified'; });
+    return null;
+  }
+
   // The stored tab id is only a candidate. Require the exact monitor
   // revision and normalized URL before treating it as extension-owned again.
   if (entry.revision !== monitor.revision || entry.url !== monitor.url) {
-    await removeLiveControlledTab(entry.tabId);
-    await forgetLiveControlledTab(monitor.id, entry.tabId);
+    if (await removeLiveControlledTab(entry.tabId)) await forgetLiveControlledTab(monitor.id, entry.tabId);
     return null;
   }
-  const tab = await tabById(entry.tabId);
   if (!tab || !tabMatchesMonitor(tab, monitor)) {
-    if (tab) await removeLiveControlledTab(entry.tabId);
-    await forgetLiveControlledTab(monitor.id, entry.tabId);
+    if (!tab || await removeLiveControlledTab(entry.tabId)) await forgetLiveControlledTab(monitor.id, entry.tabId);
     return null;
   }
   const session = {
@@ -3972,6 +4707,12 @@ async function reconcileLiveControlledTabs(monitors) {
   const owned = await getLiveOwnedTabs();
   let adopted = 0;
   for (const [monitorId, entry] of Object.entries(owned)) {
+    if (entry.sessionId !== await runtimeSessionId()) {
+      const candidate = await tabById(entry.tabId);
+      if (!candidate) await forgetLiveControlledTab(monitorId, entry.tabId);
+      else await mutateLiveOwnedTabs((all) => { if (all[monitorId]) all[monitorId].stage = 'ownership-unverified'; });
+      continue;
+    }
     const monitor = byId.get(monitorId);
     const validMonitor = monitor
       && monitor.enabled
@@ -3979,8 +4720,7 @@ async function reconcileLiveControlledTabs(monitors) {
       && monitor.revision === entry.revision
       && monitor.url === entry.url;
     if (!validMonitor) {
-      await removeLiveControlledTab(entry.tabId);
-      await forgetLiveControlledTab(monitorId, entry.tabId);
+      if (await removeLiveControlledTab(entry.tabId)) await forgetLiveControlledTab(monitorId, entry.tabId);
       continue;
     }
     if (!liveSessions.has(monitorId) && await adoptLiveControlledSession(monitor)) adopted += 1;
@@ -3989,12 +4729,19 @@ async function reconcileLiveControlledTabs(monitors) {
 }
 
 async function removeLiveControlledTab(tabId) {
-  if (!Number.isInteger(tabId)) return;
-  await chrome.tabs.remove(tabId).catch(async () => {
-    // Keep the same best-effort unpin fallback used by one-shot captures.
+  if (!Number.isInteger(tabId)) return true;
+  try { await chrome.tabs.remove(tabId); return true; }
+  catch {
     await chrome.tabs.update(tabId, { pinned: false }).catch(() => undefined);
-    await chrome.tabs.remove(tabId).catch(() => undefined);
-  });
+    try { await chrome.tabs.remove(tabId); return true; }
+    catch {
+      if (!await tabById(tabId)) return true;
+      await mutateLiveOwnedTabs((owned) => {
+        for (const entry of Object.values(owned)) if (entry.tabId === tabId) { entry.stage = 'pendingCleanup'; entry.cleanupAttemptAt = nowIso(); }
+      }).catch(() => undefined);
+      return false;
+    }
+  }
 }
 
 async function createLiveControlledTab(monitor) {
@@ -4013,12 +4760,14 @@ async function createLiveControlledTab(monitor) {
   if (!Number.isInteger(tab?.id)) {
     throw new Error('Could not create a controlled tab for live monitoring.');
   }
+  try { await rememberLiveControlledTab(monitor, tab.id, 'loading'); }
+  catch (error) { await removeLiveControlledTab(tab.id).catch(() => undefined); throw error; }
   const ready = waitForRenderedTab(tab.id);
   try {
     await ready.promise;
     return tab;
   } catch (error) {
-    await removeLiveControlledTab(tab.id);
+    if (await removeLiveControlledTab(tab.id)) await forgetLiveControlledTab(monitor.id, tab.id);
     throw error;
   } finally {
     ready.cancel();
@@ -4026,12 +4775,13 @@ async function createLiveControlledTab(monitor) {
 }
 
 async function liveFrameIdsForMonitor(monitor, tabId) {
-  const needsFrames = monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length);
+  const needsFrames = monitor.locators.some((locator) => locator.frameId !== 0 || locator.framePath?.length || locator.frameUrl);
   if (!needsFrames) return [0];
   if (typeof chrome.webNavigation?.getAllFrames !== 'function') {
     throw new Error('Subframe live monitoring is unavailable in this browser.');
   }
-  const frames = await chrome.webNavigation.getAllFrames({ tabId });
+  let frames = await chrome.webNavigation.getAllFrames({ tabId });
+  if (typeof collectStableFrameDescriptors === 'function') frames = await collectStableFrameDescriptors(tabId, frames);
   const ids = [...new Set(monitor.locators.map((locator) => resolveLocatorFrame(locator, frames)))];
   if (ids.some((frameId) => !Number.isInteger(frameId) || frameId < 0)) {
     throw new Error('A saved live-monitor frame is no longer available on this page.');
@@ -4049,10 +4799,16 @@ async function detachLiveSession(monitorId) {
   const session = liveSessions.get(monitorId);
   if (!session) {
     liveDirtyByMonitor.delete(monitorId);
-    return { ok: true, stopped: false };
+    const owned = (await getLiveOwnedTabs())[monitorId];
+    if (!owned) return { ok: true, stopped: false };
+    if (owned.sessionId !== await runtimeSessionId()) return { ok: false, stopped: false, pendingCleanup: true, error: '이전 브라우저 세션의 탭 소유권을 확인해야 합니다.' };
+    if (!await removeLiveControlledTab(owned.tabId)) return { ok: false, stopped: false, pendingCleanup: true, tabId: owned.tabId };
+    await forgetLiveControlledTab(monitorId, owned.tabId);
+    return { ok: true, stopped: true, tabId: owned.tabId };
   }
   const frameIds = [...(session.frameIds || [])];
   const ownsTab = session.ownedTab === true;
+  let result;
   try {
     if (frameIds.length) {
       await chrome.scripting.executeScript({
@@ -4061,23 +4817,30 @@ async function detachLiveSession(monitorId) {
         args: [monitorId]
       });
     }
-    return { ok: true, stopped: true, tabId: session.tabId };
+    result = { ok: true, stopped: true, tabId: session.tabId };
+    return result;
   } catch (error) {
     // A navigated/closed frame can reject an otherwise successful teardown.
     // Always discard the worker-side session so a new revision can recover.
-    return { ok: false, stopped: false, tabId: session.tabId, error: responseError(error) };
+    result = { ok: false, stopped: false, tabId: session.tabId, error: responseError(error) };
+    return result;
   } finally {
     liveSessions.delete(monitorId);
     liveDirtyByMonitor.delete(monitorId);
     if (ownsTab) {
-      await removeLiveControlledTab(session.tabId);
-      await forgetLiveControlledTab(monitorId, session.tabId);
+      if (await removeLiveControlledTab(session.tabId)) await forgetLiveControlledTab(monitorId, session.tabId);
+      else if (result) { result.ok = false; result.stopped = false; result.pendingCleanup = true; }
     }
   }
 }
 
 function queueLiveDirtyFrame(monitorId, tabId, revision, frameId) {
   const normalizedFrameId = Number.isInteger(frameId) && frameId >= 0 ? frameId : 0;
+  void mutateRuntimeState((state) => {
+    state.dirty ||= {};
+    const prior = state.dirty[monitorId];
+    state.dirty[monitorId] = { tabId, revision, frameIds: [...new Set([...(prior?.revision === revision ? prior.frameIds : []), normalizedFrameId])], at: nowIso() };
+  }).catch(() => undefined);
   const existing = liveDirtyByMonitor.get(monitorId);
   if (existing?.revision === revision && existing.tabId === tabId) {
     existing.frameIds.add(normalizedFrameId);
@@ -4092,11 +4855,16 @@ function takeLiveDirtyFrames(monitorId, tabId, revision) {
   const dirty = liveDirtyByMonitor.get(monitorId);
   if (!dirty || dirty.revision !== revision || dirty.tabId !== tabId) return [];
   liveDirtyByMonitor.delete(monitorId);
+  void mutateRuntimeState((state) => { if (state.dirty) delete state.dirty[monitorId]; }).catch(() => undefined);
   return [...dirty.frameIds];
 }
 
 async function requestLiveCapture(monitor, tabId, frameId = 0) {
-  if (checksInProgress.has(monitor.id)) {
+  if ((storageFailureBackoff.get(monitor.id)?.retryAt || 0) > Date.now()) {
+    queueLiveDirtyFrame(monitor.id, tabId, monitor.revision, frameId);
+    return { ok: true, pending: true, reason: 'storage-backoff' };
+  }
+  if (checksInProgress.has(monitor.id) || captureTasks.has(monitor.id)) {
     queueLiveDirtyFrame(monitor.id, tabId, monitor.revision, frameId);
     return { ok: true, pending: true };
   }
@@ -4108,13 +4876,12 @@ async function requestLiveCapture(monitor, tabId, frameId = 0) {
   // latest frame event. A busy page can continue to mutate forever, so leave
   // a later batch to the normal asynchronous requeue after two bounded rounds.
   while (frameIds.length && rounds < 2) {
-    for (const currentFrameId of frameIds) {
       result = await checkMonitorInOpenTab(monitor.id, tabId, {
         reschedule: false,
         source: 'live',
-        liveFrameId: currentFrameId
+        liveFrameId: 0
       });
-    }
+      if (result?.ok === false) return result;
     rounds += 1;
     frameIds = takeLiveDirtyFrames(monitor.id, tabId, monitor.revision);
   }
@@ -4148,22 +4915,28 @@ async function initializeLiveSession(monitor, session) {
   // observer. Doing the same prevents capture-owned source writes (notably the
   // capture base element) from scheduling a self-feedback check.
   const initialResults = [];
-  for (const frameId of frameIds) {
-    initialResults.push(await requestLiveCapture(monitor, session.tabId, frameId));
-  }
+  initialResults.push(await requestLiveCapture(monitor, session.tabId, frameIds[0]));
 
   const installed = await chrome.scripting.executeScript({
     target: liveTarget(session.tabId, frameIds),
     func: installLiveMutationObserver,
-    args: [monitor.id, monitor.revision]
+    args: [monitor.id, monitor.revision, { propertyPolling: monitor.locators.some((locator) => locator.fields?.some((field) => field.type === 'property')) }]
   });
+  const failedFrames = frameIds.filter((id) => !installed.some((entry) => entry.frameId === id && entry.result?.ok === true));
+  if (failedFrames.length) throw new Error(`실시간 관찰기 설치 실패: frame ${failedFrames.join(', ')}`);
+  session.installedAt = Date.now();
+  await mutateLiveOwnedTabs((owned) => { if (owned[monitor.id]) owned[monitor.id].stage = 'observing'; });
   return {
-    installedFrames: installed.length,
+    installedFrames: installed.filter((entry) => entry.result?.ok === true).length,
     initial: initialResults.length === 1 ? initialResults[0] : initialResults
   };
 }
 
-async function startLiveMonitor(message) {
+function startLiveMonitor(message) {
+  return queueLiveLifecycle(message?.id, () => startLiveMonitorInternal(message));
+}
+
+async function startLiveMonitorInternal(message) {
   const monitor = (await getMonitors()).find((item) => item.id === message?.id);
   if (!monitor) return { ok: false, error: 'Live monitor was not found.' };
   if (!monitor.enabled) return { ok: false, error: 'Live monitor is disabled.' };
@@ -4194,7 +4967,13 @@ async function startLiveMonitor(message) {
       session.navigating = false;
     } else {
       if (existing) await detachLiveSession(monitor.id);
-      const tab = await createLiveControlledTab(monitor);
+      const owned = await getLiveOwnedTabs();
+      if (owned[monitor.id]?.stage === 'ownership-unverified' || owned[monitor.id]?.stage === 'pendingCleanup') return { ok: false, reason: 'pending-cleanup', error: '이전 실시간 탭의 소유권 확인 또는 정리가 필요합니다.' };
+      if (Object.keys(owned).length + reservedLiveTabs >= MAX_RESIDENT_LIVE_TABS) return { ok: false, reason: 'resident-limit', error: '상주 실시간 탭 한도에 도달했습니다. 대기 중인 추적은 주기적으로 확인합니다.' };
+      reservedLiveTabs += 1;
+      let tab;
+      try { tab = await createLiveControlledTab(monitor); }
+      finally { reservedLiveTabs -= 1; }
       session = {
         tabId: tab.id,
         revision: monitor.revision,
@@ -4204,7 +4983,6 @@ async function startLiveMonitor(message) {
         navigating: false
       };
       liveSessions.set(monitor.id, session);
-      await rememberLiveControlledTab(monitor, tab.id);
     }
     const initialized = await initializeLiveSession(monitor, session);
     return { ok: true, tabId: session.tabId, ...initialized };
@@ -4216,7 +4994,11 @@ async function startLiveMonitor(message) {
   }
 }
 
-async function stopLiveMonitor(message) {
+function stopLiveMonitor(message) {
+  return queueLiveLifecycle(message?.id, () => stopLiveMonitorInternal(message));
+}
+
+async function stopLiveMonitorInternal(message) {
   const monitor = (await getMonitors()).find((item) => item.id === message?.id);
   if (!monitor) return { ok: false, error: 'Live monitor was not found.' };
   // There is intentionally no matching-tab fallback: reference LiveRunner
@@ -4278,14 +5060,34 @@ async function restoreLiveForTab(tabId, knownTab = null) {
 async function restoreLiveMonitoring() {
   const monitors = (await getMonitors()).filter((monitor) => monitor.enabled && isLiveTracking(monitor));
   await reconcileLiveControlledTabs(monitors);
+  // Probe the resident set independently of the large registration cursor.
+  // Lost isolated worlds and page replacements must not look connected for
+  // hours merely because thousands of other monitors are waiting.
+  for (const [id, session] of liveSessions) {
+    if (session.navigating) continue;
+    try {
+      const frameIds = [...session.frameIds];
+      const inspected = await chrome.scripting.executeScript({ target: liveTarget(session.tabId, frameIds.length ? frameIds : [0]), func: inspectLiveMutationObserver, args: [id, session.revision] });
+      if (!frameIds.length || frameIds.some((frameId) => !inspected.some((entry) => entry.frameId === frameId && entry.result?.ok === true))) session.navigating = true;
+    } catch { session.navigating = true; }
+  }
+  const state = await getRuntimeAux('runtime', 'checkpoint') || {};
+  const cursor = Number(state.liveCursor) % Math.max(1, monitors.length) || 0;
+  const reconnect = monitors.filter((monitor) => liveSessions.get(monitor.id)?.navigating);
+  const batch = [...new Map([...reconnect, ...monitors.slice(cursor, cursor + 4), ...monitors.slice(0, Math.max(0, cursor + 4 - monitors.length))].map((monitor) => [monitor.id, monitor])).values()].slice(0, 4);
   let restored = 0;
-  for (const monitor of monitors) {
+  let progressed = 0;
+  for (const monitor of batch) {
+    progressed += 1;
+    // Save progress before a tab load can consume its complete timeout.
+    await mutateRuntimeState((checkpoint) => { checkpoint.liveCursor = (cursor + progressed) % Math.max(1, monitors.length); });
     const session = liveSessions.get(monitor.id);
     if (session?.revision === monitor.revision && !session.navigating) continue;
     const outcome = await startLiveMonitor({ id: monitor.id }).catch(() => null);
     if (outcome?.ok) restored += 1;
   }
-  return { restored };
+  if (!batch.length) await mutateRuntimeState((checkpoint) => { checkpoint.liveCursor = 0; });
+  return { restored, resident: liveSessions.size, pending: Math.max(0, monitors.length - liveSessions.size), residentLimit: MAX_RESIDENT_LIVE_TABS };
 }
 
 // Every mutation path (save, import, URL replacement, deletion, enable) can
@@ -4302,15 +5104,7 @@ async function reconcileLiveSessions() {
       await detachLiveSession(id);
     }
   }
-  let restored = 0;
-  for (const monitor of monitors) {
-    if (!monitor.enabled || !isLiveTracking(monitor)) continue;
-    const session = liveSessions.get(monitor.id);
-    if (session?.revision === monitor.revision && !session.navigating) continue;
-    const result = await startLiveMonitor({ id: monitor.id }).catch(() => null);
-    if (result?.ok) restored += 1;
-  }
-  return { restored };
+  return restoreLiveMonitoring();
 }
 
 async function reinstallLiveFrame(tabId, frameId) {
@@ -4344,11 +5138,12 @@ async function reinstallLiveFrame(tabId, frameId) {
       // listening for subsequent mutations.
       session.rawTextByFrame?.delete(frameId);
       await requestLiveCapture(monitor, tabId, frameId);
-      await chrome.scripting.executeScript({
+      const installed = await chrome.scripting.executeScript({
         target: liveTarget(tabId, [frameId]),
         func: installLiveMutationObserver,
-        args: [monitor.id, monitor.revision]
+        args: [monitor.id, monitor.revision, { propertyPolling: monitor.locators.some((locator) => locator.fields?.some((field) => field.type === 'property')) }]
       });
+      if (!installed.some((entry) => entry.frameId === frameId && entry.result?.ok === true)) throw new Error('실시간 관찰기 설치에 실패했습니다.');
       reinstalled += 1;
     } catch {
       // The frame may still be tearing down; its next completed navigation
@@ -4367,7 +5162,7 @@ async function checkPage(urlValue) {
   const matching = (await getMonitors()).filter((item) => item.url === url);
   const monitors = matching.filter((item) => item.enabled);
   if (!monitors.length) {
-    return { ok: false, reason: 'disabled', error: '이 페이지에서 활성화된 추적을 찾을 수 없습니다.' };
+    return matching.length ? { ok: true, requested: matching.length, matched: matching.length, completed: 0, checked: 0, changed: 0, failed: 0, paused: matching.length, pausedIds: matching.map((monitor) => monitor.id), missing: 0, skipped: matching.length } : { ok: false, reason: 'missing', error: '이 페이지의 추적을 찾을 수 없습니다.' };
   }
 
   const result = await checkMonitors({ ids: monitors.map((monitor) => monitor.id) });
@@ -4377,10 +5172,14 @@ async function checkPage(urlValue) {
     // Preserve the page-action shape while reporting all independently
     // configured monitors that were actually checked.
     checked: result.completed,
+    changedCount: result.changed,
+    needsReviewCount: result.needsReview,
     changed: Boolean(result.changed),
     needsReview: Boolean(result.needsReview),
     matched: matching.length,
-    skipped: matching.length - monitors.length
+    skipped: matching.length - monitors.length,
+    paused: matching.length - monitors.length + (result.paused || 0),
+    pausedIds: matching.filter((monitor) => !monitor.enabled).map((monitor) => monitor.id).concat(result.pausedIds || [])
   };
 }
 
@@ -4438,7 +5237,8 @@ async function checkMonitors(message) {
   const completed = outcomes.filter((outcome) => outcome?.ok).length;
   const changed = outcomes.filter((outcome) => outcome?.ok && outcome.changed).length;
   const needsReview = outcomes.filter((outcome) => outcome?.ok && outcome.needsReview).length;
-  const failed = outcomes.filter((outcome) => !outcome?.ok).length;
+  const paused = outcomes.filter((outcome) => outcome?.reason === 'disabled').length;
+  const failed = outcomes.filter((outcome) => !outcome?.ok && outcome?.reason !== 'disabled').length;
   return {
     ok: true,
     requested: requestedIds.length,
@@ -4447,7 +5247,14 @@ async function checkMonitors(message) {
     changed,
     needsReview,
     failed,
-    missing: requestedIds.length - ids.length
+    paused,
+    missing: requestedIds.length - ids.length,
+    completedIds: ids.filter((id, index) => outcomes[index]?.ok),
+    failedIds: ids.filter((id, index) => !outcomes[index]?.ok && outcomes[index]?.reason !== 'disabled'),
+    pausedIds: ids.filter((id, index) => outcomes[index]?.reason === 'disabled'),
+    missingIds: requestedIds.filter((id) => !knownIds.has(id)),
+    disabled: outcomes.filter((outcome) => outcome?.reason === 'disabled').length,
+    outcomes: ids.map((id, index) => ({ id, ok: Boolean(outcomes[index]?.ok), reason: outcomes[index]?.reason, error: outcomes[index]?.error }))
   };
 }
 
@@ -4459,19 +5266,22 @@ async function runDueChecks() {
   sweepRunning = true;
   try {
     const now = Date.now();
-    const due = (await getMonitors())
-      .filter((monitor) => monitor.enabled && isAutomaticSchedule(monitor) && dueTimestamp(monitor) <= now)
+    const due = (typeof getMonitorSummaries === 'function' ? await getMonitorSummaries() : await getMonitors())
+      .filter((monitor) => monitor.enabled && (storageFailureBackoff.get(monitor.id)?.retryAt || 0) <= now && !captureTasks.has(monitor.id) && (
+        isAutomaticSchedule(monitor) && dueTimestamp(monitor) <= now
+        || isLiveTracking(monitor) && !liveSessions.has(monitor.id) && now - Date.parse(monitor.lastCheckedAt || '1970-01-01') >= 60_000
+      ))
       .sort((left, right) => dueTimestamp(left) - dueTimestamp(right));
 
     // Configurations that watch one page remain independent.  In particular,
     // do not collapse due work by URL: they may have different locators,
     // fields, schedules, or comparison filters.
-    const scheduled = due.slice(0, MAX_CHECKS_PER_SWEEP);
-
-    await Promise.allSettled(scheduled.map((monitor) => checkMonitor(monitor.id, { reschedule: false })));
+    // The shared queue fills each newly available permit immediately, across
+    // scheduled, manual, batch and live requests.
+    await Promise.allSettled(due.map((monitor) => checkMonitor(monitor.id, { reschedule: false, source: 'scheduled' })));
   } finally {
     sweepRunning = false;
-    await scheduleNextAlarm();
+    await scheduleNextAlarm().catch(() => undefined);
   }
 }
 
@@ -4558,7 +5368,7 @@ async function createMonitors(message, sender) {
   const intervalHours = scheduleMode === SCHEDULE_MODE_INTERVAL
     ? schedule.params.interval / 3_600
     : MIN_INTERVAL_HOURS;
-  const trackingInput = message.tracking ?? message;
+  const trackingInput = message.tracking ?? legacyTrackingSettings(message);
   const pickerItems = pickerItemsFromMessage(
     message,
     Number.isInteger(sender?.frameId) ? sender.frameId : 0
@@ -4582,6 +5392,7 @@ async function createMonitors(message, sender) {
     let frames;
     try {
       frames = await chrome.webNavigation.getAllFrames({ tabId: sender.tab.id });
+      frames = await collectStableFrameDescriptors(sender.tab.id, frames);
     } catch (error) {
       return { ok: false, error: `Could not identify the selected frame: ${responseError(error)}` };
     }
@@ -4644,16 +5455,15 @@ async function createMonitors(message, sender) {
       unread: false
     };
     monitors.push(monitor);
-    return { ok: true, monitor: { ...monitor } };
+    return { ok: true, monitor: { ...monitor }, count: 1, ids: [monitor.id] };
   });
 
   if (!result?.ok) return result;
-  await forgetPendingPicker(sender?.tab?.id);
-  await scheduleNextAlarm();
-  if (isLiveTracking(result.monitor)) {
-    await startLiveMonitor({ id: result.monitor.id, tabId: sender?.tab?.id }).catch(() => undefined);
-  }
-  return { ok: true, monitor: result.monitor, monitors: [result.monitor], count: 1 };
+  return afterMonitorCommit({ ...result, count: 1, ids: [result.monitor.id] }, [
+    ['picker', () => forgetPendingPicker(sender?.tab?.id)],
+    ['schedule', () => scheduleNextAlarm()],
+    ...(isLiveTracking(result.monitor) ? [['live', async () => { const started = await startLiveMonitor({ id: result.monitor.id }); if (!started.ok) throw new Error(started.error); }]] : [])
+  ]);
 }
 
 async function createMonitor(message, sender) {
@@ -4666,13 +5476,17 @@ async function createMonitor(message, sender) {
 }
 
 async function saveMonitor(message) {
-  const url = normalizeUrl(message.url);
+  const existing = typeof getMonitorById === 'function' ? await getMonitorById(message.id) : (await getMonitors()).find((item) => item.id === message.id);
+  if (!existing) return { ok: false, error: '추적을 찾을 수 없습니다.' };
+  const initialConflict = mutationConflict(existing, message);
+  if (initialConflict) return initialConflict;
+  const url = normalizeUrl(message.url ?? existing.url);
   const locators = cleanLocators(
     Object.hasOwn(message, 'locators')
       ? message.locators
       : Object.hasOwn(message, 'selectors')
         ? message.selectors
-        : message.selector
+        : Object.hasOwn(message, 'selector') ? message.selector : existing.locators
   );
   if (!message.id || !url || !locators) {
     return { ok: false, error: 'URL과 CSS 선택자를 확인해 주세요.' };
@@ -4682,10 +5496,6 @@ async function saveMonitor(message) {
     return { ok: false, error: '변경 내용을 거를 정규식 또는 플래그가 올바르지 않습니다.' };
   }
 
-  const existing = (await getMonitors()).find((item) => item.id === message.id);
-  if (!existing) {
-    return { ok: false, error: '추적을 찾을 수 없습니다.' };
-  }
   const schedule = normalizeScheduleDescriptor(message, existing.scheduleMode, existing.schedule);
   const scheduleMode = schedule?.type;
   const intervalHours = scheduleMode === SCHEDULE_MODE_INTERVAL
@@ -4709,6 +5519,8 @@ async function saveMonitor(message) {
     if (!monitor) {
       return { ok: false, error: '추적을 찾을 수 없습니다.' };
     }
+    const conflict = mutationConflict(monitor, message);
+    if (conflict) return conflict;
     const nextTracking = normalizeTracking(scheduleMode === SCHEDULE_MODE_LIVE
       ? { ...((trackingInput ?? monitor.tracking) && typeof (trackingInput ?? monitor.tracking) === 'object' ? (trackingInput ?? monitor.tracking) : {}), live: true }
       : trackingInput ?? monitor.tracking);
@@ -4718,13 +5530,13 @@ async function saveMonitor(message) {
     monitor.locators = [...locators];
     monitor.selectors = displaySelectorsForLocators(locators);
     monitor.tracking = nextTracking;
-    monitor.labels = cleanLabels(message.labels);
+    if (Object.hasOwn(message, 'labels')) monitor.labels = cleanLabels(message.labels);
     monitor.schedule = schedule;
     monitor.scheduleMode = scheduleMode;
     monitor.intervalHours = intervalHours;
     if (scheduleMode === SCHEDULE_MODE_INTERVAL) monitor.intervalSeconds = schedule.params.interval;
     else delete monitor.intervalSeconds;
-    const requestedEnabled = message.enabled !== false;
+    const requestedEnabled = Object.hasOwn(message, 'enabled') ? message.enabled !== false : monitor.enabled;
     monitor.enabled = requestedEnabled && permissionGranted;
     monitor.updatedAt = nowIso();
     monitor.nextCheckAt = isAutomaticSchedule(monitor)
@@ -4747,7 +5559,8 @@ async function saveMonitor(message) {
     return { ok: true, monitor: { ...monitor }, permissionGranted };
   });
 
-  if (result?.ok) {
+  return afterMonitorCommit(result, [
+    ['live', async () => {
     const updatedTracking = normalizeTracking(result.monitor?.tracking);
     const previousLive = isLiveTracking(existing);
     const updatedLive = isLiveTracking(result.monitor);
@@ -4762,16 +5575,15 @@ async function saveMonitor(message) {
       // A saved selector or tracking edit creates a new revision. Reinstall on
       // any matching open page so an older isolated-world observer cannot keep
       // sending ignored revision messages forever.
-      await startLiveMonitor({ id: existing.id }).catch(() => undefined);
+      const started = await startLiveMonitor({ id: existing.id });
+      if (!started.ok) throw new Error(started.error);
     }
-  }
-  await reconcileLiveSessions().catch(() => undefined);
-  await refreshBadge();
-  await scheduleNextAlarm();
-  if (previousUrl !== url) {
-    await releaseUnusedSitePermission(previousUrl);
-  }
-  return result;
+    await reconcileLiveSessions();
+    }],
+    ['badge', () => refreshBadge()],
+    ['schedule', () => scheduleNextAlarm()],
+    ...(previousUrl !== url ? [['permission', () => releaseUnusedSitePermission(previousUrl)]] : [])
+  ]);
 }
 
 async function setMonitorEnabled(message) {
@@ -4785,15 +5597,13 @@ async function setMonitorEnabled(message) {
   if (enabled && !permissionGranted) {
     return { ok: false, reason: 'permission', error: '이 사이트의 접근 권한이 필요합니다.' };
   }
-  if (!enabled && isLiveTracking(monitor)) {
-    await stopLiveMonitor({ id: monitor.id }).catch(() => undefined);
-  }
-
-  await mutateMonitors((monitors) => {
+  const result = await mutateMonitors((monitors) => {
     const current = monitors.find((item) => item.id === message.id);
     if (!current) {
-      return;
+      return { ok: false, error: '모니터를 찾을 수 없습니다.' };
     }
+    const conflict = mutationConflict(current, message);
+    if (conflict) return conflict;
     current.enabled = enabled;
     current.revision = createRevision();
     current.updatedAt = nowIso();
@@ -4807,35 +5617,23 @@ async function setMonitorEnabled(message) {
       current.status = statusForStoredSnapshot(current.snapshot, current.tracking);
       current.lastError = null;
     }
+    return { ok: true, id: current.id, revision: current.revision };
   });
-  if (enabled && isLiveTracking(monitor)) {
-    await startLiveMonitor({ id: monitor.id }).catch(() => undefined);
-  }
-  await reconcileLiveSessions().catch(() => undefined);
-  await scheduleNextAlarm();
-  return { ok: true };
+  return afterMonitorCommit(result, [['live', () => reconcileLiveSessions()], ['schedule', () => scheduleNextAlarm()]]);
 }
 
-async function deleteMonitor(id) {
-  const existing = (await getMonitors()).find((item) => item.id === id);
-  if (existing && isLiveTracking(existing)) {
-    await stopLiveMonitor({ id: existing.id }).catch(() => undefined);
-  }
+async function deleteMonitor(id, message = {}) {
   let deleted;
-  await mutateMonitors((monitors) => {
+  const result = await mutateMonitors((monitors) => {
     const index = monitors.findIndex((item) => item.id === id);
     if (index >= 0) {
+      const conflict = mutationConflict(monitors[index], message);
+      if (conflict) return conflict;
       deleted = monitors.splice(index, 1)[0];
     }
+    return deleted ? { ok: true, id, deletedIds: [id] } : { ok: false, error: '모니터를 찾을 수 없습니다.' };
   });
-
-  if (!deleted) {
-    return { ok: false, error: '모니터를 찾을 수 없습니다.' };
-  }
-  await releaseUnusedSitePermission(deleted.url);
-  await refreshBadge();
-  await scheduleNextAlarm();
-  return { ok: true };
+  return afterMonitorCommit(result, [['live', () => detachLiveSession(id)], ['permission', () => releaseUnusedSitePermission(deleted.url)], ['badge', () => refreshBadge()], ['schedule', () => scheduleNextAlarm()]]);
 }
 
 async function updateMonitorLabels(message) {
@@ -4860,10 +5658,14 @@ async function updateMonitorLabels(message) {
   let found = 0;
   let updated = 0;
   let skipped = 0;
-  await mutateMonitors((monitors) => {
+  const processedIds = [];
+  const conflictIds = [];
+  const result = await mutateMonitors((monitors) => {
     for (const monitor of monitors) {
       if (!selectedIds.has(monitor.id)) continue;
       found += 1;
+      if (mutationConflict(monitor, message)) { conflictIds.push(monitor.id); continue; }
+      processedIds.push(monitor.id);
       const labels = cleanLabels(monitor.labels);
       const hasLabel = labels.some((item) => item.toLocaleLowerCase('ko-KR') === labelKey);
       if ((mode === 'add' && hasLabel) || (mode === 'remove' && !hasLabel)) {
@@ -4886,17 +5688,10 @@ async function updateMonitorLabels(message) {
       monitor.updatedAt = timestamp;
       updated += 1;
     }
+    const foundIds = new Set([...processedIds, ...conflictIds]);
+    return { ok: true, label, requested: requestedIds.length, found, updated, skipped, missing: requestedIds.length - found, processedIds, conflictIds, failedIds: conflictIds, missingIds: requestedIds.filter((id) => !foundIds.has(id)), unprocessedIds: conflictIds };
   });
-
-  return {
-    ok: true,
-    label,
-    requested: requestedIds.length,
-    found,
-    updated,
-    skipped,
-    missing: requestedIds.length - found
-  };
+  return afterMonitorCommit(result, [['live', () => reconcileLiveSessions()]]);
 }
 
 async function deleteMonitors(message) {
@@ -4906,35 +5701,21 @@ async function deleteMonitors(message) {
   }
 
   const selectedIds = new Set(requestedIds);
-  const existing = (await getMonitors()).filter((monitor) => selectedIds.has(monitor.id));
-  await Promise.all(existing
-    .filter((monitor) => isLiveTracking(monitor))
-    .map((monitor) => stopLiveMonitor({ id: monitor.id }).catch(() => undefined)));
-
   const deleted = [];
-  await mutateMonitors((monitors) => {
+  const conflictIds = [];
+  const result = await mutateMonitors((monitors) => {
     const kept = [];
     for (const monitor of monitors) {
-      if (selectedIds.has(monitor.id)) deleted.push(monitor);
+      if (selectedIds.has(monitor.id) && !mutationConflict(monitor, message)) deleted.push(monitor);
+      else if (selectedIds.has(monitor.id)) { conflictIds.push(monitor.id); kept.push(monitor); }
       else kept.push(monitor);
     }
     monitors.splice(0, monitors.length, ...kept);
+    const deletedIds = deleted.map((monitor) => monitor.id);
+    const foundIds = new Set([...deletedIds, ...conflictIds]);
+    return { ok: true, requested: requestedIds.length, deletedCount: deleted.length, missing: requestedIds.length - foundIds.size, deletedIds, processedIds: deletedIds, conflictIds, failedIds: conflictIds, unprocessedIds: conflictIds, missingIds: requestedIds.filter((id) => !foundIds.has(id)) };
   });
-
-  if (!deleted.length) {
-    return { ok: false, error: '선택한 추적을 찾을 수 없습니다.' };
-  }
-  await Promise.all([...new Set(deleted.map((monitor) => monitor.url))]
-    .map((url) => releaseUnusedSitePermission(url)));
-  await reconcileLiveSessions().catch(() => undefined);
-  await refreshBadge();
-  await scheduleNextAlarm();
-  return {
-    ok: true,
-    requested: requestedIds.length,
-    deletedCount: deleted.length,
-    missing: requestedIds.length - deleted.length
-  };
+  return afterMonitorCommit(result, [['live', () => reconcileLiveSessions()], ['permission', () => Promise.all([...new Set(deleted.map((monitor) => monitor.url))].map((url) => releaseUnusedSitePermission(url)))], ['badge', () => refreshBadge()], ['schedule', () => scheduleNextAlarm()]]);
 }
 
 function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) {
@@ -4951,19 +5732,8 @@ function resetMonitorForPageUrl(monitor, url, timestamp, { copy = false } = {}) 
     selectors: [...monitor.selectors],
     ...(copy ? { createdAt: timestamp } : {}),
     updatedAt: timestamp,
-    lastCheckedAt: null,
-    lastChangedAt: null,
-    nextCheckAt: nextCheckForSchedule(monitor.schedule, null, monitor.intervalHours, timestamp),
-    snapshot: null,
-    lastChange: null,
-    history: [],
-    runs: [],
-    lastReviewAt: null,
-    lastViewedAt: null,
-    lastError: null,
-    lastErrorSnapshot: null,
-    status: 'needs-baseline',
-    unread: false
+    addressHistory: [{ previousUrl: monitor.url, url, movedAt: timestamp }, ...(monitor.addressHistory || [])],
+    nextCheckAt: nextCheckForSchedule(monitor.schedule, monitor.lastCheckedAt, monitor.intervalHours, timestamp)
   };
 }
 
@@ -4977,41 +5747,10 @@ function readMonitorsForExport() {
 }
 
 function persistNormalizedMonitorRepairs() {
-  const operation = storageQueue.catch(() => undefined).then(async () => {
-    const stored = await chrome.storage.local.get(MONITORS_KEY);
-    const rawMonitors = Array.isArray(stored[MONITORS_KEY]) ? stored[MONITORS_KEY] : [];
-    const normalizedMonitors = rawMonitors.map(normalizeMonitor);
-    const monitors = normalizedMonitors.filter(Boolean);
-    // A pre-descriptor/imported automatic monitor can legitimately have no
-    // durable nextCheckAt. Normalize it once in the write queue so a concurrent
-    // import or edit cannot be overwritten by an older read snapshot.
-    const needsSchedulePersistence = rawMonitors.some((raw, index) => {
-      const monitor = normalizedMonitors[index];
-      return Boolean(
-        monitor
-        && monitor.enabled
-        && isAutomaticSchedule(monitor)
-        && !asIso(raw?.nextCheckAt, null)
-        && monitor.nextCheckAt
-      );
-    });
-    const needsHistoryPruning = rawMonitors.some((raw, index) => {
-      const monitor = normalizedMonitors[index];
-      return Boolean(
-        monitor
-        && Array.isArray(raw?.history)
-        && raw.history.length > monitor.history.length
-      );
-    });
-    if (needsSchedulePersistence || needsHistoryPruning) {
-      await chrome.storage.local.set({ [MONITORS_KEY]: monitors });
-      return true;
-    }
-    return false;
-  });
-
-  storageQueue = operation.catch(() => undefined);
-  return operation;
+  return mutateMonitors(async () => {
+    const repository = await loadMonitorRepository();
+    return !repository.migrated || repository.recovery.length > 0;
+  }, { operation: false });
 }
 
 function moveMonitorToSiteHost(monitor, url, timestamp) {
@@ -5060,6 +5799,9 @@ async function reusePageUrl(message, { copy = false } = {}) {
     // action applies to the page group, while each affected monitor preserves
     // its own configuration and reset baseline.
     const currentSources = currentMonitors.filter((monitor) => monitor.url === sourceUrl);
+    if (Array.isArray(message.expectedRevisions) && currentSources.some((monitor) => !message.expectedRevisions.some((expected) => expected.id === monitor.id && expected.revision === monitor.revision))) {
+      return { ok: false, reason: 'outdated', error: '페이지 추적이 변경되었습니다. 대상 범위를 다시 확인해 주세요.' };
+    }
     if (!currentSources.length) {
       return { ok: false, error: '주소를 재사용할 추적 페이지를 찾을 수 없습니다.' };
     }
@@ -5175,48 +5917,43 @@ async function replaceSiteHost(message) {
   return { ok: true, count: result.count };
 }
 
-async function deletePage(urlValue) {
+async function deletePage(urlValue, message = {}) {
   const url = normalizeUrl(urlValue);
   if (!url) return { ok: false, error: '삭제할 페이지 주소가 올바르지 않습니다.' };
 
-  const existing = (await getMonitors()).filter((monitor) => monitor.url === url);
-  await Promise.all(existing
-    .filter((monitor) => isLiveTracking(monitor))
-    .map((monitor) => detachLiveSession(monitor.id)));
   let deleted = [];
-  await mutateMonitors((monitors) => {
+  const conflictIds = [];
+  const result = await mutateMonitors((monitors) => {
     const kept = [];
     for (const monitor of monitors) {
-      if (monitor.url === url) deleted.push(monitor);
+      if (monitor.url === url && !mutationConflict(monitor, message)) deleted.push(monitor);
+      else if (monitor.url === url) { conflictIds.push(monitor.id); kept.push(monitor); }
       else kept.push(monitor);
     }
     monitors.splice(0, monitors.length, ...kept);
+    return { ok: true, deletedCount: deleted.length, deletedIds: deleted.map((monitor) => monitor.id), conflictIds, unprocessedIds: conflictIds };
   });
-  if (!deleted.length) return { ok: false, error: '삭제할 추적 페이지를 찾을 수 없습니다.' };
-
-  await releaseUnusedSitePermission(url);
-  await reconcileLiveSessions().catch(() => undefined);
-  await refreshBadge();
-  await scheduleNextAlarm();
-  return { ok: true, deletedCount: deleted.length };
+  return afterMonitorCommit(result, [['permission', () => releaseUnusedSitePermission(url)], ['live', () => reconcileLiveSessions()], ['badge', () => refreshBadge()], ['schedule', () => scheduleNextAlarm()]]);
 }
 
-async function acknowledgeMonitor(id) {
+async function acknowledgeMonitor(id, message = {}) {
   const viewedAt = nowIso();
-  await mutateMonitors((monitors) => {
+  const result = await mutateMonitors((monitors) => {
     const monitor = monitors.find((item) => item.id === id);
     if (!monitor) {
-      return;
+      return { ok: false, reason: 'missing', error: '추적을 찾을 수 없습니다.' };
     }
+    const conflict = mutationConflict(monitor, message);
+    if (conflict) return conflict;
     monitor.unread = false;
     monitor.lastViewedAt = viewedAt;
     if (monitor.status === 'changed') {
       monitor.status = statusForStoredSnapshot(monitor.snapshot, monitor.tracking);
     }
     monitor.updatedAt = viewedAt;
+    return { ok: true, id, lastChangeId: monitor.lastChange?.id ?? monitor.lastChange?.detectedAt ?? null };
   });
-  await refreshBadge();
-  return { ok: true };
+  return afterMonitorCommit(result, [['badge', () => refreshBadge()]]);
 }
 
 async function openMonitorWindow(id) {
@@ -5245,380 +5982,6 @@ async function openMonitorTab(id) {
   await chrome.tabs.create({ url: monitor.url, active: true });
   await acknowledgeMonitor(id);
   return { ok: true };
-}
-
-async function startImportSession(message) {
-  pruneTransientSessions();
-  const mode = message?.mode === 'replace' ? 'replace' : 'merge';
-  const existingCount = mode === 'merge' ? (await getMonitors()).length : 0;
-  const id = createId();
-  importSessions.set(id, {
-    mode,
-    sourceCount: 0,
-    remainingCapacity: Math.max(0, MAX_MONITORS - existingCount),
-    prepared: [],
-    usedIds: new Set(),
-    fragmentRecords: new Map(),
-    discardedFragmentRecordIds: new Set(),
-    rejected: 0,
-    invalidRejected: 0,
-    capacityRejected: 0,
-    disabledForPermission: 0,
-    expiresAt: Date.now() + IMPORT_SESSION_TTL_MS
-  });
-  return { ok: true, id };
-}
-
-async function prepareImportSessionMonitor(session, raw) {
-  const result = { prepared: 0, rejected: 0, disabledForPermission: 0 };
-  if (session.sourceCount >= MAX_MONITORS) {
-    session.rejected += 1;
-    session.capacityRejected += 1;
-    result.rejected = 1;
-    return result;
-  }
-  session.sourceCount += 1;
-  if (session.prepared.length >= session.remainingCapacity) {
-    session.rejected += 1;
-    session.capacityRejected += 1;
-    result.rejected = 1;
-    return result;
-  }
-  if (!raw || typeof raw !== 'object') {
-    session.rejected += 1;
-    session.invalidRejected += 1;
-    result.rejected = 1;
-    return result;
-  }
-
-  const monitor = normalizeMonitor(raw);
-  if (!monitor) {
-    session.rejected += 1;
-    session.invalidRejected += 1;
-    result.rejected = 1;
-    return result;
-  }
-  try {
-    await validateLocatorList(monitor.locators);
-  } catch {
-    session.rejected += 1;
-    session.invalidRejected += 1;
-    result.rejected = 1;
-    return result;
-  }
-
-  while (session.usedIds.has(monitor.id)) {
-    monitor.id = createId();
-  }
-  session.usedIds.add(monitor.id);
-  monitor.revision = createRevision();
-  if (!monitor.snapshot && monitor.status === 'ok') {
-    monitor.status = 'needs-baseline';
-  }
-  if (monitor.enabled && !await hasSitePermission(monitor.url)) {
-    monitor.enabled = false;
-    monitor.status = 'permission-needed';
-    monitor.lastError = '가져온 추적에는 사이트 접근 권한이 필요합니다.';
-    session.disabledForPermission += 1;
-    result.disabledForPermission = 1;
-  } else if (!monitor.enabled && monitor.status === 'permission-needed') {
-    monitor.status = statusForStoredSnapshot(monitor.snapshot, monitor.tracking);
-    monitor.lastError = null;
-  }
-  session.prepared.push(monitor);
-  result.prepared = 1;
-  return result;
-}
-
-async function appendImportSession(message) {
-  pruneTransientSessions();
-  const session = importSessions.get(message?.id);
-  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
-  const sourceMonitors = Array.isArray(message?.monitors) ? message.monitors : [];
-  const summary = { prepared: 0, rejected: 0, disabledForPermission: 0 };
-
-  for (const raw of sourceMonitors) {
-    const result = await prepareImportSessionMonitor(session, raw);
-    summary.prepared += result.prepared;
-    summary.rejected += result.rejected;
-    summary.disabledForPermission += result.disabledForPermission;
-  }
-
-  session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
-  return { ok: true, ...summary };
-}
-
-function normalizedImportFragment(raw) {
-  if (!raw || typeof raw !== 'object' || typeof raw.recordId !== 'string' || !raw.recordId
-    || !Number.isSafeInteger(raw.fragmentIndex) || raw.fragmentIndex < 0
-    || !Number.isSafeInteger(raw.fragmentCount) || raw.fragmentCount <= 0
-    || raw.fragmentIndex >= raw.fragmentCount || typeof raw.payload !== 'string') {
-    return null;
-  }
-  return raw;
-}
-
-function appendImportFragments(message) {
-  pruneTransientSessions();
-  const session = importSessions.get(message?.id);
-  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
-  const sourceFragments = Array.isArray(message?.fragments) ? message.fragments : [];
-  if (session.prepared.length >= session.remainingCapacity) {
-    session.rejected += sourceFragments.length;
-    session.capacityRejected += sourceFragments.length;
-    session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
-    return { ok: true, received: 0, rejected: sourceFragments.length };
-  }
-  let received = 0;
-  let rejected = 0;
-
-  for (const raw of sourceFragments) {
-    const fragment = normalizedImportFragment(raw);
-    if (!fragment) {
-      session.rejected += 1;
-      session.invalidRejected += 1;
-      rejected += 1;
-      continue;
-    }
-    let record = session.fragmentRecords.get(fragment.recordId);
-    if (!record) {
-      if (session.prepared.length + session.fragmentRecords.size >= session.remainingCapacity) {
-        if (!session.discardedFragmentRecordIds.has(fragment.recordId)) {
-          session.discardedFragmentRecordIds.add(fragment.recordId);
-          session.rejected += 1;
-          session.capacityRejected += 1;
-          rejected += 1;
-        }
-        continue;
-      }
-      record = { fragmentCount: fragment.fragmentCount, pieces: new Map(), invalid: false };
-      session.fragmentRecords.set(fragment.recordId, record);
-    }
-    if (record.fragmentCount !== fragment.fragmentCount) {
-      record.invalid = true;
-      continue;
-    }
-    const existing = record.pieces.get(fragment.fragmentIndex);
-    if (existing !== undefined && existing !== fragment.payload) {
-      record.invalid = true;
-      continue;
-    }
-    record.pieces.set(fragment.fragmentIndex, fragment.payload);
-    received += 1;
-  }
-
-  session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
-  return { ok: true, received, rejected };
-}
-
-function touchImportSession(message) {
-  pruneTransientSessions();
-  const session = importSessions.get(message?.id);
-  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
-  session.expiresAt = Date.now() + IMPORT_SESSION_TTL_MS;
-  return { ok: true };
-}
-
-async function prepareFragmentedImportRecords(session) {
-  for (const [recordId, record] of session.fragmentRecords) {
-    // Release each payload before normalizing it so only the remaining
-    // fragmented records occupy session memory.
-    session.fragmentRecords.delete(recordId);
-    if (record.invalid || record.pieces.size !== record.fragmentCount) {
-      session.rejected += 1;
-      session.invalidRejected += 1;
-      continue;
-    }
-    const pieces = [];
-    let complete = true;
-    for (let index = 0; index < record.fragmentCount; index += 1) {
-      const payload = record.pieces.get(index);
-      if (payload === undefined) {
-        complete = false;
-        break;
-      }
-      pieces.push(payload);
-    }
-    if (!complete) {
-      session.rejected += 1;
-      session.invalidRejected += 1;
-      continue;
-    }
-    try {
-      await prepareImportSessionMonitor(session, JSON.parse(pieces.join('')));
-    } catch {
-      session.rejected += 1;
-      session.invalidRejected += 1;
-    }
-  }
-  session.fragmentRecords.clear();
-}
-
-async function finishImportSession(message) {
-  pruneTransientSessions();
-  const session = importSessions.get(message?.id);
-  if (!session) return { ok: false, reason: 'expired', error: '불러오기 작업이 만료되었습니다. 파일을 다시 선택해 주세요.' };
-  importSessions.delete(message.id);
-  const beforeImport = session.mode === 'replace' ? await getMonitors() : [];
-  let imported = 0;
-  try {
-    await prepareFragmentedImportRecords(session);
-    let rejected = session.rejected;
-    if (message?.requireAllValid && (session.invalidRejected > 0 || session.capacityRejected > 0)) {
-      const reason = session.invalidRejected > 0
-        ? `손상되거나 유효하지 않은 추적 ${session.invalidRejected}개를 발견했습니다.`
-        : '현재 저장된 추적과 합치면 최대 5,000개 한도를 넘습니다.';
-      return {
-        ok: false,
-        reason: session.invalidRejected > 0 ? 'invalid-backup' : 'capacity',
-        error: `백업에서 ${reason} 기존 데이터는 변경하지 않았습니다.`
-      };
-    }
-    const result = await mutateMonitors((monitors) => {
-      const existingCount = session.mode === 'replace' ? 0 : monitors.length;
-      if (message?.requireAllValid && existingCount + session.prepared.length > MAX_MONITORS) {
-        throw new Error('불러오기 도중 저장된 추적 수가 바뀌어 최대 5,000개 한도를 넘습니다. 기존 데이터는 변경하지 않았습니다.');
-      }
-      if (session.mode === 'replace') {
-        monitors.splice(0, monitors.length);
-      }
-      const usedMonitorIds = new Set(monitors.map((monitor) => monitor.id));
-      for (const preparedMonitor of session.prepared) {
-        const monitor = {
-          ...preparedMonitor,
-          selectors: [...preparedMonitor.selectors],
-          locators: preparedMonitor.locators.map((locator) => ({
-            ...locator,
-            framePath: locator.framePath.map((part) => ({ ...part })),
-            fields: locator.fields.map((field) => ({ ...field }))
-          }))
-        };
-        while (usedMonitorIds.has(monitor.id)) {
-          monitor.id = createId();
-        }
-        if (monitors.length < MAX_MONITORS) {
-          monitors.push(monitor);
-          usedMonitorIds.add(monitor.id);
-          imported += 1;
-        } else {
-          rejected += 1;
-        }
-      }
-      return { ok: true, imported, rejected, disabledForPermission: session.disabledForPermission };
-    });
-    const finalization = await finalizeImportedMonitors(beforeImport);
-    return {
-      ...result,
-      committed: true,
-      finalizationWarnings: finalization.warnings
-    };
-  } finally {
-    session.prepared.length = 0;
-    session.usedIds.clear();
-    session.fragmentRecords.clear();
-    session.discardedFragmentRecordIds.clear();
-  }
-}
-
-function abortImportSession(message) {
-  const session = importSessions.get(message?.id);
-  if (session) {
-    session.prepared.length = 0;
-    session.usedIds.clear();
-    session.fragmentRecords.clear();
-    session.discardedFragmentRecordIds.clear();
-  }
-  importSessions.delete(message?.id);
-  return { ok: true };
-}
-
-async function importMonitors(message) {
-  const beforeImport = await getMonitors();
-  const sourceMonitors = Array.isArray(message.monitors) ? message.monitors : [];
-  const rawMonitors = sourceMonitors.slice(0, MAX_MONITORS);
-  const prepared = [];
-  const usedIds = new Set();
-  let rejected = Math.max(0, sourceMonitors.length - MAX_MONITORS);
-  let imported = 0;
-  let disabledForPermission = 0;
-
-  for (const raw of rawMonitors) {
-    if (!raw || typeof raw !== 'object') {
-      rejected += 1;
-      continue;
-    }
-
-    const monitor = normalizeMonitor(raw);
-    if (!monitor) {
-      rejected += 1;
-      continue;
-    }
-    try {
-      await validateLocatorList(monitor.locators);
-    } catch {
-      rejected += 1;
-      continue;
-    }
-
-    while (usedIds.has(monitor.id)) {
-      monitor.id = createId();
-    }
-    usedIds.add(monitor.id);
-    monitor.revision = createRevision();
-
-    if (!monitor.snapshot && monitor.status === 'ok') {
-      monitor.status = 'needs-baseline';
-    }
-    if (monitor.enabled && !await hasSitePermission(monitor.url)) {
-      monitor.enabled = false;
-      monitor.status = 'permission-needed';
-      monitor.lastError = '가져온 추적에 이 사이트의 접근 권한이 필요합니다.';
-      disabledForPermission += 1;
-    } else if (!monitor.enabled && monitor.status === 'permission-needed') {
-      monitor.status = statusForStoredSnapshot(monitor.snapshot, monitor.tracking);
-      monitor.lastError = null;
-    }
-    prepared.push(monitor);
-  }
-
-  const result = await mutateMonitors((monitors) => {
-    if (message.mode === 'replace') {
-      monitors.splice(0, monitors.length);
-    }
-    const usedMonitorIds = new Set(monitors.map((monitor) => monitor.id));
-
-    for (const preparedMonitor of prepared) {
-      const monitor = {
-        ...preparedMonitor,
-        selectors: [...preparedMonitor.selectors],
-        locators: preparedMonitor.locators.map((locator) => ({
-          ...locator,
-          framePath: locator.framePath.map((part) => ({ ...part })),
-          fields: locator.fields.map((field) => ({ ...field }))
-        }))
-      };
-      // Importing is additive in merge mode. URLs are intentionally not a
-      // uniqueness key; only the persistent monitor id must be unique.
-      while (usedMonitorIds.has(monitor.id)) {
-        monitor.id = createId();
-      }
-
-      if (monitors.length < MAX_MONITORS) {
-        monitors.push(monitor);
-        usedMonitorIds.add(monitor.id);
-        imported += 1;
-      } else {
-        rejected += 1;
-      }
-    }
-    return { ok: true, imported, rejected, disabledForPermission };
-  });
-
-  let finalization = { warnings: 0 };
-  if (!message.deferFinalization) {
-    finalization = await finalizeImportedMonitors(beforeImport);
-  }
-  return { ...result, committed: true, finalizationWarnings: finalization.warnings };
 }
 
 // Dashboard imports can arrive in small messages so structured cloning and
@@ -5684,24 +6047,144 @@ async function startPicker(tabId, url) {
   return { ok: true };
 }
 
+function runtimeStatusForMonitor(monitor) {
+  const session = liveSessions.get(monitor.id);
+  const backoff = storageFailureBackoff.get(monitor.id);
+  return { checking: checksInProgress.has(monitor.id), queued: captureTasks.has(monitor.id) && !checksInProgress.has(monitor.id), queuedAt: captureQueuedAt.get(monitor.id) || null, liveConnection: !isLiveTracking(monitor) ? null : session ? session.navigating ? 'loading' : 'observing' : monitor.enabled ? 'pending' : 'paused', retryAt: backoff ? new Date(backoff.retryAt).toISOString() : null };
+}
+
+async function getRuntimeStatus() {
+  const owned = await getLiveOwnedTabs();
+  const jobs = await captureJobRecords();
+  const pending = [...Object.entries(owned).filter(([, entry]) => ['pendingCleanup', 'ownership-unverified'].includes(entry.stage)).map(([id, entry]) => ({ ...entry, id, kind: 'live' })), ...jobs.filter((job) => ['pendingCleanup', 'ownership-unverified'].includes(job.stage)).map((job) => ({ ...job, kind: 'capture' }))];
+  const pendingCleanup = await Promise.all(pending.map(async (entry) => {
+    const tab = await tabById(entry.tabId);
+    const monitor = typeof getMonitorMetadataById === 'function' ? await getMonitorMetadataById(entry.id) : await getMonitorById(entry.id);
+    return { id: entry.id, monitorId: entry.id, kind: entry.kind, tabId: entry.tabId, stage: entry.stage, url: entry.url, revision: entry.revision, monitorRevision: monitor?.revision, ownerToken: entry.ownerToken, createdAt: entry.createdAt, candidate: tab ? { id: tab.id, url: tab.url, pinned: tab.pinned === true } : null, canAdopt: entry.kind === 'live' && monitor?.enabled && isLiveTracking(monitor) && normalizeUrl(tab?.url) === entry.url && monitor.url === entry.url && tab?.pinned === true };
+  }));
+  const oldestQueuedAt = [...captureQueuedAt.values()].sort()[0] || null;
+  return { ok: true, activeCaptures, queuedCaptures: captureQueue.length, oldestQueuedAt, oldestQueueWaitMilliseconds: oldestQueuedAt ? Math.max(0, Date.now() - Date.parse(oldestQueuedAt)) : 0, globalLimit: MAX_GLOBAL_CAPTURES, originLimit: MAX_ORIGIN_CAPTURES, residentLiveTabs: liveSessions.size, residentLimit: MAX_RESIDENT_LIVE_TABS, storageRetryAt: storageUnavailableUntil > Date.now() ? new Date(storageUnavailableUntil).toISOString() : null, pendingCaptureCount: pendingSnapshotCommits.size, pendingCaptureBytes, pendingCaptureByteLimit: MAX_PENDING_CAPTURE_BYTES, pendingCleanup, jobs: jobs.map((job) => ({ id: job.id, stage: job.stage, createdAt: job.createdAt })), backoff: [...storageFailureBackoff].map(([id, entry]) => ({ id, ...entry })) };
+}
+
+function reconcileRuntimeOwnership(message) {
+  const id = cleanShortText(message?.monitorId ?? message?.id, 100);
+  return queueLiveLifecycle(id, () => reconcileRuntimeOwnershipInternal(id, message));
+}
+
+async function reconcileRuntimeOwnershipInternal(id, message) {
+  const action = message?.action;
+  if (!id || !['adopt', 'release', 'retry-cleanup', 'cleanup'].includes(action)) return { ok: false, error: '탭 복구 작업을 확인해 주세요.' };
+  const owned = await getLiveOwnedTabs();
+  const kind = message?.kind === 'capture' ? 'capture' : owned[id] ? 'live' : 'capture';
+  const entry = kind === 'live' ? owned[id] : await getRuntimeAux('jobs', `capture.${id}`);
+  if (!entry) return { ok: true, committed: true, monitorId: id, alreadyResolved: true };
+  if (Number(message.tabId) !== entry.tabId || message.ownerToken && message.ownerToken !== entry.ownerToken) return { ok: false, reason: 'conflict', error: '복구할 탭 정보가 변경되었습니다. 목록을 다시 불러와 주세요.' };
+  const tab = await tabById(entry.tabId);
+  if (action === 'adopt') {
+    const monitor = await getMonitorById(id);
+    const conflict = mutationConflict(monitor, message);
+    if (conflict) return conflict;
+    if (kind !== 'live' || !monitor?.enabled || !isLiveTracking(monitor) || !tab || normalizeUrl(tab.url) !== entry.url || monitor.url !== entry.url || tab.pinned !== true) return { ok: false, reason: 'ownership-mismatch', error: '저장된 주소와 일치하는 고정 탭만 다시 연결할 수 있습니다.' };
+    const sessionId = await runtimeSessionId();
+    await mutateLiveOwnedTabs((all) => { if (all[id]?.tabId === entry.tabId) all[id] = { ...all[id], revision: monitor.revision, sessionId, stage: 'loading' }; });
+    // Already within this monitor's lifecycle queue; do not enqueue recursively.
+    return afterMonitorCommit({ ok: true, monitorId: id, tabId: entry.tabId, adopted: true }, [['live', () => startLiveMonitorInternal({ id })]]);
+  }
+  if (action !== 'release' && tab) {
+    // An explicit cleanup click still validates the shown candidate before
+    // removing it; a reused tab ID at a different URL is never closed.
+    if (normalizeUrl(tab.url) !== entry.url || tab.pinned !== true) return { ok: false, reason: 'ownership-mismatch', error: '탭 주소 또는 고정 상태가 변경되었습니다. 기록 해제만 가능합니다.' };
+    if (!await removeLiveControlledTab(entry.tabId)) return { ok: false, reason: 'pending-cleanup', pendingCleanup: true, error: '탭을 닫지 못했습니다. 정리 기록을 유지했습니다.' };
+  }
+  if (kind === 'live') {
+    // release deliberately leaves the candidate tab open and relinquishes all
+    // extension ownership. It does not create a replacement until the next
+    // normal recovery cycle.
+    const session = liveSessions.get(id);
+    if (action === 'release' && session?.frameIds?.size) await chrome.scripting.executeScript({ target: liveTarget(session.tabId, [...session.frameIds]), func: removeLiveMutationObserver, args: [id] }).catch(() => undefined);
+    liveSessions.delete(id); liveDirtyByMonitor.delete(id);
+    await forgetLiveControlledTab(id, entry.tabId);
+  } else await deleteRuntimeAux('jobs', `capture.${id}`);
+  return { ok: true, committed: true, monitorId: id, tabId: entry.tabId, released: action === 'release', cleaned: action !== 'release' };
+}
+
+function recoverRuntime(options = {}) {
+  if (runtimeRecoveryPromise) return runtimeRecoveryPromise;
+  recoveringRuntime = true;
+  runtimeRecoveryPromise = recoverRuntimeInternal(options).finally(() => {
+    recoveringRuntime = false;
+    runtimeRecoveryPromise = null;
+    drainCaptureQueue();
+  });
+  return runtimeRecoveryPromise;
+}
+
+async function recoverRuntimeInternal({ startup = false } = {}) {
+  await runtimePersistenceQueue.catch(() => undefined);
+  const checkpoint = await getRuntimeAux('runtime', 'checkpoint') || { jobs: {}, backoff: {} };
+  if (Number(checkpoint.storageRetryAt) > Date.now()) storageUnavailableUntil = Math.max(storageUnavailableUntil, checkpoint.storageRetryAt);
+  for (const [id, entry] of Object.entries(checkpoint.backoff || {})) storageFailureBackoff.set(id, entry);
+  const resumed = [];
+  for (const job of await captureJobRecords()) {
+    const id = job.id;
+    if (captureTasks.has(id)) continue;
+    // A persisted job absent from this worker's task map was interrupted (or
+    // failed before starting), regardless of its wall-clock age.
+    if (Number.isInteger(job.tabId)) {
+      const tab = await tabById(job.tabId);
+      if (tab && job.sessionId !== await runtimeSessionId()) {
+        await putRuntimeAux('jobs', `capture.${id}`, { ...job, stage: 'ownership-unverified' });
+        continue;
+      }
+      if (tab && !await removeLiveControlledTab(job.tabId)) {
+        await putRuntimeAux('jobs', `capture.${id}`, { ...job, stage: 'pendingCleanup' });
+        continue;
+      }
+    }
+    await putRuntimeAux('jobs', `capture.${id}`, { ...job, stage: 'resumable', tabId: null });
+    resumed.push(job);
+  }
+  recoveringRuntime = false;
+  drainCaptureQueue();
+  await reconcileLiveControlledTabs(await getMonitors());
+  await restoreLiveMonitoring();
+  for (const job of resumed) {
+    const monitor = typeof getMonitorMetadataById === 'function' ? await getMonitorMetadataById(job.id) : await getMonitorById(job.id);
+    if (!monitor?.enabled) await deleteRuntimeAux('jobs', `capture.${job.id}`);
+    else if ((storageFailureBackoff.get(job.id)?.retryAt || 0) <= Date.now()) void checkMonitor(job.id, { reschedule: false, source: job.source === 'live' ? 'scheduled' : job.source }).catch(() => undefined);
+  }
+  for (const [id, dirty] of Object.entries(checkpoint.dirty || {})) {
+    const monitor = typeof getMonitorMetadataById === 'function' ? await getMonitorMetadataById(id) : await getMonitorById(id);
+    const session = liveSessions.get(id);
+    if (monitor?.enabled && monitor.revision === dirty.revision && session?.tabId === dirty.tabId) void requestLiveCapture(monitor, session.tabId, dirty.frameIds?.[0] || 0).catch(() => undefined);
+  }
+  return { resumed: resumed.length };
+}
+
 const messageHandlers = {
   'get-state': async () => ({ ok: true, ...(await getState()) }),
   'start-dashboard-load': () => startDashboardLoad(),
   'get-dashboard-load-page': (message) => getDashboardLoadPage(message),
   'finish-dashboard-load': (message) => finishDashboardLoad(message),
   'get-monitor-detail': (message) => getMonitorDetail(message.id),
+  'get-monitor-detail-fragment': (message) => getMonitorDetailFragment(message),
+  'finish-monitor-detail': async (message) => { await OpenStillRecordStore.deleteAux('staging', 'detail:' + message.detailToken); return { ok: true }; },
+  'get-monitor-summaries': (message) => getMonitorSummaryPage(message),
+  'get-recovery-status': () => recoveryStatus(),
+  'restore-recovery-record': (message) => restoreRecoveryRecord(message),
   'get-popup-state': () => getPopupState(),
-  'start-export-session': () => startExportSession(),
+  'start-export-session': (message) => startExportSession(message),
   'get-export-monitor': (message) => getExportMonitor(message),
   'get-export-monitor-fragment': (message) => getExportMonitorFragment(message),
   'touch-export-session': (message) => touchExportSession(message),
+  'checkpoint-export-session': (message) => checkpointExportSession(message),
   'finish-export-session': (message) => finishExportSession(message),
   'start-picker': (message) => startPicker(message.tabId, message.url),
   'create-monitor': (message, sender) => createMonitor(message, sender),
   'create-monitors': (message, sender) => createMonitors(message, sender),
   'save-monitor': (message) => saveMonitor(message),
   'set-monitor-enabled': (message) => setMonitorEnabled(message),
-  'delete-monitor': (message) => deleteMonitor(message.id),
+  'delete-monitor': (message) => deleteMonitor(message.id, message),
   'delete-monitors': (message) => deleteMonitors(message),
   'update-monitor-labels': (message) => updateMonitorLabels(message),
   'check-monitor': (message) => checkMonitor(message.id),
@@ -5713,8 +6196,8 @@ const messageHandlers = {
   'move-page-url': (message) => reusePageUrl(message),
   'copy-page-url': (message) => reusePageUrl(message, { copy: true }),
   'replace-site-host': (message) => replaceSiteHost(message),
-  'delete-page': (message) => deletePage(message.url),
-  'acknowledge-monitor': (message) => acknowledgeMonitor(message.id),
+  'delete-page': (message) => deletePage(message.url, message),
+  'acknowledge-monitor': (message) => acknowledgeMonitor(message.id, message),
   'open-monitor-window': (message) => openMonitorWindow(message.id),
   'open-monitor-tab': (message) => openMonitorTab(message.id),
   'import-monitors': (message) => importMonitors(message),
@@ -5727,8 +6210,13 @@ const messageHandlers = {
   'finalize-import': () => finalizeImportedMonitors(),
   'open-dashboard': () => openDashboard(),
   'release-unclaimed-origin': (message, sender) => releaseUnclaimedOrigin(message, sender),
-  'save-settings': async (message) => ({ ok: true, settings: await updateSettings(message.settings) })
+  'save-settings': async (message) => ({ ok: true, committed: true, settings: await updateSettings(message.settings) }),
+  'get-operation-result': async (message) => { const receipt = await getRuntimeAux('operations', message.operationId); return receipt ? { ok: true, found: true, ...receipt.result, committed: true, operationId: message.operationId } : { ok: true, found: false }; },
+  'get-runtime-status': () => getRuntimeStatus(),
+  'reconcile-runtime-ownership': (message) => reconcileRuntimeOwnership(message)
 };
+
+const mutationMessageTypes = new Set(['create-monitor', 'create-monitors', 'save-monitor', 'set-monitor-enabled', 'delete-monitor', 'delete-monitors', 'update-monitor-labels', 'move-page-url', 'copy-page-url', 'replace-site-host', 'delete-page', 'acknowledge-monitor', 'import-monitors', 'finish-import-session', 'save-settings', 'reconcile-runtime-ownership']);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const handler = messageHandlers[message?.type];
@@ -5736,7 +6224,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return;
   }
 
-  Promise.resolve(handler(message, _sender)).then(sendResponse).catch((error) => {
+  Promise.resolve(mutationMessageTypes.has(message.type) ? runMutationOperation(message, () => handler(message, _sender)) : handler(message, _sender)).then(sendResponse).catch((error) => {
     sendResponse({ ok: false, error: responseError(error) });
   });
   return true;
@@ -5744,7 +6232,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
-    void runDueChecks();
+    void runDueChecks().catch(() => undefined);
+  } else if (alarm.name === RUNTIME_ALARM_NAME) {
+    void recoverRuntime().then(() => runDueChecks()).catch(() => undefined);
   }
 });
 
@@ -5761,6 +6251,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (session.tabId === tabId) {
       liveSessions.delete(monitorId);
       liveDirtyByMonitor.delete(monitorId);
+      // onRemoved follows successful extension cleanup as well. Only a
+      // still-enabled live configuration is eligible for reconnection.
+      void getMonitorById(monitorId).then((monitor) => {
+        if (monitor?.enabled && isLiveTracking(monitor)) return startLiveMonitor({ id: monitorId });
+      }).catch(() => undefined);
     }
   }
 });
@@ -5817,19 +6312,27 @@ if (chrome.webNavigation?.onHistoryStateUpdated) {
   });
 }
 
-async function initialize({ cleanupPermissions = false } = {}) {
-  if (chrome.storage.local.setAccessLevel) {
-    await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
-  }
-  await migrateLegacyScheduleModes();
-  await persistNormalizedMonitorRepairs();
-  await refreshBadge();
-  await clearExpiredPendingPickers();
-  if (cleanupPermissions) {
-    await cleanupUnusedSitePermissions();
-  }
-  await scheduleNextAlarm();
-  await restoreLiveMonitoring().catch(() => undefined);
+function initialize({ cleanupPermissions = false } = {}) {
+  initializationPermissionCleanup ||= cleanupPermissions;
+  if (initializationPromise) return initializationPromise;
+  initializationPromise = (async () => {
+    const warnings = [];
+    const run = async (step, action) => { try { await action(); } catch (error) { warnings.push({ step, error: responseError(error) }); } };
+    await run('storage-access', async () => { if (chrome.storage.local.setAccessLevel) await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }); });
+    await run('migration', () => migrateLegacyScheduleModes());
+    await run('repairs', () => persistNormalizedMonitorRepairs());
+    await run('runtime-recovery', () => recoverRuntime({ startup: true }));
+    await run('schedule', () => scheduleNextAlarm());
+    await run('recovery-wakeup', () => chrome.alarms.create(RUNTIME_ALARM_NAME, { periodInMinutes: 1 }));
+    await run('badge', () => refreshBadge());
+    await run('pickers', () => clearExpiredPendingPickers());
+    if (initializationPermissionCleanup) await run('permissions', () => cleanupUnusedSitePermissions());
+    initializationPermissionCleanup = false;
+    if (warnings.length) await putRuntimeAux('runtime', 'diagnostics', { at: nowIso(), warnings }).catch(() => undefined);
+    return { ok: true, warnings };
+  })();
+  initializationPromise.finally(() => { initializationPromise = null; }).catch(() => undefined);
+  return initializationPromise;
 }
 
 chrome.runtime.onInstalled.addListener(() => {

@@ -20,17 +20,23 @@ $extensionFiles = @(
   'LICENSE',
   'THIRD_PARTY_NOTICES.md',
   'service-worker.js',
+  'record-store.js',
+  'import-session.js',
+  'export-session.js',
+  'recovery-json.js',
   'backup-integrity.js',
   'selector-engine.js',
   'picker.js',
   'offscreen.html',
   'offscreen.js',
+  'regexp-worker.js',
   'popup.html',
   'popup.css',
   'popup.js',
   'dashboard.html',
   'dashboard.css',
   'dashboard.js',
+  'dashboard-core.js',
   'import-worker.js'
 )
 

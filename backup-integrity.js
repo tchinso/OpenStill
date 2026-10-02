@@ -9,7 +9,7 @@
   'use strict';
 
   const FORMAT = 'openstill-export';
-  const SCHEMA_VERSION = 4;
+  const SCHEMA_VERSION = 5;
   const INTEGRITY_VERSION = 1;
   // Two CRC32 groups are used here as an accidental-corruption check, like a
   // ZIP file's CRC. They are incremental, so a 32 MiB backup part does not
@@ -156,7 +156,8 @@
     fragmentCount,
     finalPart = false,
     totalParts,
-    totalMonitors
+    totalMonitors,
+    envelope
   }) {
     if (!Number.isSafeInteger(monitorCount) || monitorCount < 0
       || !Number.isSafeInteger(fragmentCount) || fragmentCount < 0
@@ -167,7 +168,7 @@
       || !Number.isSafeInteger(totalMonitors) || totalMonitors < 0)) {
       throw new TypeError('마지막 백업 part의 전체 개수 정보가 올바르지 않습니다.');
     }
-    return {
+    const metadata = {
       version: INTEGRITY_VERSION,
       ...finishChecksum(state),
       monitorCount,
@@ -175,19 +176,33 @@
       finalPart,
       ...(finalPart ? { totalParts, totalMonitors } : {})
     };
+    if (envelope) {
+      metadata.version = 2;
+      metadata.envelopeDigest = envelopeDigest(envelope, metadata);
+    }
+    return metadata;
+  }
+  function envelopeDigest(envelope, integrity) {
+    const state = createCrcState();
+    const { envelopeDigest: ignored, ...metadata } = integrity;
+    appendUtf8(state, JSON.stringify({ format: envelope.format, schemaVersion: envelope.schemaVersion,
+      exportedAt: envelope.exportedAt, exportId: envelope.exportId, part: envelope.part,
+      integrityRequired: envelope.integrityRequired, previousPartDigest: envelope.previousPartDigest || null,
+      manifest: envelope.manifest || null, integrity: metadata }));
+    return finishCrc(state);
   }
 
   function invalidPart(error, code = 'invalid-integrity') {
     return { ok: false, code, error };
   }
 
-  function inspectBackupPart(payload) {
+  function inspectBackupPart(payload, streamed = null) {
     const carriesIntegrity = payload && typeof payload === 'object'
       && (payload.integrityRequired === true || Object.prototype.hasOwnProperty.call(payload, 'integrity'));
-    if (carriesIntegrity && (payload.format !== FORMAT || payload.schemaVersion !== SCHEMA_VERSION)) {
+    if (carriesIntegrity && (payload.format !== FORMAT || ![4, SCHEMA_VERSION].includes(payload.schemaVersion))) {
       return invalidPart('백업의 형식 또는 스키마 버전이 무결성 정보와 일치하지 않습니다.', 'schema-downgrade');
     }
-    if (payload?.format !== FORMAT || payload?.schemaVersion !== SCHEMA_VERSION) {
+    if (payload?.format !== FORMAT || ![4, SCHEMA_VERSION].includes(payload?.schemaVersion)) {
       return { ok: true, part: null };
     }
 
@@ -219,7 +234,7 @@
 
     const integrity = payload.integrity;
     if (!integrity || typeof integrity !== 'object'
-      || integrity.version !== INTEGRITY_VERSION
+      || ![INTEGRITY_VERSION, 2].includes(integrity.version)
       || integrity.algorithm !== ALGORITHM
       || !/^[0-9a-f]{16}$/i.test(integrity.checksum ?? '')
       || !Number.isSafeInteger(integrity.payloadBytes) || integrity.payloadBytes < 0
@@ -228,8 +243,8 @@
       || typeof integrity.finalPart !== 'boolean') {
       return invalidPart('백업 part의 무결성 정보가 손상되었습니다.');
     }
-    if (integrity.monitorCount !== payload.monitors.length
-      || integrity.fragmentCount !== payload.fragments.length) {
+    if (integrity.monitorCount !== (streamed?.monitorCount ?? payload.monitors.length)
+      || integrity.fragmentCount !== (streamed?.fragmentCount ?? payload.fragments.length)) {
       return invalidPart('백업 part의 레코드 수가 무결성 정보와 일치하지 않습니다.', 'count-mismatch');
     }
 
@@ -245,7 +260,7 @@
 
     let actual;
     try {
-      actual = checksumPayload(payload.monitors, payload.fragments);
+      actual = streamed?.checksum || checksumPayload(payload.monitors, payload.fragments);
     } catch {
       return invalidPart('백업 part의 체크섬을 계산하지 못했습니다.');
     }
@@ -253,19 +268,27 @@
       || actual.payloadBytes !== integrity.payloadBytes) {
       return invalidPart('백업 part의 내용이 손상되었거나 저장 중 변경되었습니다.', 'checksum-mismatch');
     }
+    if (integrity.version === 2 && integrity.envelopeDigest !== envelopeDigest(payload, integrity)) {
+      return invalidPart('백업 순서·식별·완료 정보의 지문이 일치하지 않습니다.', 'envelope-mismatch');
+    }
 
     return {
       ok: true,
       part: {
         verified: true,
+        digest: integrity.envelopeDigest || integrity.checksum,
+        envelopeVerified: integrity.version === 2,
+        previousPartDigest: payload.previousPartDigest || null,
+        manifest: payload.manifest || null,
         exportId: payload.exportId,
         exportedAt: payload.exportedAt,
         part: payload.part,
         finalPart: integrity.finalPart,
         totalParts: integrity.finalPart ? integrity.totalParts : null,
         totalMonitors: integrity.finalPart ? integrity.totalMonitors : null,
-        logicalMonitorCount: payload.monitors.length
+        logicalMonitorCount: streamed?.logicalMonitorCount ?? (payload.monitors.length
           + payload.fragments.filter((fragment) => fragment?.fragmentIndex === 0).length
+        )
       }
     };
   }
@@ -341,6 +364,13 @@
         );
       }
       const finalPart = finalParts[0];
+      if (finalPart.envelopeVerified) {
+        if (!Array.isArray(finalPart.manifest) || finalPart.manifest.length !== sorted.length - 1
+          || sorted.slice(0, -1).some((part, index) => finalPart.manifest[index] !== part.digest)
+          || sorted.some((part, index) => index > 0 && part.previousPartDigest !== sorted[index - 1].digest)) {
+          return failedSelection('manifest-mismatch', '백업 세트의 part 연결 또는 manifest가 일치하지 않습니다.', { exportId });
+        }
+      }
       if (sorted.length !== finalPart.totalParts) {
         let expected = 1;
         for (const part of sorted) {
@@ -374,6 +404,23 @@
 
     return { ok: true };
   }
+  function recoverBackupPartSelection(parts) {
+    const groups = new Map(); const diagnostics = []; const accepted = [];
+    for (const part of parts.filter(Boolean)) {
+      if (!groups.has(part.exportId)) groups.set(part.exportId, new Map());
+      const group = groups.get(part.exportId);
+      const prior = group.get(part.part);
+      if (prior) {
+        if (prior.digest && prior.digest === part.digest) diagnostics.push({ code: 'duplicate-identical', source: part.sourceName, part: part.part, exportId: part.exportId });
+        else diagnostics.push({ code: 'duplicate-conflict', source: part.sourceName, part: part.part, exportId: part.exportId, error: '같은 part 번호의 다른 원본을 모두 보관했습니다.' });
+      } else { group.set(part.part, part); accepted.push(part); }
+    }
+    for (const [exportId, group] of groups) {
+      const validation = validateBackupPartSelection([...group.values()]);
+      if (!validation.ok) diagnostics.push({ ...validation, exportId });
+    }
+    return { ok: true, complete: diagnostics.every((item) => item.code === 'duplicate-identical'), parts: accepted, diagnostics };
+  }
 
   return Object.freeze({
     ALGORITHM,
@@ -387,6 +434,8 @@
     createChecksumState,
     finishChecksum,
     inspectBackupPart,
+    envelopeDigest,
+    recoverBackupPartSelection,
     validateBackupPartSelection
   });
 });

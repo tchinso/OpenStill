@@ -40,6 +40,15 @@
     return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
   }
 
+  function selectorStabilityHint(selector, selectorType) {
+    // Quoted attribute values/text are evidence, not positional operators.
+    const expression = String(selector ?? '').replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, '');
+    const positional = normalizedSelectorType(selectorType) === 'xpath'
+      ? /\[\s*\d+\s*\]|\b(?:position|last)\s*\(/.test(expression)
+      : /(?<!\\):(?:nth-(?:last-)?(?:child|of-type)|(?:first|last|only)-(?:child|of-type)|eq|lt|gt|first|last|even|odd)\b/.test(expression);
+    return positional ? '요소 순서에 의존하는 선택자입니다. 목록 순서나 구성이 바뀌면 다른 요소를 가리킬 수 있습니다.' : '';
+  }
+
   function cleanSnapshotText(value, maxLength = 10_000) {
     return String(value ?? '')
       .replace(/\r\n?/g, '\n')
@@ -859,6 +868,7 @@
           .selection-item button { text-align: left; color: #d8e6f6; background: transparent; min-width: 0; }
           .selection-item .selection-css { display: block; overflow: hidden; color: #a9c8fb; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
           .selection-item .selection-text { display: block; overflow: hidden; margin-top: 2px; color: #8498b0; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+          .selection-item .selection-stability-hint { display: block; margin-top: 5px; color: #f1cf87; font-size: 11px; line-height: 1.4; }
           .remove-selection { width: 26px; height: 26px; color: #ffb5ad !important; border-radius: 6px; font-size: 16px; text-align: center !important; }
           .match.selected { border-color: #42dda3; background: rgb(66 221 163 / 10%); }
           .match.selected.excluded { border-color: #ff8b7b; background: rgb(255 92 92 / 12%); border-style: dashed; }
@@ -1481,6 +1491,14 @@
         selectButton.append(css, preview);
         const matchCount = selection.totalMatchCount ?? selection.matchCount ?? 0;
         preview.textContent = `${matchCount}개 일치 · ${cleanText(selection.text, 130) || '(텍스트 없음)'}`;
+        const stabilityHint = selectorStabilityHint(selection.selector, selection.selectorType);
+        if (stabilityHint) {
+          const hint = document.createElement('span');
+          hint.className = 'selection-stability-hint';
+          hint.setAttribute('role', 'note');
+          hint.textContent = stabilityHint;
+          selectButton.append(hint);
+        }
         const removeButton = document.createElement('button');
         removeButton.type = 'button';
         removeButton.className = 'remove-selection';

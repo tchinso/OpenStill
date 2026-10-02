@@ -1,44 +1,50 @@
 'use strict';
-
-importScripts('backup-integrity.js');
-
-// JSON parsing can be noticeably expensive even when the file is read
-// asynchronously. Keep it out of the dashboard document so its progress UI
-// and cancel/error feedback continue to paint while a backup part is decoded.
-function readFileTextWithProgress(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.addEventListener('progress', (progress) => {
-      self.postMessage({
-        type: 'read-progress',
-        loaded: progress.loaded,
-        total: progress.total || file.size || 0
-      });
-    });
-    reader.addEventListener('load', () => resolve(reader.result));
-    reader.addEventListener('error', () => reject(reader.error || new Error('파일을 읽지 못했습니다.')));
-    reader.addEventListener('abort', () => reject(new Error('파일 읽기가 취소되었습니다.')));
-    reader.readAsText(file);
-  });
-}
-
+importScripts('backup-integrity.js', 'record-store.js', 'recovery-json.js');
+let pendingAck;
 self.addEventListener('message', async (event) => {
+  if (event.data?.type === 'ack') { pendingAck?.(event.data); pendingAck = null; return; }
   if (event.data?.type !== 'parse') return;
+  const { sessionId, fileIndex, storedFileId } = event.data;
+  const recoveryId = storedFileId || 'import-file:' + sessionId + ':' + fileIndex;
+  let file = event.data.file;
   try {
-    const file = event.data.file;
-    if (!file || typeof file.text !== 'function') {
-      throw new Error('선택한 파일을 읽을 수 없습니다.');
+    if (storedFileId) {
+      const stored = await OpenStillRecordStore.getAux('staging', storedFileId)
+        || await OpenStillRecordStore.getAux('recovery', storedFileId);
+      if (stored?.raw) file = stored.raw;
+      if (file && !file.name) Object.defineProperty(file, 'name', { value: stored.source || storedFileId });
     }
-    const text = await readFileTextWithProgress(file);
-    self.postMessage({ type: 'parsing' });
-    // A UTF-8 BOM is harmless and is commonly added by Windows editors, but
-    // JSON.parse does not consistently accept it as part of the JSON text.
-    const jsonText = typeof text === 'string' && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-    const payload = JSON.parse(jsonText);
-    const inspected = self.OpenStillBackupIntegrity.inspectBackupPart(payload);
-    if (!inspected.ok) throw new Error(inspected.error || '백업 파일의 무결성을 확인하지 못했습니다.');
-    self.postMessage({ type: 'parsed', payload, backupPart: inspected.part });
+    if (!file || typeof file.stream !== 'function') throw new Error('선택한 파일을 읽을 수 없습니다.');
+    await OpenStillRecordStore.putAux('staging', recoveryId, { kind: 'import-file', id: recoveryId, sessionId, fileIndex, raw: file, source: file.name, phase: 'parsing' });
+    const checksum = self.OpenStillBackupIntegrity.createChecksumState();
+    let monitorCount = 0; let fragmentCount = 0; let logicalMonitorCount = 0;
+    const scanner = new self.OpenStillRecordScanner(async (record, kind, source) => {
+      self.OpenStillBackupIntegrity.appendSerializedRecord(checksum, kind, JSON.stringify(record));
+      if (kind === 'monitor') { monitorCount += 1; logicalMonitorCount += 1; }
+      else { fragmentCount += 1; if (record?.fragmentIndex === 0) logicalMonitorCount += 1; }
+      const acknowledgment = new Promise((resolve) => { pendingAck = resolve; });
+      self.postMessage({ type: 'record', record, kind, source: { ...source, fileName: file.name, exportId: scanner.metadata.exportId, part: scanner.metadata.part } });
+      const response = await acknowledgment;
+      if (response.error) throw new Error(response.error);
+    });
+    const reader = file.stream().getReader(); const decoder = new TextDecoder(); let loaded = 0;
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      loaded += value.byteLength; await scanner.write(decoder.decode(value, { stream: true }));
+      self.postMessage({ type: 'read-progress', loaded, total: file.size });
+    }
+    await scanner.write(decoder.decode());
+    const parsed = await scanner.finish();
+    const payload = { ...parsed.metadata, monitors: [], fragments: [] };
+    const inspected = self.OpenStillBackupIntegrity.inspectBackupPart(payload, { monitorCount, fragmentCount, logicalMonitorCount, checksum: self.OpenStillBackupIntegrity.finishChecksum(checksum) });
+    const diagnostics = [...parsed.diagnostics];
+    if (!parsed.recognized) diagnostics.push({ error: '복원 가능한 독립 레코드 배열이 없습니다.' });
+    if (!inspected.ok) diagnostics.push({ error: inspected.error, code: inspected.code });
+    if (diagnostics.length) await OpenStillRecordStore.putAux('recovery', recoveryId, { id: recoveryId, raw: file, source: file.name, error: diagnostics[0].error, diagnostics });
+    await OpenStillRecordStore.putAux('staging', recoveryId, { kind: 'import-file', id: recoveryId, sessionId, fileIndex, raw: file, source: file.name, phase: 'parsed', backupPart: inspected.part || null, diagnostics });
+    self.postMessage({ type: 'parsed', payload, backupPart: inspected.part || null, diagnostics, recoveryId: diagnostics.length ? recoveryId : null, monitorCount, fragmentCount });
   } catch (error) {
-    self.postMessage({ type: 'error', error: error?.message || 'JSON 파일을 읽지 못했습니다.' });
+    await OpenStillRecordStore.putAux('recovery', recoveryId, { id: recoveryId, raw: file, source: file?.name, error: error?.message }).catch(() => undefined);
+    self.postMessage({ type: 'error', error: error?.message || 'JSON 파일을 읽지 못했습니다.', recoveryId });
   }
 });

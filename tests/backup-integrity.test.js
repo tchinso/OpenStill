@@ -202,7 +202,7 @@ test('fragmented monitor count is checked across parts', () => {
 test('legacy v4 parts remain accepted while obvious gaps are detected', () => {
   const legacy = (part) => inspect({
     format: integrity.FORMAT,
-    schemaVersion: integrity.SCHEMA_VERSION,
+    schemaVersion: 4,
     exportedAt: '2025-01-01T00:00:00.000Z',
     exportId: 'legacy-export',
     part,
@@ -214,7 +214,7 @@ test('legacy v4 parts remain accepted while obvious gaps are detected', () => {
   assert.equal(integrity.validateBackupPartSelection([legacy(1), legacy(3)]).code, 'missing-part');
 });
 
-test('v2/v3 and Reference payloads remain outside v4 integrity enforcement', () => {
+test('v2/v3 and Reference payloads remain outside v4/v5 integrity enforcement', () => {
   assert.deepEqual(integrity.inspectBackupPart({
     format: integrity.FORMAT,
     schemaVersion: 3,
@@ -230,4 +230,116 @@ test('integrity-bearing backups cannot downgrade themselves to schema v3', () =>
   const result = integrity.inspectBackupPart(payload);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'schema-downgrade');
+});
+
+function envelopePart(options = {}, chain = {}) {
+  const payload = verifiedPart(options);
+  Object.assign(payload, chain);
+  const state = integrity.createChecksumState();
+  for (const monitor of payload.monitors) integrity.appendSerializedRecord(state, 'monitor', JSON.stringify(monitor));
+  for (const fragment of payload.fragments) integrity.appendSerializedRecord(state, 'fragment', JSON.stringify(fragment));
+  payload.integrity = integrity.createIntegrityMetadata(state, {
+    monitorCount: payload.monitors.length, fragmentCount: payload.fragments.length,
+    finalPart: payload.integrity.finalPart, totalParts: payload.integrity.totalParts,
+    totalMonitors: payload.integrity.totalMonitors, envelope: payload
+  });
+  return payload;
+}
+
+function chainedSet(exportId = 'linked') {
+  const firstPayload = envelopePart({ exportId, part: 1, finalPart: false, monitors: [{ id: 'one' }] });
+  const first = inspect(firstPayload, 'part-001.json');
+  const secondPayload = envelopePart({ exportId, part: 2, finalPart: false, monitors: [{ id: 'two' }] }, { previousPartDigest: first.digest });
+  const second = inspect(secondPayload, 'part-002.json');
+  const lastPayload = envelopePart({ exportId, part: 3, totalParts: 3, totalMonitors: 3, monitors: [{ id: 'three' }] }, { previousPartDigest: second.digest, manifest: [first.digest, second.digest] });
+  return { payloads: [firstPayload, secondPayload, lastPayload], parts: [first, second, inspect(lastPayload, 'part-003.json')] };
+}
+
+test('integrity v2 protects envelope identity, timing, schema, order and completion metadata', () => {
+  const original = envelopePart({ part: 2, finalPart: false, monitors: [{ id: 'one', text: '한글 😀' }] }, { previousPartDigest: 'previous', manifest: [] });
+  assert.equal(inspect(original).envelopeVerified, true);
+  const changes = [
+    (payload) => { payload.exportId = 'other'; },
+    (payload) => { payload.exportedAt = '2026-10-02T00:00:00Z'; },
+    (payload) => { payload.schemaVersion = payload.schemaVersion === 4 ? 5 : 4; },
+    (payload) => { payload.part = 3; },
+    (payload) => { payload.integrityRequired = false; },
+    (payload) => { payload.previousPartDigest = 'different'; },
+    (payload) => { payload.manifest = ['different']; },
+    (payload) => { payload.integrity.finalPart = true; payload.integrity.totalParts = 2; payload.integrity.totalMonitors = 1; }
+  ];
+  for (const modify of changes) {
+    const payload = structuredClone(original); modify(payload);
+    assert.equal(payload.integrity.checksum, original.integrity.checksum, 'content CRC remained unchanged');
+    const result = integrity.inspectBackupPart(payload);
+    assert.equal(result.ok, false); assert.equal(result.code, 'envelope-mismatch');
+  }
+});
+
+test('streamed record validation enforces the same v2 envelope digest', () => {
+  const payload = envelopePart({ monitors: [{ id: 'streamed', text: '조각 경계 😀' }], totalMonitors: 1 }, { manifest: [] });
+  const streamed = { monitorCount: 1, fragmentCount: 0, logicalMonitorCount: 1, checksum: integrity.checksumPayload(payload.monitors, []) };
+  const metadataOnly = { ...payload, monitors: [], fragments: [] };
+  assert.equal(integrity.inspectBackupPart(metadataOnly, streamed).ok, true);
+  metadataOnly.exportId = 'wrong-set';
+  assert.equal(integrity.inspectBackupPart(metadataOnly, streamed).code, 'envelope-mismatch');
+});
+
+test('v2 manifest verifies reordered file selection and rejects broken links or manifests', () => {
+  const { payloads, parts } = chainedSet();
+  assert.deepEqual(integrity.validateBackupPartSelection([parts[2], parts[0], parts[1]]), { ok: true });
+  const changedManifest = structuredClone(payloads[2]);
+  changedManifest.manifest.reverse();
+  changedManifest.integrity.envelopeDigest = integrity.envelopeDigest(changedManifest, changedManifest.integrity);
+  assert.equal(integrity.validateBackupPartSelection([parts[0], parts[1], inspect(changedManifest)]).code, 'manifest-mismatch');
+  const changedLink = structuredClone(payloads[1]);
+  changedLink.previousPartDigest = 'different';
+  changedLink.integrity.envelopeDigest = integrity.envelopeDigest(changedLink, changedLink.integrity);
+  assert.equal(integrity.validateBackupPartSelection([parts[0], inspect(changedLink), parts[2]]).code, 'manifest-mismatch');
+});
+
+test('tolerant selection retains intact records when final or middle parts are missing', () => {
+  const { parts } = chainedSet();
+  const noFinal = integrity.recoverBackupPartSelection([parts[1], parts[0]]);
+  assert.equal(noFinal.ok, true); assert.equal(noFinal.complete, false);
+  assert.deepEqual(noFinal.parts, [parts[1], parts[0]]);
+  assert.ok(noFinal.diagnostics.some((entry) => entry.code === 'missing-final-part'));
+  const noMiddle = integrity.recoverBackupPartSelection([parts[2], parts[0]]);
+  assert.equal(noMiddle.ok, true); assert.equal(noMiddle.complete, false);
+  assert.equal(noMiddle.parts.length, 2);
+  assert.ok(noMiddle.diagnostics.some((entry) => ['missing-part', 'manifest-mismatch'].includes(entry.code)));
+});
+
+test('tolerant selection handles several complete export sets independently', () => {
+  const first = inspect(envelopePart({ exportId: 'first', monitors: [{ id: 'first' }] }, { manifest: [] }), 'first.json');
+  const second = inspect(envelopePart({ exportId: 'second', monitors: [{ id: 'second' }] }, { manifest: [] }), 'second.json');
+  const result = integrity.recoverBackupPartSelection([second, first]);
+  assert.equal(result.ok, true); assert.equal(result.complete, true);
+  assert.deepEqual(result.parts, [second, first]); assert.deepEqual(result.diagnostics, []);
+});
+
+test('tolerant selection merges identical parts but diagnoses conflicting originals without mutation', () => {
+  const firstPayload = envelopePart({ monitors: [{ id: 'first' }] }, { manifest: [] });
+  const first = inspect(firstPayload, 'original.json');
+  const duplicate = inspect(structuredClone(firstPayload), 'same.json');
+  const same = integrity.recoverBackupPartSelection([first, duplicate]);
+  assert.equal(same.complete, true); assert.deepEqual(same.parts, [first]);
+  assert.equal(same.diagnostics[0].code, 'duplicate-identical'); assert.equal(same.diagnostics[0].source, 'same.json');
+  const conflictingPayload = envelopePart({ monitors: [{ id: 'other-content' }] }, { manifest: [] });
+  const conflicting = inspect(conflictingPayload, 'conflicting.json');
+  const before = structuredClone([firstPayload, conflictingPayload]);
+  const result = integrity.recoverBackupPartSelection([first, conflicting]);
+  assert.equal(result.ok, true); assert.equal(result.complete, false);
+  assert.equal(result.diagnostics[0].code, 'duplicate-conflict'); assert.equal(result.diagnostics[0].source, 'conflicting.json');
+  assert.deepEqual([firstPayload, conflictingPayload], before);
+});
+
+test('one incomplete set does not prevent independent complete sets from recovery', () => {
+  const incomplete = inspect(envelopePart({ exportId: 'missing-last', part: 1, finalPart: false, monitors: [{ id: 'recoverable' }] }), 'incomplete.json');
+  const complete = inspect(envelopePart({ exportId: 'complete', monitors: [{ id: 'healthy' }] }, { manifest: [] }), 'complete.json');
+  const result = integrity.recoverBackupPartSelection([incomplete, complete]);
+  assert.equal(result.ok, true); assert.equal(result.complete, false);
+  assert.deepEqual(result.parts, [incomplete, complete]);
+  assert.ok(result.diagnostics.some((entry) => entry.exportId === 'missing-last' && entry.code === 'missing-final-part'));
+  assert.equal(result.diagnostics.some((entry) => entry.exportId === 'complete'), false);
 });
