@@ -2501,6 +2501,7 @@
       batchActionRunning = false;
       patchVisibleSelections(); flushQueuedDashboardRefresh();
     }
+  }
 
   async function runBulkMutation(type, ids, extra = {}) {
     const total = { completed: 0, skipped: 0, failed: 0, paused: 0, missing: 0, conflict: 0, unprocessed: 0 };
@@ -2523,7 +2524,6 @@
       await yieldToBrowser();
     }
     return total;
-  }
   }
 
   async function actionGrant(monitor) {

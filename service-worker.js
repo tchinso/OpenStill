@@ -5887,6 +5887,17 @@ async function replaceSiteHost(message) {
   const result = await mutateMonitors((monitors) => {
     // Recreate the plan inside the serialized mutation. A concurrent edit must
     // not turn a safe preview into a partial host migration.
+    if (Array.isArray(message.expectedRevisions)) {
+      const currentSources = monitors.filter((monitor) => siteHostOfUrl(monitor.url) === sourceHost);
+      const currentIds = new Set(currentSources.map((monitor) => monitor.id));
+      const conflictIds = new Set(currentSources.filter((monitor) => mutationConflict(monitor, message)).map((monitor) => monitor.id));
+      for (const expected of message.expectedRevisions) {
+        if (!currentIds.has(expected.id)) conflictIds.add(expected.id);
+      }
+      if (conflictIds.size) {
+        return { ok: false, reason: 'conflict', conflictIds: [...conflictIds], error: '일괄 변경할 추적이 변경되었습니다. 최신 목록에서 대상 범위를 다시 확인해 주세요.' };
+      }
+    }
     const currentPlan = planSiteHostReplacement(monitors, sourceHost, targetHost);
     if (!currentPlan.ok) {
       return currentPlan;

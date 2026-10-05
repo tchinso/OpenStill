@@ -21,7 +21,7 @@ globalThis.__openStillTest = {
   persistNormalizedMonitorRepairs,
   startExportSession,
   startImportSession, checkpointExportSession, finishExportSession, getMonitorById, recoveryStatus, abortImportSession,
-  exportMonitorRecordForTransfer, normalizeSnapshot, normalizeMonitor, snapshotsEqual, compareSnapshotIdentities, importMonitors, appendImportFragments, reusePageUrl
+  exportMonitorRecordForTransfer, normalizeSnapshot, normalizeMonitor, snapshotsEqual, compareSnapshotIdentities, importMonitors, appendImportFragments, reusePageUrl, replaceSiteHost
 };`;
 
 function clone(value) {
@@ -302,6 +302,64 @@ test('address relocation preserves baseline, changes, read state, and history', 
   const result = await env.api.reusePageUrl({ sourceUrl: 'https://example.com/page', targetUrl: 'https://new.example/page' });
   assert.equal(result.ok, true); const record = (await env.api.getState()).monitors[0];
   assert.equal(record.snapshot.text, 'baseline'); assert.equal(record.history.length, 1); assert.equal(record.unread, true); assert.equal(record.addressHistory[0].previousUrl, 'https://example.com/page');
+});
+
+test('guarded bulk host replacement preserves each monitor state and URL components', async () => {
+  const sources = [
+    monitor({ id: 'https-source', url: 'https://example.com/posts/one?q=%EA%B0%80#details', enabled: true, unread: true, status: 'changed', labels: ['보존'], tracking: { compareMode: 'text' }, snapshot: { exists: true, text: 'baseline' }, lastChange: { id: 'change-one', previous: { exists: true, text: 'before' }, current: { exists: true, text: 'baseline' } }, lastCheckedAt: '2026-10-01T01:00:00Z', lastChangedAt: '2026-10-01T01:00:00Z', lastViewedAt: '2026-09-30T01:00:00Z', history: [{ capturedAt: '2026-10-01T01:00:00Z', snapshot: { exists: true, text: 'baseline' } }], runs: [{ checkedAt: '2026-10-01T01:00:00Z', status: 'changed' }] }),
+    monitor({ id: 'http-source', url: 'http://example.com/other?x=1&x=2#tail', labels: ['다른 라벨'], snapshot: { exists: true, text: 'other baseline' } }),
+    monitor({ id: 'unrelated', url: 'https://elsewhere.test/untouched' })
+  ];
+  const env = harness({ 'openStill.monitors.v2': sources });
+  const before = clone(await Promise.all(sources.map(({ id }) => env.api.getMonitorById(id))));
+  const expectedRevisions = before.filter((item) => new URL(item.url).host === 'example.com').map(({ id, revision, url }) => ({ id, revision, url }));
+  const result = await env.api.replaceSiteHost({ sourceHost: 'example.com', targetHost: 'new.example:8443', expectedRevisions });
+  assert.equal(result.ok, true);
+  assert.equal(result.count, 2);
+  const after = clone(await Promise.all(sources.map(({ id }) => env.api.getMonitorById(id))));
+  for (const original of before) {
+    const current = after.find((item) => item.id === original.id);
+    if (original.id === 'unrelated') {
+      assert.deepEqual(current, original);
+      continue;
+    }
+    const expectedUrl = new URL(original.url);
+    expectedUrl.host = 'new.example:8443';
+    assert.equal(current.url, expectedUrl.href);
+    assert.notEqual(current.revision, original.revision);
+    assert.deepEqual({ ...current, revision: original.revision, url: original.url, updatedAt: original.updatedAt }, original);
+  }
+});
+
+test('bulk host replacement atomically refuses stale revisions and changed source groups', async (t) => {
+  for (const change of ['revision', 'added', 'deleted', 'moved']) {
+    await t.test(change, async () => {
+      const sources = [monitor({ id: 'one' }), monitor({ id: 'two', url: 'http://example.com/second' }), monitor({ id: 'other', url: 'https://elsewhere.test/page' })];
+      const env = harness({ 'openStill.monitors.v2': sources });
+      const initial = clone((await env.api.getState()).monitors);
+      const expectedRevisions = initial.filter((item) => new URL(item.url).host === 'example.com').map(({ id, revision, url }) => ({ id, revision, url }));
+      await env.api.mutateMonitors((monitors) => {
+        if (change === 'revision') monitors.find((item) => item.id === 'two').revision = 'new-revision';
+        if (change === 'added') monitors.push(env.api.normalizeMonitor(monitor({ id: 'new-source', url: 'https://example.com/new' })));
+        if (change === 'deleted') monitors.splice(monitors.findIndex((item) => item.id === 'two'), 1);
+        if (change === 'moved') monitors.find((item) => item.id === 'two').url = 'https://elsewhere.test/moved';
+      });
+      const before = clone((await env.api.getState()).monitors);
+      const result = await env.api.replaceSiteHost({ sourceHost: 'example.com', targetHost: 'new.example', expectedRevisions });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, 'conflict');
+      assert.deepEqual(Array.from(result.conflictIds), [change === 'added' ? 'new-source' : 'two']);
+      assert.deepEqual(clone((await env.api.getState()).monitors), before);
+    });
+  }
+});
+
+test('bulk host replacement retains support for callers without revision guards', async () => {
+  const env = harness({ 'openStill.monitors.v2': [monitor(), monitor({ id: 'second', url: 'https://example.com/second' })] });
+  const result = await env.api.replaceSiteHost({ sourceHost: 'example.com', targetHost: 'new.example' });
+  assert.equal(result.ok, true);
+  assert.equal(result.count, 2);
+  assert.ok((await env.api.getState()).monitors.every((item) => new URL(item.url).host === 'new.example'));
 });
 
 test('v5 reference backup retains shared multibyte snapshots, settings and restart checkpoints', async () => {
