@@ -81,6 +81,70 @@ test('per-post identity and partial locator diagnostics persist', { skip: !chrom
   assert.equal(result.output.captureQuality.missingLocators[0].expr, '.missing');
 });
 
+test('textless covering links match without inventing text; explicit named fields capture their content', { skip: !chromium }, async () => {
+  const html = '<section>' + ['First title', 'Second title', 'Third title'].map((title, index) =>
+    `<article><a class="absolute inset-0 z-0" aria-label="${title}" title="${title}" href="/post/${index + 1}"></a><div>${title}</div></article>`
+  ).join('') + '</section>';
+  const locators = ['article:first-child', 'article:nth-child(2)', 'article:nth-child(3)'].map((expr) => ({
+    type: 'css', expr: `${expr} [class*='inset']`, op: 'include', fields: [{ type: 'text' }], fieldsSpecified: true
+  }));
+  const empty = await captureFixture(html, locators);
+  assert.equal(empty.output.ok, true);
+  assert.equal(empty.output.exists, false);
+  assert.equal(empty.output.matchCount, 3);
+  assert.equal(empty.output.text, '');
+  assert.deepEqual(empty.output.selectorMatches.map((match) => match.matchCount), [1, 1, 1]);
+  assert.equal(empty.output.captureQuality.status, 'complete');
+  assert.equal(empty.unchanged, true);
+  const named = await captureFixture(html, locators.map((locator) => ({ ...locator,
+    fields: [{ type: 'attribute', name: 'aria-label' }, { type: 'attribute', name: 'href' }]
+  })));
+  assert.equal(named.output.exists, true);
+  assert.match(named.output.text, /First title/);
+  assert.match(named.output.text, /https:\/\/capture\.example\.test\/post\/1/);
+  assert.equal(named.output.items.length, 3);
+  assert.equal(named.unchanged, true);
+});
+
+test('visible sibling titles retain distinct identities from their exactly labelled empty card links', { skip: !chromium }, async () => {
+  const html = '<section><article><a class="cover" aria-label="Same   title" href="/post/1"></a>'
+    + '<h2 class="entry-title">Same title</h2><a href="/author/1">Author</a></article>'
+    + '<article><a class="cover" title="Same title" href="/post/2"></a>'
+    + '<h2 class="entry-title">Same title</h2><a href="/author/2">Author</a></article></section>';
+  const result = await captureFixture(html, [{ type: 'css', expr: '.entry-title', op: 'include' }]);
+  assert.equal(result.output.ok, true, result.output.error);
+  assert.deepEqual(result.output.items.map((item) => item.text), ['Same title', 'Same title']);
+  assert.deepEqual(result.output.items.map((item) => item.identity?.key), [
+    'url:https://capture.example.test/post/1', 'url:https://capture.example.test/post/2'
+  ]);
+  assert.doesNotMatch(result.output.html, /\/post\/|\/author\//);
+  assert.equal(result.unchanged, true);
+  assert.equal(result.mutations, 0);
+});
+
+test('card title identities reject ambiguous, unrelated, non-HTTP and explicitly excluded sibling links', { skip: !chromium }, async () => {
+  const title = '<h2 class="entry-title">Same title</h2>';
+  const emptyLink = '<a class="cover" aria-label="Same title" href="/post/1"></a>';
+  const include = { type: 'css', expr: '.entry-title', op: 'include' };
+  const cases = [
+    { html: `<article>${title}${emptyLink}<a aria-label="Same title" href="/post/2"></a></article>` },
+    { html: `<article>${title}<a aria-label="Different title" href="/post/1"></a><a aria-label="Same title" href="/author/1">Author</a></article>` },
+    { html: `<article>${title}<a aria-label="Same title" href="javascript:void(0)"></a></article>` },
+    { html: `<div>${title}${emptyLink}</div>` },
+    { html: `<article>${title}<article>${emptyLink}</article></article>` },
+    { html: `<article>${title}${emptyLink}</article>`, exclude: { type: 'css', expr: '.cover', op: 'exclude' } },
+    { html: `<article>${title}${emptyLink}</article>`, exclude: { type: 'xpath', expr: '//a/@href', op: 'exclude' } },
+    { html: `<article>${title}${emptyLink}</article>`, exclude: { type: 'xpath', expr: '//a/@aria-label', op: 'exclude' } }
+  ];
+  for (const fixture of cases) {
+    const result = await captureFixture(fixture.html, [include, ...(fixture.exclude ? [fixture.exclude] : [])]);
+    assert.equal(result.output.ok, true, result.output.error);
+    assert.equal(result.output.items[0].text, 'Same title');
+    assert.equal(result.output.items[0].identity, undefined, JSON.stringify(fixture));
+    assert.equal(result.unchanged, true);
+  }
+});
+
 test('XPath attributes extract values and unsupported result kinds give actionable errors', { skip: !chromium }, async () => {
   const attribute = await captureFixture('<a href="/post/1">title</a>', [{ type: 'xpath', expr: '//a/@href', op: 'include' }]);
   assert.equal(attribute.output.ok, true);

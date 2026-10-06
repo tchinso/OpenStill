@@ -2338,7 +2338,7 @@
       const response = await send({ type: 'check-monitor', id: monitor.id });
       if (!response?.ok) throw new Error(response?.error || '확인하지 못했습니다.');
       showToast(response.needsReview
-        ? '요소를 찾지 못했습니다. 로그인 상태나 페이지 구성을 확인해 주세요.'
+        ? response.message || response.monitor?.lastError || '선택 영역과 추적 필드 설정을 확인해 주세요.'
         : response.changed ? '변경을 감지했습니다.' : '변경 없이 최신 상태입니다.');
     } catch (error) {
       showToast(error.message || '확인하지 못했습니다.');

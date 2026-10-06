@@ -21,7 +21,7 @@
   });
   const selectorCache = new WeakMap();
   const UNSAFE_FALLBACK_SELECTOR_ATTRIBUTES = new Set([
-    'href', 'src', 'srcset', 'hasinclude__', 'include__', 'title', 'alt'
+    'href', 'src', 'srcset', 'hasinclude__', 'include__', 'title', 'alt', 'aria-label'
   ]);
   const GENERATOR_ONLY_EXCLUDED_SELECTOR_ATTRIBUTES = new Set(['aria-label']);
 
@@ -99,6 +99,51 @@
 
   function snapshotTextFor(element) {
     return cleanSnapshotText(element?.innerText || element?.textContent);
+  }
+
+  function defaultFieldsFor(element) {
+    if (!snapshotTextFor(element)) {
+      for (const name of ['aria-label', 'title', 'alt']) {
+        if (cleanText(element?.getAttribute(name))) return [{ type: 'attribute', name }];
+      }
+    }
+    return [{ type: 'text' }];
+  }
+
+  function previewFieldValues(element, fields) {
+    // Capture merges repeated named fields on each matched node. Preserve
+    // the editor/transport field list, while previewing its extracted values.
+    const seen = new Set();
+    const values = fields.filter((field) => {
+      if (field.type === 'text') return false;
+      const key = field.type + '\u0000' + field.name;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).map((field) => {
+      try {
+        if (field.type === 'property') {
+          const value = element[field.name];
+          return value != null && ['string', 'number', 'boolean', 'bigint'].includes(typeof value) ? String(value) : '';
+        }
+        const lightDom = element.getRootNode() === document;
+        // New picker monitors use capture's default filtering. Live shadow
+        // attributes are retained by that same capture contract.
+        if (lightDom && (field.name.toLowerCase() === 'style' || /^on/i.test(field.name))) return 'undefined';
+        const normalizedResource = lightDom && location.protocol !== 'data:'
+          && ((field.name === 'href' && element.localName === 'a')
+            || (field.name === 'src' && ['audio', 'img', 'video'].includes(element.localName)));
+        if (!element.hasAttribute(field.name)) return normalizedResource ? '' : 'undefined';
+        const value = element.getAttribute(field.name) || '';
+        // Capture normalizes these resource attributes in its detached clone.
+        if (normalizedResource) {
+          try { return new URL(value, document.baseURI).href; } catch { /* retain an invalid raw value */ }
+        }
+        return value;
+      } catch { return ''; }
+    });
+    if (fields.some((field) => field.type === 'text')) values.push(snapshotTextFor(element));
+    return values.join('\n');
   }
 
   function isPickerUiElement(element) {
@@ -234,8 +279,74 @@
     return current;
   }
 
+  function readableElementUnderLink(element, clientX, clientY) {
+    // Stretched links sit over sibling card content. Native hit testing sees
+    // the empty link even when the user points at the title underneath it.
+    // Resolve only an empty positioned link within its own card; never pierce
+    // modal/backdrop UI or mutate pointer-events on the page to discover it.
+    if (element?.localName !== 'a' || !element.hasAttribute('href') || snapshotTextFor(element)
+      || !element.parentElement || ['body', 'html'].includes(element.parentElement.localName)) return element;
+    if (getComputedStyle(element).position !== 'absolute') return element;
+    const linkRect = element.getBoundingClientRect();
+    const parentRect = element.parentElement.getBoundingClientRect();
+    // An icon/control can be absolutely positioned over text too. Only a
+    // link that spans most of its parent is a stretched card hit surface.
+    if (!parentRect.width || !parentRect.height
+      || linkRect.width < parentRect.width * 0.8 || linkRect.height < parentRect.height * 0.8
+      || linkRect.left < parentRect.left - 2 || linkRect.top < parentRect.top - 2
+      || linkRect.right > parentRect.right + 2 || linkRect.bottom > parentRect.bottom + 2) return element;
+    const root = element.getRootNode();
+    if (typeof root.elementsFromPoint !== 'function') return element;
+    const stack = root.elementsFromPoint(clientX, clientY);
+    const overlayIndex = stack.indexOf(element);
+    if (overlayIndex < 0) return element;
+    for (const candidate of stack.slice(overlayIndex + 1)) {
+      if (!isPageElement(candidate) || candidate.getRootNode() !== root
+        || !element.parentElement.contains(candidate) || candidate.contains(element)) continue;
+      const style = getComputedStyle(candidate);
+      if (style.visibility !== 'visible' || Number(style.opacity) === 0 || !snapshotTextFor(candidate)) continue;
+      return candidate;
+    }
+    return element;
+  }
+
   function selectorTypeFor(element) {
     return element?.getRootNode?.()?.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? 'xcss' : 'css';
+  }
+
+  function repeatedElementsFor(element) {
+    const path = [];
+    const sameShape = (source, candidate) => {
+      if (candidate?.localName !== source.localName) return false;
+      const classes = [...source.classList].filter(isStableClass);
+      return !classes.length || classes.every((name) => candidate.classList.contains(name));
+    };
+    // Find the nearest repeated sibling family, then follow the same local
+    // route inside each item. Positional steps discover examples only; the
+    // final saved rule is synthesized and verified by SelectorX against all
+    // of those examples, rather than serializing this route.
+    let fallback = [];
+    for (let item = element; item?.parentElement && path.length <= 4; item = item.parentElement) {
+      const siblings = [...item.parentElement.children].filter((node) => sameShape(item, node));
+      if (siblings.length > 1) {
+        const matches = siblings.map((sibling) => {
+          let current = sibling;
+          for (const step of [...path].reverse()) {
+            const candidates = [...current.children].filter((child) => sameShape(step.node, child));
+            current = candidates[step.index];
+            if (!current) return null;
+          }
+          return current;
+        }).filter((node) => isPageElement(node));
+        if (matches.length > 1 && matches.includes(element)) {
+          if (['article', 'li', 'tr'].includes(item.localName) || item.getAttribute('role') === 'listitem') return matches;
+          if (!fallback.length) fallback = matches;
+        }
+      }
+      const candidates = [...item.parentElement.children].filter((node) => sameShape(item, node));
+      path.push({ node: item, index: candidates.indexOf(item) });
+    }
+    return fallback;
   }
 
   function uniqueElementsInDocumentOrder(elements) {
@@ -250,9 +361,9 @@
       .some((ancestor) => composedContains(ancestor, element)));
   }
 
-  function snapshotTextForElements(elements) {
+  function snapshotTextForElements(elements, fields = [{ type: 'text' }]) {
     return cleanSnapshotText(uniqueElementsInDocumentOrder(elements)
-      .map((element) => snapshotTextFor(element))
+      .map((element) => previewFieldValues(element, fields))
       .filter(Boolean)
       .join('\n\n'));
   }
@@ -880,6 +991,7 @@
           .schedule small { color: #7e91aa; font-weight: 500; }
           .actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 2px; }
           .actions .right { display: flex; gap: 8px; }
+          .scope-actions { flex-wrap: wrap; }
           .button { padding: 9px 11px; color: #d8e5f5; background: #2b3a50; font-size: 12px; font-weight: 700; }
           .button:hover { background: #354963; }
           .button.primary { color: #052218; background: #42dda3; }
@@ -905,6 +1017,10 @@
               <label>CSS 선택자
                 <div class="selector-row"><select id="selectorType" aria-label="Selector type"><option value="css">CSS</option><option value="xcss">XCSS (Shadow DOM)</option><option value="xpath">XPath</option></select><input id="selector" autocomplete="off" spellcheck="false" /></div>
               </label>
+              <div class="actions scope-actions" aria-label="선택 범위 조절">
+                <div class="right"><button class="button" id="widen" type="button">상위 영역</button><button class="button" id="narrow" type="button" disabled>하위 영역</button></div>
+                <button class="button" id="selectSimilar" type="button">유사 요소 함께 선택</button>
+              </div>
               <fieldset class="field-editor" aria-describedby="fieldHelp">
                 <legend>추출할 값</legend>
                 <p class="field-help" id="fieldHelp">필드 순서대로 값을 추출합니다. 텍스트, 여러 속성, 프로퍼티를 함께 추가할 수 있습니다.</p>
@@ -989,9 +1105,15 @@
       this.closeButton = this.shadow.querySelector('#close');
       this.cancelButton = this.shadow.querySelector('#cancel');
       this.selectAgainButton = this.shadow.querySelector('#selectAgain');
+      this.widenButton = this.shadow.querySelector('#widen');
+      this.narrowButton = this.shadow.querySelector('#narrow');
+      this.selectSimilarButton = this.shadow.querySelector('#selectSimilar');
       this.closeButton.addEventListener('click', () => this.destroy());
       this.cancelButton.addEventListener('click', () => this.destroy());
       this.selectAgainButton.addEventListener('click', () => this.beginPicking());
+      this.widenButton.addEventListener('click', () => { void this.changeSelectionScope(1); });
+      this.narrowButton.addEventListener('click', () => { void this.changeSelectionScope(-1); });
+      this.selectSimilarButton.addEventListener('click', () => { void this.selectSimilarElements(); });
       this.selectorInput.addEventListener('input', () => this.validateSelector());
       this.selectorTypeInput.addEventListener('change', () => {
         void this.changeActiveSelectorType(this.selectorTypeInput.value);
@@ -1086,7 +1208,8 @@
         return null;
       }
       const exposed = path.find((node) => node instanceof Element && node !== this.host && !this.host.contains(node)) ?? null;
-      return exposed ? deepestShadowElementAtPoint(exposed, event.clientX, event.clientY) : null;
+      if (!exposed) return null;
+      return readableElementUnderLink(deepestShadowElementAtPoint(exposed, event.clientX, event.clientY), event.clientX, event.clientY);
     }
 
     onPointerMove(event) {
@@ -1391,6 +1514,78 @@
       if (this.selectorTypeInput) {
         this.selectorTypeInput.value = normalizedSelectorType(selection?.selectorType);
       }
+      if (this.widenButton) {
+        const single = selection?.matchedElements?.length === 1;
+        this.widenButton.disabled = this.saving || !single || !isPageElement(selection?.element?.parentElement)
+          || selection?.element?.parentElement === document.documentElement;
+        this.narrowButton.disabled = this.saving || !single || !(selection?.scopeIndex > 0);
+        this.selectSimilarButton.disabled = this.saving || !single || selection?.op === 'exclude';
+      }
+    }
+
+    async changeSelectionScope(direction) {
+      const selection = this.currentSelection();
+      if (!selection || this.saving || selection.matchedElements?.length !== 1) return;
+      const trail = selection.scopeTrail ?? [selection.element];
+      const index = selection.scopeIndex ?? 0;
+      const target = direction > 0 ? selection.element?.parentElement : trail[index - 1];
+      if (!isPageElement(target) || target === document.documentElement) return;
+      if (this.selections.some((other) => other !== selection && other.matchedElements?.some((node) => composedContains(target, node)))) {
+        this.message.textContent = '다른 선택을 포함하는 영역입니다. 기존 선택을 먼저 조절해 주세요.';
+        return;
+      }
+      const selectorType = selectorTypeFor(target);
+      const selector = selectorFor(target);
+      if (!selector) {
+        this.message.textContent = '이 영역의 선택자를 안전하게 만들 수 없습니다.';
+        return;
+      }
+      let matches;
+      try { matches = queryTrackedElements(selector, document, selectorType); } catch { return; }
+      if (matches.length !== 1 || matches[0] !== target) return;
+      selection.scopeTrail = direction > 0 ? [...trail.slice(0, index + 1), target] : trail;
+      selection.scopeIndex = index + direction;
+      selection.selector = selector;
+      selection.selectorType = selectorType;
+      selection.fields = defaultFieldsFor(target);
+      this.setSelectionMatchInfo(selection, matches);
+      this.activateSelection(this.activeSelectionIndex);
+    }
+
+    async selectSimilarElements() {
+      const selection = this.currentSelection();
+      if (!selection || this.saving || selection.op === 'exclude' || selection.matchedElements?.length !== 1) return;
+      const originalSelector = selection.selector;
+      const originalElement = selection.element;
+      const targets = repeatedElementsFor(selection.element);
+      if (targets.length < 2) {
+        this.message.textContent = '같은 목록에서 유사한 요소를 찾지 못했습니다. 선택 영역을 조절해 주세요.';
+        return;
+      }
+      const selectorType = selectorTypeFor(selection.element);
+      const runtime = globalThis.__openStillSelectorX;
+      let selector = '';
+      try {
+        const generate = selectorType === 'xcss' ? runtime?.getExtendedCSS : runtime?.getCSS;
+        selector = await generate?.(targets, {
+          timeout: 500,
+          filterCallback: (_type, name, value) => allowsGeneratedSelectorEvidence(name, value)
+        });
+        const matches = queryTrackedElements(selector, document, selectorType);
+        // Do not expand into unrelated parts of the page even if they share
+        // a class. The preview and saved scope must agree with this family.
+        if (matches.length !== targets.length || targets.some((node) => !matches.includes(node))) throw new Error('scope mismatch');
+        if (this.currentSelection() !== selection || this.saving
+          || selection.selector !== originalSelector || selection.element !== originalElement) return;
+        selection.selector = selector;
+        selection.selectorType = selectorType;
+        delete selection.scopeTrail;
+        delete selection.scopeIndex;
+        this.setSelectionMatchInfo(selection, matches);
+        this.activateSelection(this.activeSelectionIndex);
+      } catch {
+        this.message.textContent = '유사 요소를 공통 선택자로 안전하게 묶지 못했습니다. 현재 선택을 유지합니다.';
+      }
     }
 
     async changeActiveSelectorType(value) {
@@ -1466,7 +1661,7 @@
       selection.element = elements[0] ?? matchedElements[0] ?? null;
       selection.totalMatchCount = matchedElements.length;
       selection.matchCount = elements.length;
-      selection.text = snapshotTextForElements(elements);
+      selection.text = snapshotTextForElements(elements, copyPickerFields(selection.fields));
     }
 
     renderSelectionList() {
@@ -1648,7 +1843,7 @@
           this.message.textContent = '한 번에 선택할 수 있는 요소는 최대 ' + MAX_SELECTIONS + '개입니다.';
           return;
         }
-        const selection = { selector, selectorType, op: operation, fields: [{ type: 'text' }] };
+        const selection = { selector, selectorType, op: operation, fields: defaultFieldsFor(element), scopeTrail: [element], scopeIndex: 0 };
         this.setSelectionMatchInfo(selection, matches);
         this.selections.push(selection);
         this.activeSelectionIndex = this.selections.length - 1;
@@ -1896,17 +2091,25 @@
           return false;
         }
 
+        if (active.selector !== selector || active.element !== matches[0]) {
+          delete active.scopeTrail;
+          delete active.scopeIndex;
+        }
         active.selector = selector;
         active.selectorType = selectorType;
         active.fields = fields;
         this.setSelectionMatchInfo(active, matches);
+        this.syncSelectorEditor(active);
         this.selectedElement = active.element;
         const preview = document.createElement('div');
         preview.className = 'preview';
         preview.textContent = active.text.slice(0, 700) || '(텍스트 없음)';
-        const message = matches.length === 1
+        let message = matches.length === 1
           ? '1개 요소와 일치합니다.'
           : `${matches.length}개 요소와 일치합니다. 모두 함께 추적합니다.`;
+        if (!active.text && active.op !== 'exclude') {
+          message += ' 선택한 필드의 추출 값이 비어 있습니다. 제목이나 aria-label 같은 속성을 선택해 주세요.';
+        }
         this.validity.replaceChildren(document.createTextNode(message), preview);
         this.validity.classList.add('ok');
         this.renderSelectionList();

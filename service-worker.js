@@ -90,6 +90,7 @@ const LOCATOR_OPERATIONS = new Set(['include', 'exclude']);
 const LOCATOR_FIELD_TYPES = new Set(['text', 'attribute', 'property']);
 
 const ELEMENT_NOT_FOUND_MESSAGE = '선택한 요소를 찾지 못했습니다. 로그인 상태나 페이지 구성, CSS 선택자를 확인해 주세요.';
+const ELEMENT_CONTENT_EMPTY_MESSAGE = '선택한 요소는 찾았지만 추적 내용이 비어 있습니다. 텍스트가 있는 요소나 title·aria-label·href 속성을 선택하고 필터 설정을 확인해 주세요.';
 
 let storageQueue = Promise.resolve();
 let offscreenCreation;
@@ -3353,6 +3354,49 @@ async function captureReferenceRenderedDocumentCollection(...args) {
     // and turns harmless wrapper/list changes into alerts.
     const filtered = makeHtml(captureClone, included, excluded, automaticallyIncluded, excludedAttributes, fields, structuralContext);
     const text = filtered.text;
+    const cardSelector = 'article,li,tr,[role="listitem"]';
+    const normalizedIdentityText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const excludedOriginals = new Set([...excluded].map((node) => originalNodes.get(node)).filter(Boolean));
+    const excludedOriginalAttributes = new Map([...excludedAttributes]
+      .map(([node, names]) => [originalNodes.get(node), names]).filter(([node]) => node));
+    const labelledCardLinks = new WeakMap();
+    const titlePermalink = (element) => {
+      const original = originalNodes.get(element);
+      const selectedText = normalizedIdentityText(original?.textContent);
+      const card = original?.closest?.(cardSelector);
+      if (!card || !selectedText) return null;
+      if (!labelledCardLinks.has(card)) {
+        const byLabel = new Map();
+        for (const anchor of card.querySelectorAll('a[href]')) {
+          // A visible title can be a sibling of its card's empty hit surface.
+          // Its exact accessible/title label is the only evidence connecting
+          // them; text links and links belonging to nested cards cannot help.
+          if (anchor.closest(cardSelector) !== card || normalizedIdentityText(anchor.textContent)) continue;
+          let excludedLink = false;
+          for (let current = anchor; current; current = parentAcrossShadow(current)) {
+            if (excludedOriginals.has(current)) { excludedLink = true; break; }
+          }
+          const excludedNames = excludedOriginalAttributes.get(anchor);
+          if (excludedLink || excludedNames?.has('href')) continue;
+          const rawHref = anchor.getAttribute('href');
+          if (!rawHref?.trim()) continue;
+          let url;
+          try { url = new URL(rawHref, anchor.baseURI || document.baseURI); } catch { continue; }
+          if (!['http:', 'https:'].includes(url.protocol)) continue;
+          for (const name of ['aria-label', 'title']) {
+            if (excludedNames?.has(name)) continue;
+            const label = normalizedIdentityText(anchor.getAttribute(name));
+            if (!label) continue;
+            const urls = byLabel.get(label) || new Set();
+            urls.add(url.href);
+            byLabel.set(label, urls);
+          }
+        }
+        labelledCardLinks.set(card, byLabel);
+      }
+      const urls = labelledCardLinks.get(card).get(selectedText);
+      return urls?.size === 1 ? [...urls][0] : null;
+    };
     const identityFor = (element, sources) => {
       const custom = sources.map((locator) => locator.identityAttribute).filter(Boolean);
       for (const attribute of [...custom, 'data-post-id', 'data-article-id']) {
@@ -3364,6 +3408,8 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       const urls = [...new Set(anchors.map((anchor) => anchor.getAttribute('href')).filter(Boolean))];
       const value = bookmark?.getAttribute('href') || (urls.length === 1 ? urls[0] : null);
       if (value) return { kind: 'permalink', value, key: `url:${value}` };
+      const labelledPermalink = titlePermalink(element);
+      if (labelledPermalink) return { kind: 'permalink', value: labelledPermalink, key: `url:${labelledPermalink}` };
       for (const attribute of ['data-id', 'id']) {
         const attributeValue = element.getAttribute(attribute);
         if (attributeValue) return { kind: 'attribute', attribute, value: attributeValue, key: `attr:${attribute}:${attributeValue}` };
@@ -4342,14 +4388,16 @@ function applySnapshotOutcome(monitor, nextSnapshot, checkedAt) {
     monitor.lastReviewAt = checkedAt;
     monitor.lastError = '일부 선택 영역을 찾지 못했습니다. 이전 정상 기준값을 유지합니다.';
     monitor.lastErrorSnapshot = nextSnapshot;
-    return { changed: false, needsReview: true, partial: true };
+    return { changed: false, needsReview: true, partial: true, reason: 'selection-partial', message: monitor.lastError };
   }
   if (!nextSnapshot.exists && !tracking.allowEmpty) {
     monitor.status = 'needs-review';
     monitor.lastReviewAt = checkedAt;
-    monitor.lastError = ELEMENT_NOT_FOUND_MESSAGE;
+    const matched = nextSnapshot.matchCount > 0
+      || (nextSnapshot.selectorMatches || []).some((entry) => entry.op !== 'exclude' && entry.matchCount > 0);
+    monitor.lastError = matched ? ELEMENT_CONTENT_EMPTY_MESSAGE : ELEMENT_NOT_FOUND_MESSAGE;
     monitor.lastErrorSnapshot = nextSnapshot.evidenceHtml ? nextSnapshot : null;
-    return { changed: false, needsReview: true };
+    return { changed: false, needsReview: true, reason: matched ? 'selection-content-empty' : 'selection-empty', message: monitor.lastError };
   }
 
   const previous = monitor.snapshot;
@@ -4524,7 +4572,7 @@ async function checkMonitorWithCapture(id, capture, {
         appendRunHistory(current, {
           at: checkedAt,
           status: applied.needsReview ? 'needs-review' : applied.changed ? 'changed' : 'ok',
-          code: applied.needsReview ? 'selection-empty' : applied.orderChanged ? 'order-changed' : null,
+          code: applied.needsReview ? applied.reason || 'selection-empty' : applied.orderChanged ? 'order-changed' : null,
           message: applied.needsReview ? current.lastError : null,
           changed: applied.changed,
           matchCount: nextSnapshot.matchCount

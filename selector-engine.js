@@ -29,12 +29,12 @@
     'title', 'value'
   ]);
   const CSS_VOCABULARY = new Set([
-    'align', 'animate', 'animation', 'background', 'border', 'bottom',
+    'absolute', 'align', 'animate', 'animation', 'background', 'border', 'bottom',
     'box', 'column', 'color', 'container', 'display', 'flex', 'font',
-    'gap', 'grid', 'height', 'hidden', 'hover', 'inline', 'justify',
-    'layout', 'left', 'margin', 'max', 'min', 'opacity', 'overflow',
-    'padding', 'position', 'right', 'row', 'shadow', 'size', 'space',
-    'text', 'top', 'transition', 'visible', 'width'
+    'fixed', 'gap', 'grid', 'height', 'hidden', 'hover', 'inline', 'inset', 'isolate', 'justify',
+    'layout', 'left', 'line', 'clamp', 'margin', 'max', 'min', 'opacity', 'overflow',
+    'padding', 'pointer', 'events', 'position', 'relative', 'right', 'rounded', 'row', 'shadow', 'size', 'space',
+    'sticky', 'text', 'top', 'transition', 'truncate', 'visible', 'width', 'z'
   ]);
   const MEANINGFUL_NAMES = new Set([
     'a', 'article', 'button', 'h1', 'h2', 'h3', 'h4', 'h5', 'li',
@@ -760,7 +760,9 @@
         - sharedRate * 2.8
         - targetProximity * 0.7
         - semanticName * 0.5
-        + cssPenalty * 0.65
+        // Layout utilities remain usable evidence, but a semantic class or
+        // attribute should win when both describe the same target set.
+        + cssPenalty * 2.4
         + sameOnRoute * 0.45
         + numericRisk * 1.6
         + specialRisk * (item.type === 'attrib' ? 0.9 : 0.25);

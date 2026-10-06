@@ -52,6 +52,35 @@ function harness(monitors = [], options = {}) {
 }
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test('matched empty fields report an empty-content review and preserve the last baseline', async () => {
+  const env = harness([monitor({ snapshot: { exists: true, text: 'previous title', matchCount: 1 } })]);
+  await env.ready();
+  const result = await env.api.checkMonitorWithCapture('m1', () => env.api.normalizeSnapshot({
+    exists: false, matchCount: 1, text: '', html: '<a title="current title" href="/post/2"></a>',
+    selectorMatches: [{ type: 'css', expr: 'a', op: 'include', matchCount: 1 }],
+    evidenceHtml: '<html><body>current title</body></html>'
+  }), { reschedule: false });
+  assert.equal(result.ok, true);
+  assert.equal(result.needsReview, true);
+  assert.equal(result.reason, 'selection-content-empty');
+  assert.match(result.message, /요소는 찾았지만/);
+  assert.match(result.message, /title·aria-label·href/);
+  const stored = await env.api.getMonitorById('m1');
+  assert.equal(stored.lastError, result.message);
+  assert.equal(stored.snapshot.text, 'previous title');
+  assert.equal(stored.lastErrorSnapshot.matchCount, 1);
+  assert.equal(stored.runs[0].code, 'selection-content-empty');
+
+  const missing = env.api.applySnapshotOutcome(monitor(), env.api.normalizeSnapshot({
+    exists: false, matchCount: 0, text: '', selectorMatches: [{ type: 'css', expr: 'a', op: 'include', matchCount: 0 }]
+  }), '2026-10-06T01:00:00Z');
+  assert.equal(missing.reason, 'selection-empty');
+  const allowEmpty = monitor({ tracking: { allowEmpty: true } });
+  const allowed = env.api.applySnapshotOutcome(allowEmpty, env.api.normalizeSnapshot({ exists: false, matchCount: 1, text: '' }), '2026-10-06T01:00:00Z');
+  assert.equal(allowed.needsReview, false);
+  assert.equal(allowEmpty.lastError, null);
+});
+
 test('manual, batch, scheduler and live share six permits and two per origin', async () => {
   const env = harness();
   let active = 0, maximum = 0;

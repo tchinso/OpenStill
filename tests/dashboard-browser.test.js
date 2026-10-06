@@ -161,6 +161,22 @@ test('invalid locator editor blocks save and valid duplicate submits use one rev
   } finally { await page.close(); }
 });
 
+test('matched empty-content reviews show the capture diagnosis in the dashboard', { skip: !chromium }, async () => {
+  const { page, errors } = await fixture(1);
+  try {
+    const message = '선택한 요소는 찾았지만 추적 내용이 비어 있습니다. 텍스트나 속성 필드를 확인해 주세요.';
+    await page.evaluate((lastError) => {
+      window.__messageHandler = (request) => request.type === 'check-monitor'
+        ? { ok: true, needsReview: true, reason: 'selection-content-empty', message: lastError, monitor: { id: window.__monitors[0].id } }
+        : undefined;
+    }, message);
+    await page.locator('.row-name').click();
+    await page.locator('#monitorDetailDialog [data-action="check"]').click();
+    assert.equal(await page.locator('#toast').textContent(), message);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
 test('all failed page checks report failure and refresh failures release check buttons', { skip: !chromium }, async () => {
   const { page, errors } = await fixture(1);
   try {
