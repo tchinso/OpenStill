@@ -20,7 +20,7 @@ globalThis.__openStillTest = {
   mutateMonitors,
   persistNormalizedMonitorRepairs,
   startExportSession,
-  startImportSession, checkpointExportSession, finishExportSession, getMonitorById, recoveryStatus, abortImportSession,
+  startImportSession, touchImportSession, checkpointExportSession, finishExportSession, getMonitorById, recoveryStatus, abortImportSession,
   exportMonitorRecordForTransfer, normalizeSnapshot, normalizeMonitor, snapshotsEqual, compareSnapshotIdentities, importMonitors, appendImportFragments, reusePageUrl, replaceSiteHost
 };`;
 
@@ -421,4 +421,112 @@ test('export includes a worker-terminated source file even before pause finaliza
   for (let index = 0; index < exported.total; index += 1) records.push(JSON.parse((await env.api.getExportMonitor({ id: exported.id, index })).record));
   const file = records.find((record) => record._openStillRecoveryFile)._openStillRecoveryFile;
   assert.equal(Buffer.from(file.base64, 'base64').toString(), await original.text());
+});
+
+test('a restarted import keeps durable records when its session checkpoint lagged behind', async () => {
+  const env = harness(); const started = await env.api.startImportSession();
+  const checkpoint = await env.store.getAux('staging', 'import:' + started.id);
+  await env.api.appendImportSession({ id: started.id, monitors: [monitor({ id: 'already-durable' })] });
+  // Termination can happen after the atomic record/index write and before the
+  // updated session checkpoint. Restore that exact on-disk state.
+  await env.store.putAux('staging', 'import:' + started.id, checkpoint);
+  const restarted = harness({}, env.localValues);
+  await restarted.api.startImportSession({ resumeId: started.id });
+  await restarted.api.appendImportSession({ id: started.id, monitors: [monitor({ id: 'next-record' })] });
+  const result = await restarted.api.finishImportSession({ id: started.id });
+  assert.equal(result.imported, 2);
+  assert.deepEqual(Array.from((await restarted.api.getState()).monitors, (item) => item.id).sort(), ['already-durable', 'next-record']);
+});
+
+test('a concurrent session touch cannot replace a newer append checkpoint after restart', async () => {
+  const initial = harness(); const started = await initial.api.startImportSession();
+  const env = harness({}, initial.localValues);
+  const get = env.chrome.storage.local.get;
+  let release; let entered; let held = false;
+  const reading = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  env.chrome.storage.local.get = async (keys) => {
+    const result = await get(keys);
+    if (!held && keys === 'openStill.record-store.v1.staging.prepared-index:' + started.id + ':0') {
+      held = true; entered(); await gate;
+    }
+    return result;
+  };
+  const touching = env.api.touchImportSession({ id: started.id });
+  await reading;
+  await env.api.appendImportSession({ id: started.id, monitors: [monitor({ id: 'first-append' })] });
+  release(); await touching;
+  await env.api.appendImportSession({ id: started.id, monitors: [monitor({ id: 'second-append' })] });
+  const result = await env.api.finishImportSession({ id: started.id });
+  assert.equal(result.imported, 2);
+  assert.deepEqual(Array.from((await env.api.getState()).monitors, (item) => item.id).sort(), ['first-append', 'second-append']);
+});
+
+test('invalid original-file base64 is preserved without blocking healthy sibling records', async () => {
+  const env = harness(); const started = await env.api.startImportSession();
+  const malformed = { _openStillRecoveryFile: { id: 'damaged-file', name: 'original.json', chunkIndex: 0, chunkCount: 1, base64: '%%%invalid%%%' } };
+  const appended = await env.api.appendImportSession({ id: started.id, monitors: [malformed, monitor({ id: 'healthy-sibling' })] });
+  assert.equal(appended.rejected, 1); assert.equal(appended.prepared, 1);
+  const result = await env.api.finishImportSession({ id: started.id });
+  assert.equal(result.imported, 1); assert.equal(result.recoveryPending, 1);
+  const preserved = (await env.store.allAux('recovery')).find((entry) => entry.raw?._openStillRecoveryFile);
+  assert.deepEqual(clone(preserved.raw), malformed);
+});
+
+test('optional local backup streams, restores, and roundtrips without losing monitor content', { skip: !process.env.OPENSTILL_SAMPLE_BACKUP }, async (t) => {
+  const Scanner = require('../recovery-json.js');
+  const integrity = require('../backup-integrity.js');
+  const env = harness(); const started = await env.api.startImportSession();
+  const checksum = integrity.createChecksumState();
+  let monitorCount = 0; let fragmentCount = 0; let logicalMonitorCount = 0;
+  let snapshotCount = 0; let nativeCount = 0; let originalCount = 0;
+  const scanner = new Scanner(async (record, kind) => {
+    integrity.appendSerializedRecord(checksum, kind, JSON.stringify(record));
+    if (kind === 'fragment') {
+      fragmentCount += 1; if (record.fragmentIndex === 0) logicalMonitorCount += 1;
+      await env.api.appendImportFragments({ id: started.id, exportId: scanner.metadata.exportId, fragments: [record] });
+    } else {
+      monitorCount += 1; logicalMonitorCount += 1;
+      if (record?._openStillSnapshot) snapshotCount += 1;
+      if (record?._openStillMonitorRecord) nativeCount += 1;
+      if (record?._openStillRecovery || record?._openStillRecoveryFile) originalCount += 1;
+      await env.api.appendImportSession({ id: started.id, monitors: [record] });
+    }
+  });
+  for await (const chunk of fs.createReadStream(process.env.OPENSTILL_SAMPLE_BACKUP, { encoding: 'utf8', highWaterMark: 64 * 1024 })) await scanner.write(chunk);
+  const parsed = await scanner.finish();
+  assert.equal(parsed.diagnostics.length, 0);
+  const inspected = integrity.inspectBackupPart({ ...parsed.metadata, monitors: [], fragments: [] },
+    { monitorCount, fragmentCount, logicalMonitorCount, checksum: integrity.finishChecksum(checksum) });
+  assert.equal(inspected.ok, true);
+  assert.equal(integrity.validateBackupPartSelection([inspected.part]).ok, true);
+  const imported = await env.api.finishImportSession({ id: started.id });
+  assert.equal(imported.recoveryPending, 0);
+  assert.equal(imported.imported, nativeCount);
+  const before = new Map();
+  for (const entry of (await env.api.getState()).monitors) before.set(entry.id, await env.api.getMonitorById(entry.id));
+  const exporting = await env.api.startExportSession();
+  assert.equal(exporting.normalCount, nativeCount);
+  assert.ok(exporting.originalCount >= originalCount);
+  const target = harness(); const receiving = await target.api.startImportSession();
+  for (let index = 0; index < exporting.total; index += 1) {
+    const result = await env.api.getExportMonitor({ id: exporting.id, index });
+    assert.equal(typeof result.record, 'string', 'sample record fits direct transfer');
+    await target.api.appendImportSession({ id: receiving.id, monitors: [JSON.parse(result.record)] });
+  }
+  const restored = await target.api.finishImportSession({ id: receiving.id });
+  assert.equal(restored.imported, imported.imported); assert.equal(restored.recoveryPending, 0);
+  const keys = ['name', 'url', 'labels', 'locators', 'tracking', 'schedule', 'snapshot', 'lastErrorSnapshot', 'lastChange', 'history', 'runs', 'unread', 'lastViewedAt'];
+  for (const [id, original] of before) {
+    const record = await target.api.getMonitorById(id);
+    assert.ok(record);
+    for (const key of keys) {
+      // Hash assertions keep private content and addresses out of test output.
+      assert.equal(await target.store.digest(JSON.stringify(record[key]) || ''), await env.store.digest(JSON.stringify(original[key]) || ''), 'roundtrip changed field ' + key);
+    }
+  }
+  const replay = await target.api.importMonitors({ monitors: await Promise.all([...before.values()]) });
+  assert.equal(replay.imported, 0); assert.equal(replay.duplicates, nativeCount);
+  t.diagnostic(JSON.stringify({ bytes: fs.statSync(process.env.OPENSTILL_SAMPLE_BACKUP).size, monitorCount, fragmentCount, snapshotCount, nativeCount, originalCount,
+    restored: restored.imported, duplicateReplay: replay.duplicates, checksumVerified: inspected.part.verified }));
 });

@@ -194,6 +194,33 @@ test('XCSS execution does not affect a later CSS capture in the same frame', { s
   await page.close();
 });
 
+test('standalone XCSS capture handles escaped combinators in IDs before shadow descendants', { skip: !chromium }, async () => {
+  const page = await browser.newPage();
+  try {
+    await page.setContent('<main></main>');
+    const results = await page.evaluate(async (captureSource) => {
+      const capture = (0, eval)(`(${captureSource})`);
+      const outputs = [];
+      for (const symbol of ['+', '>', '~']) {
+        const host = document.createElement('entry-feed');
+        host.id = 'feed' + symbol;
+        host.innerHTML = '<h2 class="headline">Light entry</h2>';
+        host.attachShadow({ mode: 'open' }).innerHTML = '<h2 class="headline">Shadow entry</h2>';
+        document.querySelector('main').append(host);
+        const expr = '#' + CSS.escape(host.id) + ' .headline';
+        outputs.push(await capture([{ type: 'xcss', expr, op: 'include' }], 0, 0, 0, 0, 0, {}));
+      }
+      return outputs;
+    }, captureSource);
+    for (const result of results) {
+      assert.equal(result.ok, true, result.error);
+      assert.equal(result.matchCount, 2);
+      assert.match(result.text, /Light entry/);
+      assert.match(result.text, /Shadow entry/);
+    }
+  } finally { await page.close(); }
+});
+
 test('empty retries compare only final HTML and ten thousand roots stay bounded', { skip: !chromium }, async () => {
   const empty = await captureFixture('<div id="empty"></div>', [{ type: 'css', expr: '#empty', op: 'include' }], { allowEmpty: true, retryCount: 2 });
   assert.equal(empty.output.data, empty.output.html);

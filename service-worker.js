@@ -1959,10 +1959,12 @@ async function trimHydratedMonitors(protectedId) {
   for (const [id, size] of hydratedMonitorIds) {
     if (bytes <= MAX_HYDRATED_MONITOR_BYTES) break;
     if (id === protectedId || checksInProgress.has(id) || typeof captureTasks !== 'undefined' && captureTasks.has(id)) continue;
+    const current = repository.monitors.get(id);
     const pendingRepair = repository.recovery.some((entry) => entry.source === 'records' && entry.recordId === id);
     if (pendingRepair && repairedMonitorShells.has(id)) repository.monitors.set(id, repairedMonitorShells.get(id));
     else {
       const envelope = await OpenStillRecordStore.getAux('monitors', id);
+      if (repository.monitors.get(id) !== current) continue;
       if (envelope?.record) repository.monitors.set(id, envelope.record);
       repairedMonitorShells.delete(id);
     }
@@ -2040,22 +2042,32 @@ async function getMonitorById(id) {
   if (!referenced) return monitor;
   if (hydrationInProgress.has(id)) return hydrationInProgress.get(id);
   const operation = (async () => {
-    const restored = await hydrateMonitorSnapshotsIndependently(monitor, { versions: () => OpenStillRecordStore.getAux('versions', id).then((values) => values || []) });
-    const hydrated = restored.monitor;
-    if (restored.recovery.length) {
-      const envelope = await OpenStillRecordStore.getAux('monitors', id);
-      const entries = [{ id: 'damaged-' + id + '-' + repository.generation, source: 'records', recordId: id, raw: envelope,
-        error: hydrated.lastError || '스냅샷 복사본에서 정상 내용을 회수했습니다.' }, ...restored.recovery];
-      for (const entry of entries) {
-        const index = repository.recovery.findIndex((existing) => existing.id === entry.id);
-        if (index === -1) repository.recovery.push(entry); else repository.recovery[index] = entry;
+    while (true) {
+      const monitor = repository.monitors.get(id);
+      if (!monitor) return null;
+      const referenced = monitor.snapshot?.$snapshot || monitor.lastErrorSnapshot?.$snapshot || monitor.lastChange?.previous?.$snapshot || monitor.lastChange?.current?.$snapshot || (monitor.history || []).some((entry) => entry.snapshot?.$snapshot);
+      if (!referenced) return monitor;
+      const restored = await hydrateMonitorSnapshotsIndependently(monitor, { versions: () => OpenStillRecordStore.getAux('versions', id).then((values) => values || []) });
+      const hydrated = restored.monitor;
+      const envelope = restored.recovery.length ? await OpenStillRecordStore.getAux('monitors', id) : null;
+      // Snapshot reads yield to committed edits/deletions. Never publish an old
+      // shell (or its repair diagnostics) over a newer repository record.
+      if (repository.monitors.get(id) !== monitor) continue;
+      if (restored.recovery.length) {
+        const entries = [{ id: 'damaged-' + id + '-' + repository.generation, source: 'records', recordId: id, raw: envelope,
+          error: hydrated.lastError || '스냅샷 복사본에서 정상 내용을 회수했습니다.' }, ...restored.recovery];
+        for (const entry of entries) {
+          const index = repository.recovery.findIndex((existing) => existing.id === entry.id);
+          if (index === -1) repository.recovery.push(entry); else repository.recovery[index] = entry;
+        }
+        repairedMonitorShells.set(id, restored.shell);
       }
-      repairedMonitorShells.set(id, restored.shell);
+      repository.monitors.set(id, hydrated); repository.summaries.set(id, dashboardMonitorSummary(hydrated));
+      hydratedMonitorIds.delete(id); hydratedMonitorIds.set(id, monitorBodyBytes(hydrated));
+      await trimHydratedMonitors(id);
+      if (repository.monitors.get(id) !== hydrated) continue;
+      return hydrated;
     }
-    repository.monitors.set(id, hydrated); repository.summaries.set(id, dashboardMonitorSummary(hydrated));
-    hydratedMonitorIds.delete(id); hydratedMonitorIds.set(id, monitorBodyBytes(hydrated));
-    await trimHydratedMonitors(id);
-    return hydrated;
   })().finally(() => hydrationInProgress.delete(id));
   hydrationInProgress.set(id, operation); return operation;
 }
@@ -2166,12 +2178,13 @@ async function startDashboardLoad() {
   pruneTransientSessions();
   const state = await getState();
   const id = createId();
+  const monitors = await getMonitorSummaries();
   dashboardLoadSessions.set(id, {
-    monitors: await getMonitorSummaries(),
+    monitors,
     settings: state.settings,
     expiresAt: Date.now() + DASHBOARD_SESSION_TTL_MS
   });
-  return { ok: true, id, total: state.monitors.length, settings: state.settings };
+  return { ok: true, id, total: monitors.length, settings: state.settings };
 }
 
 function getDashboardLoadPage(message) {
@@ -2323,7 +2336,7 @@ function mutateMonitors(mutator, options = {}) {
       hydratedMonitorIds.delete(monitor.id);
       repairedMonitorShells.delete(monitor.id);
     }
-    for (const id of deletedIds) { repository.summaries.delete(id); repairedMonitorShells.delete(id); }
+    for (const id of deletedIds) { repository.summaries.delete(id); repairedMonitorShells.delete(id); hydratedMonitorIds.delete(id); }
     repository.generation = generation; repository.migrated = true; repository.recovery = [];
     repository.diagnostics.normalCount = next.size;
     repository.diagnostics.repairedCount = [...next.values()].filter((monitor) => monitor.recoveryIssues?.length || monitor.recoveryRepairs?.length).length;
@@ -2792,11 +2805,19 @@ async function captureReferenceRenderedDocumentCollection(...args) {
       if (/\s/.test(character) && !square && !round) flush(); else value += character;
     }
     flush();
+    const endsWithCombinator = (part) => {
+      if (!/[>+~]$/.test(part)) return false;
+      let escapes = 0;
+      for (let index = part.length - 2; index >= 0 && part[index] === '\\'; index -= 1) escapes += 1;
+      // Keep escaped ID punctuation as part of its descendant query step,
+      // matching the packaged SelectorX parser used by the picker.
+      return escapes % 2 === 0;
+    };
     for (let index = 0; index < parts.length; index += 1) {
       if (/^[>+~]$/.test(parts[index]) && index > 0 && index < parts.length - 1) {
         parts[index - 1] += parts[index] + parts[index + 1];
         parts.splice(index, 2); index -= 1;
-      } else if (/[>+~]$/.test(parts[index]) && index < parts.length - 1) {
+      } else if (endsWithCombinator(parts[index]) && index < parts.length - 1) {
         parts[index] += parts[index + 1]; parts.splice(index + 1, 1); index -= 1;
       } else if (/^[>+~]/.test(parts[index]) && index > 0) {
         parts[index - 1] += parts[index]; parts.splice(index, 1); index -= 1;
@@ -4328,7 +4349,7 @@ function retryDelayForSchedule(monitor) {
 
 async function setCheckFailure(id, expectedRevision, status, errorMessage, source = 'manual') {
   const checkedAt = nowIso();
-  await mutateMonitors((monitors) => {
+  const updated = await mutateMonitors((monitors) => {
     const monitor = monitors.find((item) => item.id === id);
     if (!monitor || !monitor.enabled || monitor.revision !== expectedRevision) {
       return null;
@@ -4356,6 +4377,7 @@ async function setCheckFailure(id, expectedRevision, status, errorMessage, sourc
     });
     return monitor;
   }, { operation: false });
+  if (updated) liveSessions.get(id)?.rawTextByFrame?.clear();
 }
 
 function statusForStoredSnapshot(snapshot, tracking = null) {
@@ -4509,7 +4531,8 @@ async function checkMonitorWithCapture(id, capture, {
     if (source === 'live') {
       // Dedupe uses the same complete comparison semantics as persisted
       // snapshots, including links, attributes and data-only changes.
-      const rawText = JSON.stringify([nextSnapshot?.exists, nextSnapshot?.textFingerprint || snapshotFingerprint(nextSnapshot?.text || ''), nextSnapshot?.dataFingerprint || snapshotFingerprint(nextSnapshot?.data || ''), snapshotFingerprint(JSON.stringify(nextSnapshot?.items?.map((item) => [item.identity, item.permalink]) || []))]);
+      const rawText = JSON.stringify([nextSnapshot?.exists, nextSnapshot?.textFingerprint || snapshotFingerprint(nextSnapshot?.text || ''), nextSnapshot?.dataFingerprint || snapshotFingerprint(nextSnapshot?.data || ''), snapshotFingerprint(JSON.stringify(nextSnapshot?.items?.map((item) => [item.identity, item.permalink]) || [])),
+        nextSnapshot?.captureQuality, nextSnapshot?.selectorMatches]);
       const session = liveSessions.get(id);
       const expectedSession = session
         && session.revision === monitor.revision
@@ -4585,6 +4608,9 @@ async function checkMonitorWithCapture(id, capture, {
     if (result?.ok) {
       forgetPendingCapture(id);
       const hadBackoff = storageFailureBackoff.delete(id);
+      // A scheduled/manual result can change the baseline or error state
+      // without changing the live observer's last captured payload.
+      if (source !== 'live') liveSessions.get(id)?.rawTextByFrame?.clear();
       if (pendingLiveCache && liveSessions.get(id) === pendingLiveCache.session) pendingLiveCache.session.rawTextByFrame.set(pendingLiveCache.frameId, pendingLiveCache.rawText);
       if (hadBackoff) await mutateRuntimeState((state) => { delete state.backoff[id]; }).catch(() => undefined);
     } else if (result?.reason === 'outdated') {

@@ -1615,14 +1615,21 @@
         return;
       }
       const runtime = globalThis.__openStillSelectorX;
+      // A format conversion must preserve the same tracking intent as the
+      // initial click. Page content such as names and links changes between
+      // checks and must not become a new selector constraint here.
+      const generatorOptions = {
+        timeout: 500,
+        filterCallback: (_type, name, value) => allowsGeneratedSelectorEvidence(name, value)
+      };
       let selector = '';
       try {
         if (nextType === 'xpath') {
-          selector = await Promise.resolve(runtime?.getXPATH?.(targets, { timeout: 500 }));
+          selector = await Promise.resolve(runtime?.getXPATH?.(targets, generatorOptions));
         } else if (nextType === 'xcss') {
-          selector = await Promise.resolve(runtime?.getExtendedCSS?.(targets, { timeout: 500 }));
+          selector = await Promise.resolve(runtime?.getExtendedCSS?.(targets, generatorOptions));
         } else if (targets.every((element) => selectorTypeFor(element) !== 'xcss')) {
-          selector = await Promise.resolve(runtime?.getCSS?.(targets, { timeout: 500 }));
+          selector = await Promise.resolve(runtime?.getCSS?.(targets, generatorOptions));
           if (!selector) selector = selectorFor(target);
         }
       } catch {
@@ -1641,7 +1648,7 @@
         // Keep the existing type and locator when the generated expression is
         // rejected by the browser's native selector/XPath evaluator.
       }
-      if (!matches.length || targets.some((element) => !matches.includes(element))) {
+      if (matches.length !== targets.length || targets.some((element) => !matches.includes(element))) {
         this.selectorTypeInput.value = previousType;
         this.message.textContent = '변환한 선택자가 현재 요소와 일치하지 않습니다.';
         return;
@@ -1800,7 +1807,10 @@
       // represent a shadow boundary, so retain XCSS for shadow-tree targets.
       if (!selector && selectorType !== 'xcss') {
         try {
-          const xpath = await Promise.resolve(globalThis.__openStillSelectorX?.getXPATH?.([element], { timeout: 500 }));
+          const xpath = await Promise.resolve(globalThis.__openStillSelectorX?.getXPATH?.([element], {
+            timeout: 500,
+            filterCallback: (_type, name, value) => allowsGeneratedSelectorEvidence(name, value)
+          }));
           if (typeof xpath === 'string' && xpath && hasSingleMatch(xpath, element, 'xpath')) {
             selector = xpath;
             selectorType = 'xpath';

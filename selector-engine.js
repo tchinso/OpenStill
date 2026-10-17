@@ -1312,13 +1312,21 @@
     // Native combinators remain a single query step. A plain whitespace is
     // deliberately left as a step boundary, which is what lets it pierce an
     // intervening shadow root.
+    const endsWithCombinator = (part) => {
+      if (!/[>+~]$/.test(part)) return false;
+      let escapes = 0;
+      for (let index = part.length - 2; index >= 0 && part[index] === '\\'; index -= 1) escapes += 1;
+      // CSS.escape() can leave an escaped punctuation character at the end
+      // of an ID. It belongs to that identifier, not the next query step.
+      return escapes % 2 === 0;
+    };
     for (let index = 0; index < parts.length; index += 1) {
       const part = parts[index];
       if (/^[>+~]$/.test(part) && index > 0 && index < parts.length - 1) {
         parts[index - 1] += part + parts[index + 1];
         parts.splice(index, 2);
         index -= 1;
-      } else if (/[>+~]$/.test(part) && index < parts.length - 1) {
+      } else if (endsWithCombinator(part) && index < parts.length - 1) {
         parts[index] += parts[index + 1];
         parts.splice(index + 1, 1);
         index -= 1;

@@ -15,7 +15,21 @@ async function persistImportSession(session) {
   importSessions.set(session.id, session);
 }
 async function loadImportSession(id) {
-  return importSessions.get(id) || await OpenStillRecordStore.getAux('staging', 'import:' + id);
+  const cached = importSessions.get(id);
+  if (cached) return cached;
+  const session = await OpenStillRecordStore.getAux('staging', 'import:' + id);
+  if (session) {
+    // The atomic record/index write can finish before the session checkpoint.
+    // Recover the durable append position before another record uses its index.
+    await preparedImportKeys(session);
+    // A concurrent status read/resume may have loaded an older checkpoint.
+    // Keep the session another request published while this scan was awaiting.
+    const current = importSessions.get(id);
+    if (current) return current;
+    session.sourceCount = Math.max(session.sourceCount || 0, session.preparedCount || 0);
+    importSessions.set(id, session);
+  }
+  return session;
 }
 async function startImportSession(message = {}) {
   if (message.resumeId) {
@@ -82,6 +96,11 @@ async function prepareImportSessionMonitor(session, raw, source = {}) {
     if (typeof piece.id !== 'string' || !Number.isSafeInteger(piece.chunkCount) || piece.chunkCount < 1 || piece.chunkCount > 100000
       || !Number.isSafeInteger(piece.chunkIndex) || piece.chunkIndex < 0 || piece.chunkIndex >= piece.chunkCount || typeof piece.base64 !== 'string') {
       session.rejected += 1; summary.rejected = 1; await preserveImportRaw(session, raw, source.fileName || 'recovery-file', '원문 파일 조각의 식별 정보가 잘못되었습니다.'); return summary;
+    }
+    try { atob(piece.base64); }
+    catch {
+      session.rejected += 1; summary.rejected = 1;
+      await preserveImportRaw(session, raw, source.fileName || 'recovery-file', '원문 파일 조각의 Base64 내용을 해석하지 못했습니다.'); return summary;
     }
     const fileKey = 'recovery-file:' + session.id + ':' + piece.id;
     session.recoveryFiles ||= {};

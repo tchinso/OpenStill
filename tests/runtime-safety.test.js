@@ -129,6 +129,82 @@ test('live data mode notices a link-only change with identical visible text', as
   assert.equal(result.changed, true);
 });
 
+test('live dedupe observes selection health changes even when the captured text is identical', async () => {
+  const env = harness([monitor({ tracking: { live: true }, snapshot: { exists: true, text: 'same' } })]);
+  await env.ready(); env.api.setSession('m1', { tabId: 1, revision: 'r1' });
+  const capture = (partial) => () => env.api.normalizeSnapshot({ exists: true, text: 'same',
+    captureQuality: { status: partial ? 'partial' : 'complete' },
+    selectorMatches: [{ expr: '.title', type: 'css', op: 'include', matchCount: partial ? 0 : 1 }] });
+  const options = { source: 'live', reschedule: false };
+  await env.api.checkMonitorWithCapture('m1', capture(false), options);
+  const partial = await env.api.checkMonitorWithCapture('m1', capture(true), options);
+  assert.equal(partial.needsReview, true);
+  assert.equal((await env.api.getMonitorById('m1')).status, 'needs-review');
+  const recovered = await env.api.checkMonitorWithCapture('m1', capture(false), options);
+  assert.equal(recovered.needsReview, false);
+  assert.equal((await env.api.getMonitorById('m1')).lastError, null);
+  const repeated = await env.api.checkMonitorWithCapture('m1', capture(false), options);
+  assert.equal(repeated.liveNoop, true);
+});
+
+test('an unchanged live capture clears a preceding scheduled failure', async () => {
+  const env = harness([monitor({ tracking: { live: true }, snapshot: { exists: true, text: 'same' } })]);
+  await env.ready(); env.api.setSession('m1', { tabId: 1, revision: 'r1' });
+  const capture = () => env.api.normalizeSnapshot({ exists: true, text: 'same' });
+  await env.api.checkMonitorWithCapture('m1', capture, { source: 'live', reschedule: false });
+  await env.api.checkMonitorWithCapture('m1', () => { throw new Error('temporary page failure'); }, { source: 'scheduled', reschedule: false });
+  assert.equal((await env.api.getMonitorById('m1')).status, 'error');
+  await env.api.checkMonitorWithCapture('m1', capture, { source: 'live', reschedule: false });
+  const current = await env.api.getMonitorById('m1');
+  assert.equal(current.status, 'ok');
+  assert.equal(current.lastError, null);
+});
+
+test('live captures compare against the latest successful scheduled baseline', async () => {
+  const env = harness([monitor({ tracking: { live: true }, snapshot: { exists: true, text: 'A' } })]);
+  await env.ready(); env.api.setSession('m1', { tabId: 1, revision: 'r1' });
+  const capture = (text) => () => env.api.normalizeSnapshot({ exists: true, text });
+  await env.api.checkMonitorWithCapture('m1', capture('A'), { source: 'live', reschedule: false });
+  await env.api.checkMonitorWithCapture('m1', capture('B'), { source: 'scheduled', reschedule: false });
+  const result = await env.api.checkMonitorWithCapture('m1', capture('A'), { source: 'live', reschedule: false });
+  assert.equal(result.changed, true);
+  const current = await env.api.getMonitorById('m1');
+  assert.equal(current.lastChange.previous.text, 'B');
+  assert.equal(current.lastChange.current.text, 'A');
+});
+
+for (const action of ['delete', 'label']) {
+  test(`reading a snapshot cannot undo a concurrent ${action} commit`, async () => {
+    const env = harness([monitor({ snapshot: { exists: true, text: 'saved baseline' } })]);
+    await env.ready();
+    assert.ok((await env.api.getMonitors())[0].snapshot.$snapshot);
+    const originalStore = env.context.OpenStillRecordStore;
+    let release; let entered;
+    const started = new Promise((resolve) => { entered = resolve; });
+    const gate = new Promise((resolve) => { release = resolve; });
+    let held = false;
+    env.context.OpenStillRecordStore = { ...originalStore, async unpack(...args) {
+      if (!held) { held = true; entered(); await gate; }
+      return originalStore.unpack(...args);
+    } };
+    const reading = env.api.getMonitorById('m1');
+    await started;
+    if (action === 'delete') await env.api.deleteMonitor('m1');
+    else await env.api.updateMonitorLabels({ ids: ['m1'], mode: 'add', label: 'new label' });
+    release();
+    const read = await reading;
+    if (action === 'delete') {
+      assert.equal(read, null);
+      assert.equal(await env.api.getMonitorById('m1'), null);
+      assert.equal((await env.api.getMonitors()).length, 0);
+    } else {
+      assert.deepEqual(Array.from(read.labels), ['new label']);
+      assert.deepEqual(Array.from((await env.api.getMonitorById('m1')).labels), ['new label']);
+      assert.equal(read.snapshot.text, 'saved baseline');
+    }
+  });
+}
+
 test('pause and deletion storage failures leave the running live session intact', async () => {
   for (const action of ['pause', 'delete']) {
     const env = harness([monitor({ tracking: { live: true } })]); await env.ready(); env.api.setSession('m1', { tabId: 1, revision: 'r1' }); env.state.failCommit = true;

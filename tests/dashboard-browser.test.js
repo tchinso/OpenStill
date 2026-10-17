@@ -161,6 +161,55 @@ test('invalid locator editor blocks save and valid duplicate submits use one rev
   } finally { await page.close(); }
 });
 
+test('switching schedule modes excludes hidden invalid inputs from form validation', { skip: !chromium }, async () => {
+  const { page, errors } = await fixture(1);
+  try {
+    await page.locator('.row-name').click();
+    await page.locator('#monitorDetailDialog [data-action="edit"]').click();
+    await page.locator('#editScheduleMode').selectOption('interval');
+    await page.locator('#editIntervalSeconds').fill('1');
+    assert.equal(await page.locator('#editorForm').evaluate((form) => form.checkValidity()), false);
+    await page.locator('#editScheduleMode').selectOption('random');
+    await page.locator('#editRandomMinSeconds').fill('2');
+    await page.locator('#editScheduleMode').selectOption('manual');
+    assert.equal(await page.locator('#editorForm').evaluate((form) => form.checkValidity()), true);
+    await page.locator('#editScheduleMode').selectOption('interval');
+    assert.equal(await page.locator('#editIntervalSeconds').isDisabled(), false);
+    assert.equal(await page.locator('#editorForm').evaluate((form) => form.checkValidity()), false);
+    await page.locator('#editScheduleMode').selectOption('manual');
+    await page.locator('#editName').fill('수동 확인 이름 수정');
+    await page.locator('#editorForm button[type="submit"]').click();
+    await page.waitForFunction(() => window.__messages.some((message) => message.type === 'save-monitor'));
+    const saved = await page.evaluate(() => window.__messages.find((message) => message.type === 'save-monitor'));
+    assert.equal(saved.name, '수동 확인 이름 수정');
+    assert.equal(saved.schedule.type, 'manual');
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('dashboard load stops at the final page when its initial total is stale', { skip: !chromium }, async () => {
+  const { page, errors } = await fixture(3);
+  try {
+    await page.evaluate(() => {
+      window.__pageRequests = 0;
+      window.__messageHandler = (message) => {
+        if (message.type === 'start-dashboard-load') return { ok: true, id: 'changed-load', total: 3, settings: {} };
+        if (message.type === 'get-dashboard-load-page') {
+          window.__pageRequests += 1;
+          if (window.__pageRequests > 2) return { ok: false, error: 'Final page was requested repeatedly' };
+          return { ok: true, monitors: message.offset === 0 ? window.__monitors.slice(0, 2) : [], total: 2, done: true };
+        }
+      };
+      window.__storageListeners.forEach((callback) => callback({ 'openStill.monitors.v2': { newValue: [] } }, 'local'));
+    });
+    await page.waitForFunction(() => window.__messages.some((message) => message.type === 'finish-dashboard-load' && message.id === 'changed-load'));
+    assert.equal(await page.locator('#summaryTotal').textContent(), '2');
+    assert.equal(await page.evaluate(() => window.__pageRequests), 1);
+    assert.equal(await page.locator('#exportButton').isDisabled(), false);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
 test('matched empty-content reviews show the capture diagnosis in the dashboard', { skip: !chromium }, async () => {
   const { page, errors } = await fixture(1);
   try {

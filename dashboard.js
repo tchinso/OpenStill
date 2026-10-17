@@ -868,10 +868,13 @@
             monitors.push(...(page.monitors ?? []));
             offset += (page.monitors ?? []).length;
             updateDashboardLoadProgress(offset, total);
-            if (!page.done && (page.monitors ?? []).length) await yieldToBrowser();
-            if (!page.done && !(page.monitors ?? []).length) {
+            // The page belongs to the frozen load session. Its final marker
+            // is authoritative even if the initial count became stale.
+            if (page.done) break;
+            if (!(page.monitors ?? []).length) {
               throw new Error('대시보드 데이터를 계속 불러올 수 없습니다.');
             }
+            await yieldToBrowser();
           }
         } finally {
           await send({ type: 'finish-dashboard-load', id: loadId }).catch(() => undefined);
@@ -881,7 +884,7 @@
         rebuildMonitorIndexes();
         state.settings = started.settings ?? { soundEnabled: true };
         await render();
-        finishDashboardLoadProgress(total);
+        finishDashboardLoadProgress(monitors.length);
         loadFinished = true;
         return;
       }
@@ -1127,6 +1130,11 @@
     elements.editIntervalInputs.hidden = scheduleMode !== 'interval';
     elements.editRandomInputs.hidden = scheduleMode !== 'random';
     elements.editCronInputs.hidden = scheduleMode !== 'cron';
+    // Hidden number inputs still participate in native form validation.
+    // Keep their drafts, but validate only the selected schedule mode.
+    for (const group of [elements.editIntervalInputs, elements.editRandomInputs, elements.editCronInputs]) {
+      group.querySelectorAll('input,select').forEach((input) => { input.disabled = group.hidden; });
+    }
     if (elements.editLive) {
       if (scheduleMode === 'live') elements.editLive.checked = true;
       elements.editLive.disabled = scheduleMode === 'live';

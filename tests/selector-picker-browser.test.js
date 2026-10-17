@@ -539,3 +539,79 @@ test('shadow attribute preview retains live style and inline handler values exac
     assert.equal(captured.text, selected.preview);
   } finally { await page.close(); }
 });
+
+test('selector type conversion keeps changing title attributes out of generated tracking rules', { skip: !chromium }, async () => {
+  for (const type of ['xpath', 'xcss']) {
+    const page = await fixture('<main><h2 class="title" aria-label="First entry">First entry</h2><h2 class="title" aria-label="Second entry">Second entry</h2></main>');
+    try {
+      await page.evaluate(async (nextType) => {
+        const picker = globalThis.__openStillPickerInstance__;
+        await picker.selectElement(document.querySelector('.title'));
+        await picker.changeActiveSelectorType(nextType);
+      }, type);
+      const selected = await selectionSnapshot(page);
+      assert.equal(selected.selectorType, type);
+      assert.equal(selected.totalMatchCount, 1);
+      assert.doesNotMatch(selected.selector, /aria-label|First entry/);
+      await page.evaluate(() => {
+        const title = document.querySelector('.title');
+        title.textContent = 'Updated entry';
+        title.setAttribute('aria-label', 'Updated entry');
+        globalThis.__openStillPickerInstance__.validateSelector();
+      });
+      assert.equal((await selectionSnapshot(page)).preview, 'Updated entry');
+      const captured = await captureSelections(page);
+      assert.equal(captured.ok, true, captured.error);
+      assert.equal(captured.text, 'Updated entry');
+    } finally { await page.close(); }
+  }
+});
+
+test('selector type conversion rejects a broader shadow-piercing match set', { skip: !chromium }, async () => {
+  const page = await fixture('<h2 class="headline">Chosen entry</h2><entry-feed></entry-feed>', () => {
+    document.querySelector('entry-feed').attachShadow({ mode: 'open' }).innerHTML = '<h2 class="headline">Unrelated entry</h2>';
+  });
+  try {
+    await page.evaluate(async () => {
+      await globalThis.__openStillPickerInstance__.selectElement(document.querySelector('.headline'));
+    });
+    const selected = await selectionSnapshot(page);
+    assert.equal(selected.selectorType, 'css');
+    await page.evaluate(async () => { await globalThis.__openStillPickerInstance__.changeActiveSelectorType('xcss'); });
+    const converted = await selectionSnapshot(page);
+    assert.equal(converted.selectorType, selected.selectorType);
+    assert.equal(converted.selector, selected.selector);
+    assert.equal(converted.totalMatchCount, 1);
+    assert.equal((await captureSelections(page)).text, 'Chosen entry');
+  } finally { await page.close(); }
+});
+
+test('extended CSS preserves escaped combinator characters at descendant and shadow boundaries', { skip: !chromium }, async () => {
+  const page = await fixture('<main></main>', () => {
+    for (const symbol of ['+', '>', '~']) {
+      const host = document.createElement('entry-feed');
+      host.id = `feed${symbol}`;
+      host.innerHTML = '<h2 class="headline">Light entry</h2><p class="detail">Details</p>';
+      host.attachShadow({ mode: 'open' }).innerHTML = '<h2 class="headline">Shadow entry</h2><p class="detail">Details</p>';
+      document.querySelector('main').append(host);
+    }
+  });
+  try {
+    const results = await page.evaluate(() => ['+', '>', '~'].map((symbol) => {
+      const engine = globalThis.__openStillSelectorX;
+      const host = document.getElementById(`feed${symbol}`);
+      const prefix = '#' + CSS.escape(host.id);
+      return {
+        symbol,
+        descendants: engine.querySelectorAll(prefix + ' .headline').map((element) => element.textContent),
+        siblings: engine.querySelectorAll(prefix + ' .headline + .detail').length,
+        children: engine.querySelectorAll(prefix + ' > .headline').map((element) => element.textContent)
+      };
+    }));
+    for (const result of results) {
+      assert.deepEqual(result.descendants, ['Light entry', 'Shadow entry'], result.symbol);
+      assert.equal(result.siblings, 2, result.symbol);
+      assert.deepEqual(result.children, ['Light entry'], result.symbol);
+    }
+  } finally { await page.close(); }
+});
