@@ -187,6 +187,78 @@ test('empty named elements default to attribute extraction without binding their
   }
 });
 
+test('pointer-disabled text under stretched links is selected and captured across DOM variants', { skip: !chromium }, async () => {
+  for (const variant of ['direct', 'inherited', 'shadow']) {
+    const markup = (title) => `<section class="card">
+      <a class="cover" href="/entries/current" rel="noopener noreferrer"></a>
+      <div style="${variant !== 'direct' ? 'pointer-events:none' : ''}">
+        <h3 class="headline" style="${variant === 'direct' ? 'pointer-events:none' : ''}">${title}</h3>
+        <p>Unrelated description</p>
+      </div></section>`;
+    const content = markup('Visible headline');
+    const page = await fixture(variant === 'shadow' ? '<entry-card></entry-card>' : content,
+      variant === 'shadow' ? () => {
+        document.querySelector('entry-card').attachShadow({ mode: 'open' });
+      } : null);
+    try {
+      if (variant === 'shadow') {
+        await page.evaluate((html) => {
+          document.querySelector('entry-card').shadowRoot.innerHTML = html;
+        }, styles + content);
+      }
+      const headline = variant === 'shadow' ? 'entry-card .headline' : '.headline';
+      assert.equal(await page.locator(headline).evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const stack = element.getRootNode().elementsFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        return !stack.includes(element) && stack.includes(element.closest('section').querySelector('a'));
+      }), true);
+      await mouseTarget(page, headline, false);
+      assert.equal((await selectionSnapshot(page)).hoveredClass, 'headline');
+      await mouseTarget(page, headline);
+      const selected = await selectionSnapshot(page);
+      assert.equal(selected.localName, 'h3');
+      assert.deepEqual(selected.fields, [{ type: 'text' }]);
+      assert.equal(selected.preview, 'Visible headline');
+      assert.doesNotMatch(selected.selector, /noopener|Visible headline/);
+      assert.equal((await captureSelections(page)).text, 'Visible headline');
+      await page.locator(headline).evaluate((element) => { element.textContent = 'Updated headline'; });
+      assert.equal((await captureSelections(page)).text, 'Updated headline');
+    } finally { await page.close(); }
+  }
+});
+
+test('geometric fallback ignores invisible and clipped text, and does not pierce dialogs or controls', { skip: !chromium }, async () => {
+  const page = await fixture(`<style>
+    .card { height:160px; }
+    .ghost { position:absolute; inset:20px; pointer-events:none; }
+    .clip { position:absolute; left:0; top:0; width:10px; height:10px; overflow:hidden; }
+    .clipped { position:absolute; left:30px; top:30px; width:250px; height:100px; pointer-events:none; }
+    .action { position:absolute; left:60px; top:60px; z-index:3; }
+    .modal { position:fixed; inset:0; z-index:10; }
+  </style><section class="card">
+    <a class="cover" href="/entry" aria-label="Card link"></a>
+    <div style="opacity:0"><h3 class="ghost">Invisible text</h3></div>
+    <h3 class="ghost" style="visibility:hidden">Hidden text</h3>
+    <div class="clip"><h3 class="clipped">Clipped text</h3></div>
+    <button class="action">Action</button>
+  </section>`);
+  try {
+    await mouseTarget(page, '.cover');
+    assert.equal((await selectionSnapshot(page)).localName, 'a');
+    assert.equal((await selectionSnapshot(page)).preview, 'Card link');
+    await page.evaluate(() => globalThis.__openStillPickerInstance__.beginPicking());
+    await mouseTarget(page, '.action');
+    assert.equal((await selectionSnapshot(page)).localName, 'button');
+    await page.evaluate(() => {
+      globalThis.__openStillPickerInstance__.beginPicking();
+      document.body.insertAdjacentHTML('beforeend', '<div class="modal"></div>');
+    });
+    await mouseTarget(page, '.cover');
+    assert.equal((await selectionSnapshot(page)).localName, 'div');
+    assert.equal(await page.evaluate(() => globalThis.__openStillPickerInstance__.currentSelection().element.className), 'modal');
+  } finally { await page.close(); }
+});
+
 test('field preview and saved extraction preserve absolute URL attributes and scalar zero and false', { skip: !chromium }, async () => {
   const page = await fixture('<a class="ordinary" href="/entries/7">Visible entry</a>', () => {
     const link = document.querySelector('.ordinary');

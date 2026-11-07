@@ -300,6 +300,48 @@
     const stack = root.elementsFromPoint(clientX, clientY);
     const overlayIndex = stack.indexOf(element);
     if (overlayIndex < 0) return element;
+    // Native hit testing omits pointer-events:none, including inherited values.
+    // Such content is still visible and extractable. Inspect only this card,
+    // without changing page styles or making the link cease receiving events.
+    const containsPoint = (rect) => rect.width > 0 && rect.height > 0
+      && clientX >= rect.left && clientX < rect.right
+      && clientY >= rect.top && clientY < rect.bottom;
+    const readable = [];
+    const walker = document.createTreeWalker(element.parentElement, NodeFilter.SHOW_ELEMENT);
+    let inspected = 0;
+    let complete = true;
+    for (let candidate = walker.nextNode(); candidate; candidate = walker.nextNode()) {
+      // Bound work on each pointer frame, even for unusually large cards.
+      if (++inspected > 500) { complete = false; break; }
+      if (candidate === element || element.contains(candidate)
+        || !isPageElement(candidate) || candidate.getRootNode() !== root) continue;
+      const style = getComputedStyle(candidate);
+      if (style.pointerEvents !== 'none' || style.visibility !== 'visible'
+        || ![...candidate.getClientRects()].some(containsPoint)) continue;
+      let visible = true;
+      for (let ancestor = candidate; ancestor; ancestor = ancestor.parentElement || ancestor.getRootNode()?.host) {
+        const ancestorStyle = getComputedStyle(ancestor);
+        if (Number(ancestorStyle.opacity) === 0 || ancestorStyle.contentVisibility === 'hidden') {
+          visible = false;
+          break;
+        }
+        if (ancestor !== candidate) {
+          const rect = ancestor.getBoundingClientRect();
+          if ((ancestorStyle.overflowX !== 'visible' && (clientX < rect.left || clientX >= rect.right))
+            || (ancestorStyle.overflowY !== 'visible' && (clientY < rect.top || clientY >= rect.bottom))) {
+            visible = false;
+            break;
+          }
+        }
+      }
+      if (visible && snapshotTextFor(candidate)) readable.push(candidate);
+    }
+    // Prefer the innermost readable box. Overlapping unrelated boxes are
+    // ambiguous without a native paint-order hit; retain the native fallback.
+    const leaves = complete
+      ? readable.filter((candidate) => !readable.some((other) => other !== candidate && candidate.contains(other)))
+      : [];
+    if (leaves.length === 1) return leaves[0];
     for (const candidate of stack.slice(overlayIndex + 1)) {
       if (!isPageElement(candidate) || candidate.getRootNode() !== root
         || !element.parentElement.contains(candidate) || candidate.contains(element)) continue;
