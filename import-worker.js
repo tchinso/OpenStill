@@ -5,8 +5,13 @@ self.addEventListener('message', async (event) => {
   if (event.data?.type === 'ack') { pendingAck?.(event.data); pendingAck = null; return; }
   if (event.data?.type !== 'parse') return;
   const { sessionId, fileIndex, storedFileId } = event.data;
-  const recoveryId = storedFileId || 'import-file:' + sessionId + ':' + fileIndex;
+  const fileKey = storedFileId || 'import-file:' + sessionId + ':' + fileIndex;
   let file = event.data.file;
+  let staged;
+  let recoveryId = null;
+  const archive = (error, diagnostics) => OpenStillRecordStore.putRecovery({
+    id: 'import-file:' + (file.name || ''), raw: file, source: file.name, error, diagnostics
+  });
   try {
     if (storedFileId) {
       const stored = await OpenStillRecordStore.getAux('staging', storedFileId)
@@ -15,7 +20,8 @@ self.addEventListener('message', async (event) => {
       if (file && !file.name) Object.defineProperty(file, 'name', { value: stored.source || storedFileId });
     }
     if (!file || typeof file.stream !== 'function') throw new Error('선택한 파일을 읽을 수 없습니다.');
-    await OpenStillRecordStore.putAux('staging', recoveryId, { kind: 'import-file', id: recoveryId, sessionId, fileIndex, raw: file, source: file.name, phase: 'parsing' });
+    staged = { kind: 'import-file', id: fileKey, sessionId, fileIndex, raw: file, source: file.name, phase: 'parsing' };
+    await OpenStillRecordStore.putAux('staging', fileKey, staged);
     const checksum = self.OpenStillBackupIntegrity.createChecksumState();
     let monitorCount = 0; let fragmentCount = 0; let logicalMonitorCount = 0;
     const scanner = new self.OpenStillRecordScanner(async (record, kind, source) => {
@@ -40,11 +46,12 @@ self.addEventListener('message', async (event) => {
     const diagnostics = [...parsed.diagnostics];
     if (!parsed.recognized) diagnostics.push({ error: '복원 가능한 독립 레코드 배열이 없습니다.' });
     if (!inspected.ok) diagnostics.push({ error: inspected.error, code: inspected.code });
-    if (diagnostics.length) await OpenStillRecordStore.putAux('recovery', recoveryId, { id: recoveryId, raw: file, source: file.name, error: diagnostics[0].error, diagnostics });
-    await OpenStillRecordStore.putAux('staging', recoveryId, { kind: 'import-file', id: recoveryId, sessionId, fileIndex, raw: file, source: file.name, phase: 'parsed', backupPart: inspected.part || null, diagnostics });
-    self.postMessage({ type: 'parsed', payload, backupPart: inspected.part || null, diagnostics, recoveryId: diagnostics.length ? recoveryId : null, monitorCount, fragmentCount });
+    if (diagnostics.length) recoveryId = await archive(diagnostics[0].error, diagnostics);
+    await OpenStillRecordStore.putAux('staging', fileKey, { ...staged, phase: 'parsed', backupPart: inspected.part || null, diagnostics, recoveryId });
+    self.postMessage({ type: 'parsed', payload, backupPart: inspected.part || null, diagnostics, recoveryId, monitorCount, fragmentCount });
   } catch (error) {
-    await OpenStillRecordStore.putAux('recovery', recoveryId, { id: recoveryId, raw: file, source: file?.name, error: error?.message }).catch(() => undefined);
+    if (!recoveryId && file instanceof Blob) recoveryId = await archive(error?.message).catch(() => null);
+    if (staged && recoveryId) await OpenStillRecordStore.putAux('staging', fileKey, { ...staged, recoveryId }).catch(() => undefined);
     self.postMessage({ type: 'error', error: error?.message || 'JSON 파일을 읽지 못했습니다.', recoveryId });
   }
 });

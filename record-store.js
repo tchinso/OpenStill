@@ -3,6 +3,8 @@
   const DB_NAME = 'openstill-records';
   const STORES = ['meta', 'monitors', 'snapshots', 'snapshotCopies', 'recovery', 'versions', 'staging', 'operations', 'jobs'];
   const PREFIX = 'openStill.record-store.v1.';
+  const RECOVERY_KEY_PREFIX = 'recovery-sha256:';
+  let fallbackRecoveryQueue = Promise.resolve();
   let opening;
   const request = (value) => new Promise((resolve, reject) => {
     value.onsuccess = () => resolve(value.result);
@@ -45,7 +47,8 @@
   async function writeTransaction(db, stores, apply) {
     const tx = db.transaction(stores, 'readwrite');
     const completion = done(tx);
-    try { apply(tx); }
+    completion.catch(() => undefined);
+    try { await apply(tx); }
     catch (error) {
       // A synchronous DataCloneError or other exception does not abort an IDB
       // transaction automatically. Roll back writes already queued in it.
@@ -121,17 +124,130 @@
     if (!db) return chrome.storage.local.set(Object.fromEntries(entries.map(([key, value]) => [PREFIX + store + '.' + key, value])));
     await writeTransaction(db, store, (tx) => { for (const [key, value] of entries) tx.objectStore(store).put(value, key); });
   }
-  async function digest(value) {
-    const bytes = new TextEncoder().encode(value);
+  async function digestBytes(bytes) {
     return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((byte) => byte.toString(16).padStart(2, '0')).join('');
   }
-  async function commitAux(patches) {
-    if (!patches.length) return;
+  function digest(value) { return digestBytes(new TextEncoder().encode(value)); }
+  async function recoveryFingerprint(entry) {
+    const { id, sourceOriginalId, contentDigest, localCapturedAt, ...original } = entry;
+    const fields = [];
+    for (const key of Object.keys(original).sort()) {
+      const value = original[key];
+      if (value === undefined) continue;
+      if (typeof Blob !== 'undefined' && value instanceof Blob) {
+        const chunks = [];
+        const chunkSize = 2 * 1024 * 1024;
+        for (let offset = 0; offset < value.size; offset += chunkSize) {
+          chunks.push(await digestBytes(await value.slice(offset, offset + chunkSize).arrayBuffer()));
+        }
+        fields.push([key, 'blob', value.name, value.type, value.lastModified, value.size, await digest(chunks.join(''))]);
+      } else {
+        fields.push([key, 'json', await digest(JSON.stringify(value))]);
+      }
+    }
+    return digest(JSON.stringify(fields));
+  }
+  function recoverySourceId(entry) {
+    for (const value of [entry.sourceOriginalId, entry.id]) if (typeof value === 'string' && value) return value;
+    return null;
+  }
+  const recoveryIndexKey = (key) => 'recovery:' + key;
+  async function prepareRecoveryEntry(entry) {
+    const contentDigest = await recoveryFingerprint(entry);
+    const sourceOriginalId = recoverySourceId(entry) || RECOVERY_KEY_PREFIX + contentDigest;
+    const baseKey = RECOVERY_KEY_PREFIX + await digest(JSON.stringify([sourceOriginalId, contentDigest]));
+    let legacyDigest = null;
+    if (!await getAux('meta', recoveryIndexKey(sourceOriginalId))) {
+      const prior = await getAux('recovery', sourceOriginalId);
+      if (prior && recoverySourceId(prior) === sourceOriginalId) legacyDigest = await recoveryFingerprint(prior);
+    }
+    const value = { ...entry, sourceOriginalId, contentDigest, localCapturedAt: new Date().toISOString() };
+    return { value, baseKey, legacyDigest };
+  }
+  async function insertRecoveryEntry({ value, baseKey, legacyDigest }, store) {
+    const { sourceOriginalId: sourceId, contentDigest } = value;
+    const matches = (index) => index?.sourceOriginalId === sourceId && index.contentDigest === contentDigest;
+    const primary = await store.has(sourceId);
+    if (primary) {
+      // Legacy entries were writable by old import code. Only the separate
+      // local index is authoritative when an original is already indexed.
+      const indexed = await store.index(sourceId);
+      if (indexed ? matches(indexed) : legacyDigest === contentDigest) return sourceId;
+    }
+    // Reuse a collision slot even if the original slot was removed later.
+    let key = baseKey;
+    for (let suffix = 1; await store.has(key); suffix += 1) {
+      if (matches(await store.index(key))) return key;
+      key = baseKey + ':' + suffix;
+    }
+    if (!primary && !sourceId.startsWith(RECOVERY_KEY_PREFIX)) key = sourceId;
+    store.add(key, { ...value, id: key }, { sourceOriginalId: sourceId, contentDigest });
+    return key;
+  }
+  async function persistPatches(patches, deletedIds = []) {
+    if (!patches.length && !deletedIds.length) return [];
+    const originals = [];
+    const writes = [];
+    for (const patch of patches) {
+      if (patch[0] === 'recovery') originals.push(await prepareRecoveryEntry(patch[2]));
+      else writes.push(patch);
+    }
     const db = await database();
-    if (!db) return chrome.storage.local.set(Object.fromEntries(patches.map(([store, key, value]) => [PREFIX + store + '.' + key, value])));
-    await writeTransaction(db, [...new Set(patches.map(([store]) => store))], (tx) => {
-      for (const [store, key, value] of patches) tx.objectStore(store).put(value, key);
+    const saved = [];
+    if (!db) {
+      const apply = async () => {
+        const patch = Object.fromEntries(writes.map(([store, key, value]) => [PREFIX + store + '.' + key, value]));
+        const keyFor = (store, key) => PREFIX + store + '.' + key;
+        const read = (store, key) => patch[keyFor(store, key)] ?? getAux(store, key);
+        const archive = {
+          has: async (key) => (await read('recovery', key)) !== undefined,
+          index: (key) => read('meta', recoveryIndexKey(key)),
+          add(key, value, index) {
+            patch[keyFor('recovery', key)] = value;
+            patch[keyFor('meta', recoveryIndexKey(key))] = index;
+          }
+        };
+        for (const entry of originals) saved.push(await insertRecoveryEntry(entry, archive));
+        // Fallback tombstones participate in the same storage.set call.
+        for (const id of deletedIds) patch[PREFIX + 'monitors.' + id] = { deleted: true, id };
+        if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+      };
+      if (!originals.length) await apply();
+      else {
+        const work = fallbackRecoveryQueue.catch(() => undefined).then(apply);
+        fallbackRecoveryQueue = work;
+        await work;
+      }
+      return saved;
+    }
+    const stores = new Set(patches.map(([store]) => store));
+    if (deletedIds.length) stores.add('monitors');
+    if (originals.length) stores.add('meta');
+    await writeTransaction(db, [...stores], async (tx) => {
+      for (const [store, key, value] of writes) tx.objectStore(store).put(value, key);
+      for (const id of deletedIds) tx.objectStore('monitors').delete(id);
+      if (originals.length) {
+        const table = tx.objectStore('recovery');
+        const index = tx.objectStore('meta');
+        const archive = {
+          has: async (key) => (await request(table.getKey(key))) !== undefined,
+          index: (key) => request(index.get(recoveryIndexKey(key))),
+          add(key, value, identity) {
+            table.add(value, key);
+            index.put(identity, recoveryIndexKey(key));
+          }
+        };
+        for (const entry of originals) saved.push(await insertRecoveryEntry(entry, archive));
+      }
     });
+    return saved;
+  }
+  async function putRecovery(entry) {
+    const [id] = await persistPatches([['recovery', null, entry]]);
+    return id;
+  }
+  async function commitAux(patches) {
+    await persistPatches(patches);
   }
   async function pack(monitor, snapshots, { allowReferences = true } = {}) {
     const refs = new Map();
@@ -162,7 +278,7 @@
   async function stageMonitor(monitor, { allowReferences = false } = {}) {
     const snapshots = new Map();
     const packed = await pack(monitor, snapshots, { allowReferences });
-    const patches = await snapshotPatches(snapshots, 'stage-' + crypto.randomUUID());
+    const patches = await snapshotPatches(snapshots, 'stage');
     // Body blobs are durable before a compact staged record refers to them.
     // This never changes active monitors or the current generation marker.
     await commitAux(patches);
@@ -177,7 +293,7 @@
     catch (cause) { const error = new Error('스냅샷 JSON을 해석하지 못했습니다: ' + cause.message); error.snapshotValidation = true; throw error; }
     const value = { json: snapshot.json, digest: snapshot.id };
     // Archive both damaged originals and repair both copies in one transaction.
-    await commitAux(await snapshotPatches(new Map([[snapshot.id, value]]), 'import-' + crypto.randomUUID()));
+    await commitAux(await snapshotPatches(new Map([[snapshot.id, value]]), 'import'));
   }
   const damagesByCache = new WeakMap();
   async function unpack(record, cache = new Map()) {
@@ -253,7 +369,7 @@
         }
       }
     }
-    return { monitors, generation, recovery: [...new Map(recovery.map((entry) => [entry.id, entry])).values()] };
+    return { monitors, generation, recovery };
   }
   async function snapshotPatches(snapshots, generation) {
     const patches = [];
@@ -298,7 +414,7 @@
         const record = await pack(deletedById.get(id), snapshots);
         prior = { id, record, digest: await digest(JSON.stringify(record)) };
       }
-      if (prior) deleted.push({ id: 'deleted-' + generation + '-' + id, source: 'trash', recordId: id, raw: prior, capturedAt: new Date().toISOString() });
+      if (prior) deleted.push({ id: 'deleted-' + generation + '-' + id, source: 'trash', recordId: id, raw: prior });
     }
     const patches = await snapshotPatches(snapshots, generation);
     for (const entry of recovery) {
@@ -314,19 +430,8 @@
     patches.push(['meta', 'current', { generation, schemaVersion: 1, committedAt: new Date().toISOString() }]);
     if (settings !== undefined) patches.push(['meta', 'settings', settings]);
     if (operation) patches.push(['operations', operation.id, operation]);
-    const db = await database();
-    if (!db) {
-      const patch = Object.fromEntries(patches.map(([store, key, value]) => [PREFIX + store + '.' + key, value]));
-      // Fallback tombstones participate in the same atomic storage.set call.
-      for (const id of deletedIds) patch[PREFIX + 'monitors.' + id] = { deleted: true, id };
-      await chrome.storage.local.set(patch);
-    } else {
-      await writeTransaction(db, STORES, (tx) => {
-        for (const [store, key, value] of patches) tx.objectStore(store).put(value, key);
-        for (const id of deletedIds) tx.objectStore('monitors').delete(id);
-      });
-    }
+    await persistPatches(patches, deletedIds);
   }
-  root.OpenStillRecordStore = Object.freeze({ getAux, putAux, putAuxBatch, deleteAux, deleteAuxBatch, allAux, keysAux, load, commit, commitAux, stageMonitor, stageSnapshot, unpack, digest });
+  root.OpenStillRecordStore = Object.freeze({ getAux, putAux, putAuxBatch, deleteAux, deleteAuxBatch, allAux, keysAux, load, commit, commitAux, putRecovery, stageMonitor, stageSnapshot, unpack, digest });
   if (typeof module === 'object' && module.exports) module.exports = root.OpenStillRecordStore;
 })(typeof self !== 'undefined' ? self : globalThis);

@@ -1,6 +1,6 @@
 'use strict';
 
-if (typeof importScripts === 'function') importScripts('record-store.js', 'import-session.js', 'export-session.js');
+if (typeof importScripts === 'function') importScripts('record-store.js', 'import-session.js', 'export-session.js', 'koofr-jobs.js');
 
 const MONITORS_KEY = 'openStill.monitors.v2';
 const SETTINGS_KEY = 'openStill.settings.v1';
@@ -1571,6 +1571,10 @@ function normalizeSnapshot(value) {
       ? Number(value.matchCount)
       : Number.NaN;
   const rawItems = Array.isArray(value.items) ? value.items.filter((item) => item && typeof item === 'object' && !Array.isArray(item) && (typeof item.text === 'string' || typeof item.html === 'string')) : [];
+  // Normalized aggregate-only snapshots carry a text preview as their sole
+  // item. Keep it a preview when a backup of that snapshot is imported.
+  if (value.schemaVersion === 1 && rawItems.length === 1 && rawItems[0].text === value.text
+    && typeof value.text === 'string' && Object.keys(rawItems[0]).length === 1) rawItems.length = 0;
   const fullItemTexts = rawItems.map((item) => cleanSnapshotText(item?.text, Number.MAX_SAFE_INTEGER));
   const fullText = typeof value.text === 'string'
     ? cleanSnapshotText(value.text, Number.MAX_SAFE_INTEGER)
@@ -1886,10 +1890,11 @@ function normalizeMonitor(value) {
 }
 
 function normalizeSettings(value) {
-  return {
-    ...DEFAULT_SETTINGS,
-    ...(value && typeof value === 'object' ? { ...value, soundEnabled: value.soundEnabled !== false } : {})
-  };
+  const settings = { ...DEFAULT_SETTINGS, soundEnabled: value?.soundEnabled !== false };
+  const sort = value?.dashboardSort;
+  if (['lastViewedAt', 'lastCheckedAt', 'lastChangedAt', 'name'].includes(sort?.field)
+    && ['asc', 'desc'].includes(sort.direction)) settings.dashboardSort = { field: sort.field, direction: sort.direction };
+  return settings;
 }
 
 async function getState() {
@@ -1932,7 +1937,7 @@ async function loadMonitorRepository() {
       if (monitor.recoveryIssues?.length || monitor.recoveryRepairs?.length) repaired += 1;
       monitors.set(monitor.id, monitor);
     }
-    if (!stored && legacy !== undefined) recovery.unshift({ id: 'legacy-container', source: 'migration-original', raw: legacy, capturedAt: nowIso(), error: Array.isArray(legacy) ? null : '배열이 아닌 원본 컨테이너에서 정상 레코드를 회수했습니다.' });
+    if (!stored && legacy !== undefined) recovery.unshift({ id: 'legacy-container', source: 'migration-original', raw: legacy, error: Array.isArray(legacy) ? null : '배열이 아닌 원본 컨테이너에서 정상 레코드를 회수했습니다.' });
     const summaries = new Map([...monitors].map(([id, monitor]) => [id, dashboardMonitorSummary(monitor)]));
     monitorRepository = { monitors, summaries, recovery, generation: stored?.generation || 0, migrated: Boolean(stored), diagnostics: { sourceCount: rawRecords.length, normalCount: monitors.size, repairedCount: repaired, recoveryPendingCount: recovery.filter((entry) => entry.source !== 'migration-original').length } };
     return monitorRepository;
@@ -2057,8 +2062,7 @@ async function getMonitorById(id) {
         const entries = [{ id: 'damaged-' + id + '-' + repository.generation, source: 'records', recordId: id, raw: envelope,
           error: hydrated.lastError || '스냅샷 복사본에서 정상 내용을 회수했습니다.' }, ...restored.recovery];
         for (const entry of entries) {
-          const index = repository.recovery.findIndex((existing) => existing.id === entry.id);
-          if (index === -1) repository.recovery.push(entry); else repository.recovery[index] = entry;
+          repository.recovery.push(entry);
         }
         repairedMonitorShells.set(id, restored.shell);
       }
@@ -2081,14 +2085,14 @@ async function recoveryStatus() {
   const records = [...state.recovery];
   for (const key of await OpenStillRecordStore.keysAux('recovery')) {
     const record = await OpenStillRecordStore.getAux('recovery', key);
-    if (record) { const { raw, ...metadata } = record; records.push(metadata); }
+    if (record) { const { raw, ...metadata } = record; records.push({ ...metadata, id: key }); }
   }
   const unique = new Map(records.map((record) => [record.id, record]));
   const sessions = []; const files = [];
   for (const key of await OpenStillRecordStore.keysAux('staging')) {
     if (/^(import|export):[^:]+$/.test(key)) {
       const entry = await OpenStillRecordStore.getAux('staging', key);
-      if (entry) sessions.push({ id: entry.id, kind: entry.kind, phase: entry.phase, processed: entry.sourceCount,
+      if (entry && entry.target !== 'koofr') sessions.push({ id: entry.id, kind: entry.kind, phase: entry.phase, processed: entry.sourceCount,
         pending: entry.preparedCount || entry.preparedIds?.length || 0, progress: entry.progress });
     } else if (key.startsWith('import-file:')) {
       const entry = await OpenStillRecordStore.getAux('staging', key);
@@ -2101,7 +2105,12 @@ async function recoveryStatus() {
 async function restoreRecoveryRecord(message) {
   const recovery = await OpenStillRecordStore.getAux('recovery', message.id);
   if (!recovery) return { ok: false, error: '보관된 원본을 찾지 못했습니다.' };
-  const rawRecords = recovery.raw?.record ? [recovery.raw] : recordsFromContainer(recovery.raw);
+  const { raw } = recovery;
+  let rawRecords;
+  if (raw?.record) rawRecords = [raw];
+  else if (recovery.source === 'discarded-prepared' && raw?.kind === 'import-record') rawRecords = [raw.monitor];
+  else if (recovery.source === 'discarded-native' && raw?.kind === 'pending-native') rawRecords = [raw.raw?._openStillMonitorRecord];
+  else rawRecords = recordsFromContainer(raw);
   const monitors = [];
   for (const raw of rawRecords) {
     const envelope = raw?.record && typeof raw.record === 'object' ? raw : null;
@@ -2109,9 +2118,10 @@ async function restoreRecoveryRecord(message) {
     if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
     const restored = await hydrateMonitorSnapshotsIndependently(record);
     const monitor = restored.monitor;
-    if (envelope?.digest && await OpenStillRecordStore.digest(JSON.stringify(envelope.record)) !== envelope.digest) {
+    if (envelope && await OpenStillRecordStore.digest(JSON.stringify(envelope.record)) !== envelope.digest) {
       monitor.enabled = false; monitor.status = 'needs-review';
-      monitor.recoveryIssues = [...new Set([...(monitor.recoveryIssues || []), '원본 레코드 지문이 일치하지 않아 실행을 정지한 상태로 회수했습니다.'])];
+      const priorIssues = Array.isArray(monitor.recoveryIssues) ? monitor.recoveryIssues : [];
+      monitor.recoveryIssues = [...new Set([...priorIssues, '원본 레코드 지문이 일치하지 않아 실행을 정지한 상태로 회수했습니다.'])];
     }
     monitors.push(monitor);
   }
@@ -2268,26 +2278,9 @@ async function getPopupState() {
   };
 }
 
-function exportHistoryEntryForTransfer(entry, index) {
-  if (index === 0 || !entry || typeof entry !== 'object') return entry;
-  return {
-    kind: entry.kind === 'baseline' ? 'baseline' : 'change',
-    capturedAt: entry.capturedAt ?? entry.snapshot?.capturedAt ?? null,
-    snapshot: { exists: entry.snapshot?.exists !== false, contentOmitted: true }
-  };
-}
-
 function exportMonitorRecordForTransfer(monitor) {
   if (Number(monitor?.schemaVersion) > 1) return monitor.unsupportedOriginal || monitor;
-  if (!monitor || typeof monitor !== 'object' || !Array.isArray(monitor.history)) return monitor;
-  return {
-    ...monitor,
-    history: monitor.history.map(exportHistoryEntryForTransfer)
-  };
-}
-
-function serializedExportRecord(monitor) {
-  return JSON.stringify(exportMonitorRecordForTransfer(monitor));
+  return monitor;
 }
 
 async function getMonitors() {
@@ -2466,7 +2459,7 @@ async function ensureOffscreenDocument() {
     offscreenCreation = chrome.offscreen.createDocument({
       url: 'offscreen.html',
       reasons: ['DOM_PARSER', 'AUDIO_PLAYBACK', 'WORKERS'],
-      justification: 'OpenStill validates selectors, runs interruptible text filters, and plays a local alert tone.'
+      justification: 'OpenStill validates selectors, plays a local alert tone, and hosts interruptible text and backup workers.'
     }).catch(async (error) => {
       const contextsAfterFailure = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
       if (!contextsAfterFailure.some((context) => context.documentUrl === offscreenUrl)) {
@@ -6258,12 +6251,12 @@ const messageHandlers = {
   'get-recovery-status': () => recoveryStatus(),
   'restore-recovery-record': (message) => restoreRecoveryRecord(message),
   'get-popup-state': () => getPopupState(),
-  'start-export-session': (message) => startExportSession(message),
-  'get-export-monitor': (message) => getExportMonitor(message),
-  'get-export-monitor-fragment': (message) => getExportMonitorFragment(message),
-  'touch-export-session': (message) => touchExportSession(message),
-  'checkpoint-export-session': (message) => checkpointExportSession(message),
-  'finish-export-session': (message) => finishExportSession(message),
+  'start-export-session': (message) => localExportRequest(message.resumeId, () => startExportSession(message)),
+  'get-export-monitor': (message) => localExportRequest(message.id, () => getExportMonitor(message)),
+  'get-export-monitor-fragment': (message) => localExportRequest(message.id, () => getExportMonitorFragment(message)),
+  'touch-export-session': (message) => localExportRequest(message.id, () => touchExportSession(message)),
+  'checkpoint-export-session': (message) => localExportRequest(message.id, () => checkpointExportSession(message)),
+  'finish-export-session': (message) => localExportRequest(message.id, () => finishExportSession(message)),
   'start-picker': (message) => startPicker(message.tabId, message.url),
   'create-monitor': (message, sender) => createMonitor(message, sender),
   'create-monitors': (message, sender) => createMonitors(message, sender),
@@ -6286,12 +6279,12 @@ const messageHandlers = {
   'open-monitor-window': (message) => openMonitorWindow(message.id),
   'open-monitor-tab': (message) => openMonitorTab(message.id),
   'import-monitors': (message) => importMonitors(message),
-  'start-import-session': (message) => startImportSession(message),
-  'append-import-session': (message) => appendImportSession(message),
-  'append-import-fragments': (message) => appendImportFragments(message),
-  'touch-import-session': (message) => touchImportSession(message),
-  'finish-import-session': (message) => finishImportSession(message),
-  'abort-import-session': (message) => abortImportSession(message),
+  'start-import-session': (message) => serializeKoofr(() => startImportSession(message)),
+  'append-import-session': (message) => localImportRequest(message.id, () => appendImportSession(message)),
+  'append-import-fragments': (message) => localImportRequest(message.id, () => appendImportFragments(message)),
+  'touch-import-session': (message) => localImportRequest(message.id, () => touchImportSession(message)),
+  'finish-import-session': (message) => localImportRequest(message.id, () => finishImportSession(message)),
+  'abort-import-session': (message) => localImportRequest(message.id, () => abortImportSession(message)),
   'finalize-import': () => finalizeImportedMonitors(),
   'open-dashboard': () => openDashboard(),
   'release-unclaimed-origin': (message, sender) => releaseUnclaimedOrigin(message, sender),
@@ -6304,13 +6297,21 @@ const messageHandlers = {
 const mutationMessageTypes = new Set(['create-monitor', 'create-monitors', 'save-monitor', 'set-monitor-enabled', 'delete-monitor', 'delete-monitors', 'update-monitor-labels', 'move-page-url', 'copy-page-url', 'replace-site-host', 'delete-page', 'acknowledge-monitor', 'import-monitors', 'finish-import-session', 'save-settings', 'reconcile-runtime-ownership']);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  const handler = messageHandlers[message?.type];
+  let handler = messageHandlers[message?.type];
+  if (KOOFR_DASHBOARD_MESSAGES.has(message?.type)) {
+    if (!isKoofrSender(_sender, 'dashboard.html')) return;
+    handler = koofrDashboardMessage;
+  } else if (message?.type === 'koofr-runtime') {
+    if (!isKoofrSender(_sender, 'offscreen.html')) return;
+    handler = handleKoofrRuntime;
+  }
   if (!handler) {
     return;
   }
 
   Promise.resolve(mutationMessageTypes.has(message.type) ? runMutationOperation(message, () => handler(message, _sender)) : handler(message, _sender)).then(sendResponse).catch((error) => {
-    sendResponse({ ok: false, error: responseError(error) });
+    const koofr = handler === koofrDashboardMessage || handler === handleKoofrRuntime;
+    sendResponse({ ok: false, error: koofr ? 'Koofr 작업 상태를 처리하지 못했습니다. 잠시 뒤 다시 시도해 주세요.' : responseError(error) });
   });
   return true;
 });
@@ -6320,6 +6321,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     void runDueChecks().catch(() => undefined);
   } else if (alarm.name === RUNTIME_ALARM_NAME) {
     void recoverRuntime().then(() => runDueChecks()).catch(() => undefined);
+  } else if (alarm.name === KOOFR_ALARM) {
+    void wakeKoofr().catch(() => undefined);
   }
 });
 
@@ -6409,6 +6412,7 @@ function initialize({ cleanupPermissions = false } = {}) {
     await run('runtime-recovery', () => recoverRuntime({ startup: true }));
     await run('schedule', () => scheduleNextAlarm());
     await run('recovery-wakeup', () => chrome.alarms.create(RUNTIME_ALARM_NAME, { periodInMinutes: 1 }));
+    await run('koofr-wakeup', () => wakeKoofr());
     await run('badge', () => refreshBadge());
     await run('pickers', () => clearExpiredPendingPickers());
     if (initializationPermissionCleanup) await run('permissions', () => cleanupUnusedSitePermissions());

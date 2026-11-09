@@ -1,20 +1,13 @@
 (() => {
   const backupIntegrity = globalThis.OpenStillBackupIntegrity;
+  const backupTransfer = globalThis.OpenStillBackupTransfer;
   const dashboardCore = globalThis.OpenStillDashboardCore;
   if (!dashboardCore) throw new Error('대시보드 비교 모듈을 불러오지 못했습니다.');
   if (!backupIntegrity) throw new Error('백업 무결성 모듈을 불러오지 못했습니다.');
-  // Keep a small buffer below the requested 32 MiB split point. It leaves
-  // room for the runtime-message envelope while every generated JSON part is
-  // valid JSON and remains strictly below 32 MiB.
-  const EXPORT_FILE_SPLIT_BYTES = 32 * 1024 * 1024;
-  const EXPORT_FILE_HEADROOM_BYTES = 64 * 1024;
-  const EXPORT_INTEGRITY_METADATA_RESERVE_BYTES = 1024 * 1024;
-  const MAX_EXPORT_FILE_BYTES = EXPORT_FILE_SPLIT_BYTES - EXPORT_FILE_HEADROOM_BYTES;
-  const MAX_IMPORT_MESSAGE_BYTES = MAX_EXPORT_FILE_BYTES;
-  const IMPORT_RECORD_FRAGMENT_CHARS = 3 * 1024 * 1024;
+  if (!backupTransfer) throw new Error('백업 전송 모듈을 불러오지 못했습니다.');
+  const MAX_IMPORT_MESSAGE_BYTES = backupTransfer.MAX_FILE_BYTES;
   const BULK_TRANSFER_THRESHOLD = 200;
   const BULK_TRANSFER_CHUNK_SIZE = 100;
-  const TRANSFER_YIELD_BYTE_BUDGET = 4 * 1024 * 1024;
   const SELECTED_CHECK_CHUNK_SIZE = 6;
   const SEARCH_RENDER_DEBOUNCE_MS = 150;
   const dateTimeFormatter = new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium', timeStyle: 'short' });
@@ -1009,17 +1002,13 @@
     elements.transferProgress.hidden = true;
   }
 
-  function transferChunkSize(total) {
-    return total >= BULK_TRANSFER_THRESHOLD ? BULK_TRANSFER_CHUNK_SIZE : Math.max(total, 1);
-  }
-
   async function nextImportChunk(monitors, start, maxItems = BULK_TRANSFER_CHUNK_SIZE) {
     let end = start;
     let byteLength = 256; // Envelope fields added by chrome.runtime.sendMessage.
     while (end < monitors.length && end - start < maxItems) {
       const item = monitors[end];
       const cachedBytes = item && typeof item === 'object' ? importRecordByteLengths.get(item) : undefined;
-      const recordBytes = (cachedBytes ?? await utf8ByteLengthYielding(JSON.stringify(item)))
+      const recordBytes = (cachedBytes ?? await backupTransfer.utf8ByteLengthYielding(JSON.stringify(item), yieldToBrowser))
         + (end > start ? 1 : 0);
       if (byteLength + recordBytes > MAX_IMPORT_MESSAGE_BYTES) {
         if (end === start) {
@@ -1056,24 +1045,6 @@
         window.setTimeout(finish, 0);
       });
     });
-  }
-
-  async function utf8ByteLengthYielding(value, chunkChars = 1024 * 1024) {
-    if (value.length <= chunkChars) return utf8ByteLength(value);
-    let bytes = 0;
-    for (let start = 0; start < value.length;) {
-      let end = Math.min(value.length, start + chunkChars);
-      const last = value.charCodeAt(end - 1);
-      const next = value.charCodeAt(end);
-      if (end < value.length && last >= 0xd800 && last <= 0xdbff
-        && next >= 0xdc00 && next <= 0xdfff) {
-        end = end - start > 1 ? end - 1 : end + 1;
-      }
-      bytes += utf8ByteLength(value.slice(start, end));
-      start = end;
-      if (start < value.length) await yieldToBrowser();
-    }
-    return bytes;
   }
 
   function monitorById(id) {
@@ -2668,102 +2639,6 @@
     }
   }
 
-  // Unlike TextEncoder.encode(), this calculates the UTF-8 byte length without
-  // allocating a second byte array as large as an export record.
-  function utf8ByteLength(value) {
-    let length = 0;
-    for (let index = 0; index < value.length; index += 1) {
-      const code = value.charCodeAt(index);
-      if (code <= 0x7f) length += 1;
-      else if (code <= 0x7ff) length += 2;
-      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
-        const next = value.charCodeAt(index + 1);
-        if (next >= 0xdc00 && next <= 0xdfff) {
-          length += 4;
-          index += 1;
-        } else {
-          length += 3;
-        }
-      } else length += 3;
-    }
-    return length;
-  }
-
-  function createExportPart(exportedAt, exportId, partNumber) {
-    const prefix = `${JSON.stringify({
-      format: 'openstill-export',
-      schemaVersion: 5,
-      exportedAt,
-      exportId,
-      part: partNumber
-    }).slice(0, -1)},"monitors":[`;
-    const divider = '],"fragments":[';
-    const suffix = ']}';
-    return {
-      monitorParts: [prefix],
-      fragmentParts: [],
-      divider,
-      suffix,
-      exportedAt,
-      exportId,
-      partNumber,
-      integrityState: backupIntegrity.createChecksumState(),
-      // The final prefix contains counts, the checksum, and completion
-      // metadata. Reserve more than its maximum practical size so the exact
-      // Blob remains below the same 32 MiB safety boundary.
-      byteLength: utf8ByteLength(prefix) + utf8ByteLength(divider) + utf8ByteLength(suffix)
-        + EXPORT_INTEGRITY_METADATA_RESERVE_BYTES,
-      monitorCount: 0,
-      fragmentCount: 0
-    };
-  }
-
-  function hasExportPartData(part) {
-    return part.monitorCount > 0 || part.fragmentCount > 0;
-  }
-
-  function canAppendExportPartValue(part, countKey, valueBytes) {
-    const delimiterBytes = part[countKey] ? 1 : 0;
-    return part.byteLength + delimiterBytes + valueBytes < MAX_EXPORT_FILE_BYTES;
-  }
-
-  async function appendExportPartValue(part, partsKey, countKey, value, valueBytes) {
-    const delimiter = part[countKey] ? ',' : '';
-    part[partsKey].push(delimiter, value);
-    part.byteLength += utf8ByteLength(delimiter) + valueBytes;
-    part[countKey] += 1;
-    await backupIntegrity.appendSerializedRecordChunked(
-      part.integrityState,
-      partsKey === 'fragmentParts' ? 'fragment' : 'monitor',
-      value,
-      yieldToBrowser
-    );
-  }
-
-  function exportPartBlobParts(part, finalPart, totalMonitors) {
-    const envelope = {
-      format: 'openstill-export',
-      schemaVersion: 5,
-      exportedAt: part.exportedAt,
-      exportId: part.exportId,
-      part: part.partNumber,
-      integrityRequired: true,
-      previousPartDigest: part.previousPartDigest || null,
-      ...(finalPart ? { manifest: part.manifest || [] } : {})
-    };
-    const integrity = backupIntegrity.createIntegrityMetadata(part.integrityState, {
-        monitorCount: part.monitorCount,
-        fragmentCount: part.fragmentCount,
-        finalPart,
-        totalParts: part.partNumber,
-        totalMonitors,
-        envelope
-    });
-    part.envelopeDigest = integrity.envelopeDigest;
-    const prefix = `${JSON.stringify({ ...envelope, integrity }).slice(0, -1)},"monitors":[`;
-    return [prefix, ...part.monitorParts.slice(1), part.divider, ...part.fragmentParts, part.suffix];
-  }
-
   function settleExportDownload(downloadId, state) {
     const pending = exportDownloadUrls.get(downloadId);
     if (!pending) return;
@@ -2795,11 +2670,7 @@
     });
   }
 
-  async function downloadExportPart(part, exportedAt, partNumber, finalPart, totalMonitors) {
-    const blob = new Blob(exportPartBlobParts(part, finalPart, totalMonitors), { type: 'application/json' });
-    if (blob.size >= MAX_EXPORT_FILE_BYTES) {
-      throw new Error('내보내기 파일 한도를 넘는 데이터 묶음을 만들었습니다.');
-    }
+  async function downloadExportPart({ blob, exportedAt, partNumber }) {
     const url = URL.createObjectURL(blob);
     const filename = `openstill-export-${exportedAt.slice(0, 10)}-part-${String(partNumber).padStart(3, '0')}.json`;
     if (chrome.downloads?.download) {
@@ -2853,100 +2724,17 @@
       if (showsTransferProgress(total)) await yieldToBrowser();
       const saved = started.progress || {};
       if (saved.done) { succeeded = true; finishTransfer('이미 내보내기 완료', total, total); return; }
-      const exportedAt = saved.exportedAt || new Date().toISOString();
-      const exportId = saved.exportId || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-      let partNumber = saved.partNumber || 1;
-      const manifest = [...(saved.manifest || [])];
-      let cursor = { nextIndex: saved.nextIndex || 0, fragmentIndex: saved.fragmentIndex || 0 };
-      let part = createExportPart(exportedAt, exportId, partNumber);
-      const checkpoint = async (done = false) => {
-        const response = await send({ type: 'checkpoint-export-session', id: exportSessionId,
-          progress: { ...cursor, exportId, exportedAt, partNumber, manifest: [...manifest], done } });
-        if (!response?.ok) throw new Error(response?.error || '내보내기 재개 위치를 저장하지 못했습니다.');
-      };
-      await checkpoint();
-      const flushExportPart = async () => {
-        if (!hasExportPartData(part)) return;
-        part.previousPartDigest = manifest.at(-1) || null;
-        await downloadExportPart(part, exportedAt, partNumber, false, total);
-        manifest.push(part.envelopeDigest);
-        partNumber += 1;
-        await checkpoint();
-        part = createExportPart(exportedAt, exportId, partNumber);
-      };
-      const appendExportPartValueSafely = async (partsKey, countKey, value) => {
-        const valueBytes = await utf8ByteLengthYielding(value);
-        if (!canAppendExportPartValue(part, countKey, valueBytes) && hasExportPartData(part)) {
-          await flushExportPart();
+      const progress = await backupTransfer.writeBackup({
+        session: started,
+        send,
+        writePart: downloadExportPart,
+        yieldControl: yieldToBrowser,
+        onProgress: (index) => {
+          completed = index;
+          updateTransferProgress('내보내는 중', completed, total);
         }
-        if (!canAppendExportPartValue(part, countKey, valueBytes)) {
-          throw new Error('내보낼 데이터 조각이 32 MB 파일 분할 기준을 넘습니다.');
-        }
-        await appendExportPartValue(part, partsKey, countKey, value, valueBytes);
-        return valueBytes;
-      };
-      const chunkSize = transferChunkSize(total);
-      let bytesSinceYield = 0;
-      const firstIndex = cursor.nextIndex;
-      const firstFragment = cursor.fragmentIndex;
-      for (let start = firstIndex; start < total; start += chunkSize) {
-        const end = Math.min(start + chunkSize, total);
-        for (let index = start; index < end; index += 1) {
-          const response = await send({ type: 'get-export-monitor', id: exportSessionId, index });
-          if (!response?.ok) {
-            throw new Error(response?.error || '내보낼 추적을 불러오지 못했습니다.');
-          }
-          if (response.fragmented) {
-            if (typeof response.recordId !== 'string' || !Number.isInteger(response.fragmentCount) || response.fragmentCount < 1) {
-              throw new Error('내보낼 큰 추적 데이터를 나누지 못했습니다.');
-            }
-            for (let fragmentIndex = index === firstIndex ? firstFragment : 0; fragmentIndex < response.fragmentCount; fragmentIndex += 1) {
-              const fragmentResponse = await send({
-                type: 'get-export-monitor-fragment',
-                id: exportSessionId,
-                index,
-                fragmentIndex
-              });
-              if (!fragmentResponse?.ok || typeof fragmentResponse.payload !== 'string') {
-                throw new Error(fragmentResponse?.error || '내보낼 추적 조각을 불러오지 못했습니다.');
-              }
-              const fragment = JSON.stringify({
-                recordId: response.recordId,
-                fragmentIndex,
-                fragmentCount: response.fragmentCount,
-                payload: fragmentResponse.payload
-              });
-              const fragmentBytes = await appendExportPartValueSafely('fragmentParts', 'fragmentCount', fragment);
-              cursor = fragmentIndex + 1 === response.fragmentCount
-                ? { nextIndex: index + 1, fragmentIndex: 0 }
-                : { nextIndex: index, fragmentIndex: fragmentIndex + 1 };
-              bytesSinceYield += fragmentBytes;
-              if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET) {
-                await yieldToBrowser();
-                bytesSinceYield = 0;
-              }
-            }
-          } else if (typeof response.record === 'string') {
-            const recordBytes = await appendExportPartValueSafely('monitorParts', 'monitorCount', response.record);
-            cursor = { nextIndex: index + 1, fragmentIndex: 0 };
-            bytesSinceYield += recordBytes;
-            if (bytesSinceYield >= TRANSFER_YIELD_BYTE_BUDGET) {
-              await yieldToBrowser();
-              bytesSinceYield = 0;
-            }
-          } else {
-            throw new Error('내보낼 추적 데이터를 읽지 못했습니다.');
-          }
-        }
-        completed = end;
-        updateTransferProgress('내보내는 중', completed, total);
-        if (end < total && showsTransferProgress(total)) await yieldToBrowser();
-      }
-      part.previousPartDigest = manifest.at(-1) || null;
-      part.manifest = [...manifest];
-      await downloadExportPart(part, exportedAt, partNumber, true, total);
-      cursor = { nextIndex: total, fragmentIndex: 0 };
-      await checkpoint(true);
+      });
+      const partNumber = progress.partNumber;
       succeeded = true;
       finishTransfer('내보내기 완료', total, total);
       showToast(partNumber > 1
@@ -2979,47 +2767,7 @@
   }
 
   let importAbortController = null;
-  function parseImportFile(file, sessionId, fileIndex, onProgress, signal) {
-    return new Promise((resolve, reject) => {
-      const worker = new Worker(chrome.runtime.getURL('import-worker.js'));
-      let timer; let finished = false;
-      const finish = (error, result) => {
-        if (finished) return;
-        finished = true; clearTimeout(timer); worker.terminate();
-        signal?.removeEventListener('abort', abort);
-        if (error) reject(error); else resolve(result);
-      };
-      const abort = () => finish(new Error('불러오기를 중단했습니다. 원본과 준비한 자료는 복구함에서 이어갈 수 있습니다.'));
-      const watchdog = () => { clearTimeout(timer); timer = setTimeout(() => finish(new Error('파일 처리 응답이 없어 중단했습니다. 준비한 자료를 보관했습니다.')), 90_000); };
-      worker.addEventListener('message', async (event) => {
-        watchdog(); const message = event.data;
-        if (message?.type === 'record') {
-          try {
-            const serialized = JSON.stringify(message.record);
-            if (message.kind === 'monitor' && utf8ByteLength(serialized) + 1024 >= MAX_IMPORT_MESSAGE_BYTES) {
-              const fragmentCount = Math.ceil(serialized.length / IMPORT_RECORD_FRAGMENT_CHARS);
-              for (let index = 0; index < fragmentCount; index += 1) {
-                const response = await send({ type: 'append-import-fragments', id: sessionId, exportId: message.source?.exportId,
-                  fragments: [{ recordId: `file:${fileIndex}:${message.source.recordIndex}`, fragmentIndex: index, fragmentCount, payload: serialized.slice(index * IMPORT_RECORD_FRAGMENT_CHARS, (index + 1) * IMPORT_RECORD_FRAGMENT_CHARS) }] });
-                if (!response?.ok) throw new Error(response?.error || '레코드 조각을 준비하지 못했습니다.');
-              }
-            } else {
-              const response = await send({ type: message.kind === 'fragment' ? 'append-import-fragments' : 'append-import-session', id: sessionId,
-                [message.kind === 'fragment' ? 'fragments' : 'monitors']: [message.record], source: message.source, exportId: message.source?.exportId });
-              if (!response?.ok) throw new Error(response?.error || '레코드를 준비하지 못했습니다.');
-            }
-            worker.postMessage({ type: 'ack' }); watchdog();
-          } catch (error) { worker.postMessage({ type: 'ack', error: error.message }); finish(error); }
-        } else if (message?.type === 'read-progress' || message?.type === 'parsing') onProgress?.(message);
-        else if (message?.type === 'parsed') finish(null, message);
-        else if (message?.type === 'error') finish(new Error(message.error || '파일을 읽지 못했습니다.'));
-      });
-      worker.addEventListener('error', () => finish(new Error('JSON 해석 워커가 중단되었습니다. 원본과 준비 자료는 보관했습니다.')));
-      worker.addEventListener('messageerror', () => finish(new Error('파일 처리 메시지를 읽지 못했습니다. 준비 자료는 보관했습니다.')));
-      signal?.addEventListener('abort', abort, { once: true }); watchdog();
-      worker.postMessage({ type: 'parse', ...(file.storedFileId ? { storedFileId: file.storedFileId } : { file }), sessionId, fileIndex });
-    });
-  }
+  const { parseImportFile } = globalThis.OpenStillBackupImport;
   function presentImportResult(result) {
     if (result.settings) {
       state.settings = { ...state.settings, ...result.settings };
@@ -3046,7 +2794,7 @@
         if (importAbortController.signal.aborted) break;
         const file = files[index]; const label = `파일 분석 (${index + 1}/${files.length})`;
         try {
-          const parsed = await parseImportFile(file, sessionId, file.fileIndex ?? fileIndexOffset + index, (progress) => updateImportFileProgress(label, progress.loaded || 0, progress.total || file.size), importAbortController.signal);
+          const parsed = await parseImportFile(file, sessionId, file.fileIndex ?? fileIndexOffset + index, (progress) => updateImportFileProgress(label, progress.loaded || 0, progress.total || file.size), importAbortController.signal, send);
           if (parsed.backupPart) parts.push({ ...parsed.backupPart, sourceName: file.name });
           for (const diagnostic of parsed.diagnostics || []) await send({ type: 'append-import-session', id: sessionId, diagnostic: { ...diagnostic, source: file.name, recoveryId: parsed.recoveryId } });
         } catch (error) {
@@ -3120,7 +2868,25 @@
     const showMore = () => {
     for (const record of allRecords.slice(shown, shown + 200)) {
       const row = document.createElement('p'); row.textContent = `${record.source || record.id || '백업'}${record.recordIndex !== undefined ? ` · 레코드 ${record.recordIndex + 1}` : ''}${record.offset !== undefined ? ` · 문자 위치 ${record.offset}` : ''}: ${record.error || record.code || '원본 보관'}${record.missing !== undefined ? ` · 누락 ${Array.isArray(record.missing) ? record.missing.join(', ') : record.missing}` : ''}${record.fields?.length ? ` · 수리 ${record.fields.join(', ')}` : ''}${record.recordId ? ` · 추적 ${record.recordId}` : ''}${record.recoveryId || record.staging || record.id ? ` · 보관 ${record.recoveryId || record.staging || record.id}` : ''}`;
-      if (record.source === 'trash') { const restore = document.createElement('button'); restore.textContent = '복원'; restore.type = 'button'; restore.addEventListener('click', async () => { restore.disabled = true; try { const result = await send({ type: 'restore-recovery-record', id: record.id }); if (!result?.ok) throw new Error(result?.error); presentImportResult(result); queueDashboardRefresh(); } catch (error) { showToast(error.message); } finally { restore.disabled = false; } }); row.append(restore); }
+      if (['trash', 'discarded-prepared', 'discarded-native'].includes(record.source)) {
+        const restore = document.createElement('button');
+        restore.textContent = '복원';
+        restore.type = 'button';
+        restore.addEventListener('click', async () => {
+          restore.disabled = true;
+          try {
+            const result = await send({ type: 'restore-recovery-record', id: record.id });
+            if (!result?.ok) throw new Error(result?.error);
+            presentImportResult(result);
+            queueDashboardRefresh();
+          } catch (error) {
+            showToast(error.message);
+          } finally {
+            restore.disabled = false;
+          }
+        });
+        row.append(restore);
+      }
       list.append(row);
     }
     shown += 200; more.hidden = shown >= allRecords.length;
@@ -3128,6 +2894,153 @@
     if (!dialog.open) dialog.showModal();
   }
   recoveryButton.addEventListener('click', () => void showRecoveryPanel().catch((error) => showToast(error.message)));
+
+  const koofr = Object.fromEntries([
+    'Settings', 'SettingsDialog', 'Form', 'Account', 'Email', 'Password', 'Interval', 'Retention',
+    'JobStatus', 'LastSuccess', 'LastFailure', 'SettingsMessage', 'Cancel', 'Remove', 'Check', 'Save',
+    'Export', 'Import', 'RestoreDialog', 'RestoreForm', 'BackupChoice', 'RestoreMessage', 'Restore'
+  ].map((name) => [name, document.getElementById('koofr' + name)]));
+  let koofrBackups = [];
+  let observedKoofrJob = '';
+  let koofrUpdate = 0;
+  let loadKoofrInputs = false;
+
+  async function requestKoofr(type, fields = {}) {
+    const response = await send({ type: 'koofr-' + type, ...fields });
+    if (!response?.ok) throw new Error(response?.error || 'Koofr 작업 상태를 확인하지 못했습니다.');
+    return response;
+  }
+
+  function renderKoofr(status, loadInputs = false) {
+    const { registered, job, lastSuccess, lastFailure, lastRestore } = status;
+    koofr.Export.hidden = koofr.Import.hidden = !registered;
+    koofr.Export.disabled = Boolean(job && job.phase !== 'paused');
+    koofr.Import.disabled = Boolean(job);
+    koofr.Export.textContent = job?.phase === 'paused' ? 'Koofr 내보내기 이어가기' : 'Koofr로 내보내기';
+    koofr.Remove.hidden = !registered;
+    koofr.Cancel.hidden = !job;
+    koofr.Account.textContent = registered ? `등록된 계정 ${status.emailHint}` : 'Koofr 연결 정보가 없습니다.';
+    koofr.JobStatus.textContent = job
+      ? `${job.kind === 'export' ? '내보내기' : '불러오기'} · ${{ queued: '대기', running: '진행 중', retry: '재시도 대기', paused: '이어가기 대기' }[job.phase]} · 확인한 파일 ${job.completed || 0}${job.total ? ` / ${job.total}` : ''}`
+      : '';
+    koofr.LastSuccess.textContent = lastSuccess ? `마지막 백업 성공 ${dateTimeFormatter.format(new Date(lastSuccess.at))} · 파일 ${lastSuccess.partCount}개` : '성공한 Koofr 백업 기록이 없습니다.';
+    koofr.LastFailure.textContent = lastFailure ? `${dateTimeFormatter.format(new Date(lastFailure.at))} · ${lastFailure.message}` : '';
+    if (loadInputs) {
+      koofr.Interval.value = String(status.interval);
+      koofr.Retention.value = String(status.keep);
+    }
+    if (observedKoofrJob && observedKoofrJob !== job?.id) {
+      if (lastRestore?.id === observedKoofrJob) {
+        if (lastRestore.result) {
+          presentImportResult(lastRestore.result);
+          queueDashboardRefresh();
+        } else if (lastRestore.error) showToast(lastRestore.error);
+      } else if (lastSuccess?.id === observedKoofrJob) showToast('Koofr 백업이 완료되었습니다.');
+      observedKoofrJob = '';
+    }
+    if (observedKoofrJob && job?.phase === 'paused') {
+      showToast(lastFailure?.message || 'Koofr 설정에서 백업 작업 상태를 확인해 주세요.');
+      observedKoofrJob = '';
+    }
+  }
+
+  async function refreshKoofr(loadInputs = false) {
+    loadKoofrInputs ||= loadInputs;
+    const request = ++koofrUpdate;
+    const status = await requestKoofr('status');
+    if (request === koofrUpdate) {
+      renderKoofr(status, loadKoofrInputs);
+      loadKoofrInputs = false;
+    }
+  }
+
+  function koofrFields() {
+    return { email: koofr.Email.value, appPassword: koofr.Password.value,
+      interval: Number(koofr.Interval.value), keep: Number(koofr.Retention.value) };
+  }
+
+  async function manageKoofr(type, fields) {
+    const buttons = [koofr.Check, koofr.Save, koofr.Remove, koofr.Cancel];
+    buttons.forEach((button) => { button.disabled = true; });
+    koofr.SettingsMessage.textContent = '처리 중…';
+    try {
+      await requestKoofr(type, fields);
+      if (type !== 'check') {
+        koofr.Form.reset();
+        await refreshKoofr(true);
+      }
+      koofr.SettingsMessage.textContent = {
+        check: '테스트 JSON의 저장·읽기·삭제를 확인했습니다.',
+        save: 'Koofr 설정을 저장했습니다.',
+        remove: '연결 정보를 삭제했습니다. Koofr의 백업은 보관됩니다.',
+        cancel: 'Koofr 작업을 중단했습니다.'
+      }[type];
+    } catch (error) {
+      koofr.SettingsMessage.textContent = error.message;
+    } finally {
+      buttons.forEach((button) => { button.disabled = false; });
+    }
+  }
+
+  koofr.Settings.addEventListener('click', () => {
+    koofr.Form.reset();
+    koofr.SettingsMessage.textContent = '';
+    koofr.SettingsDialog.showModal();
+    void refreshKoofr(true).catch((error) => { koofr.SettingsMessage.textContent = error.message; });
+  });
+  koofr.SettingsDialog.addEventListener('close', () => { koofr.Password.value = ''; });
+  koofr.Check.addEventListener('click', () => {
+    if (koofr.Form.reportValidity()) void manageKoofr('check', koofrFields());
+  });
+  koofr.Form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void manageKoofr('save', koofrFields());
+  });
+  koofr.Remove.addEventListener('click', () => void manageKoofr('remove'));
+  koofr.Cancel.addEventListener('click', () => void manageKoofr('cancel'));
+  koofr.Export.addEventListener('click', async () => {
+    try {
+      const result = await requestKoofr('export', { dashboardSort: sorting });
+      observedKoofrJob = result.job.id;
+      await refreshKoofr();
+      showToast('Koofr 내보내기를 시작했습니다. 진행 상태는 Koofr 설정에서 확인할 수 있습니다.');
+    } catch (error) { showToast(error.message); }
+  });
+  koofr.Import.addEventListener('click', async () => {
+    koofr.RestoreMessage.textContent = '완료된 백업을 찾는 중…';
+    koofr.BackupChoice.replaceChildren();
+    koofr.Restore.disabled = true;
+    koofr.RestoreDialog.showModal();
+    try {
+      const result = await requestKoofr('list');
+      koofrBackups = result.backups;
+      koofr.BackupChoice.replaceChildren(...koofrBackups.map((backup, index) => {
+        const date = dateTimeFormatter.format(new Date(backup.createdAt));
+        const size = new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 2 }).format(backup.totalBytes / 1048576);
+        return new Option(`${date} · 기기 ${backup.deviceId.slice(0, 8)} · 파일 ${backup.partCount}개 · ${size} MiB`, String(index));
+      }));
+      koofr.Restore.disabled = !koofrBackups.length;
+      koofr.RestoreMessage.textContent = koofrBackups.length ? '' : '완료된 백업이 없습니다.';
+    } catch (error) { koofr.RestoreMessage.textContent = error.message; }
+  });
+  koofr.RestoreForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const selected = koofrBackups[koofr.BackupChoice.value];
+    if (!selected) return;
+    koofr.Restore.disabled = true;
+    try {
+      const { backupId, deviceId } = selected;
+      const result = await requestKoofr('restore', { backupId, deviceId });
+      observedKoofrJob = result.job.id;
+      koofr.RestoreDialog.close();
+      await refreshKoofr();
+      showToast('Koofr 불러오기를 시작했습니다. 진행 상태는 Koofr 설정에서 확인할 수 있습니다.');
+    } catch (error) {
+      koofr.RestoreMessage.textContent = error.message;
+      koofr.Restore.disabled = false;
+    }
+  });
+  void refreshKoofr().catch(() => undefined);
 
   elements.monitorList.addEventListener('click', (event) => void handleCardAction(event));
   elements.monitorList.addEventListener('change', (event) => {
@@ -3317,6 +3230,7 @@
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== 'local') return;
+    if (changes['openStill.koofr.jobs.v1']) void refreshKoofr().catch(() => undefined);
     if (Object.prototype.hasOwnProperty.call(changes, 'openStill.monitors.v2') || Object.prototype.hasOwnProperty.call(changes, 'openStill.settings.v1')) { queueDashboardRefresh(); return; }
     const change = changes['openStill.records.changed.v1']?.newValue;
     if (!change) return;

@@ -19,6 +19,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .button { display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 7px 11px; border: 1px solid transparent; border-radius: 8px; color: #092119; background: var(--green); font-size: 12px; font-weight: 760; text-decoration: none; }
 .button:hover { filter: brightness(1.08); }
 .button:disabled { cursor: progress; opacity: .62; }
+.button[hidden] { display: none; }
 .button.secondary { border-color: #3b506c; color: #d7e3f1; background: #24344a; }
 .button.danger { border-color: rgb(255 147 139 / 38%); color: #ffc1bb; background: rgb(136 50 47 / 28%); }
 .import-button { cursor: pointer; }

@@ -15,6 +15,8 @@
         <button id="batchUrlButton" class="button secondary" type="button">주소 일괄 변경</button>
         <button id="exportButton" class="button secondary" type="button">내보내기</button>
         <button id="importButton" class="button secondary" type="button">불러오기</button>
+        <button id="koofrExport" class="button secondary" type="button" hidden>Koofr로 내보내기</button>
+        <button id="koofrImport" class="button secondary" type="button" hidden>Koofr에서 불러오기</button>
         <input id="importInput" type="file" accept="application/json,.json" multiple hidden>
         <div id="transferProgress" class="transfer-progress" role="status" aria-live="polite" hidden>
           <span id="transferProgressLabel"></span>
@@ -82,13 +84,45 @@
         </section>
       </section>
 
-      <div class="runtime-summary"><span id="runtimeSummary" role="status" aria-live="polite"></span><button id="refreshRuntime" class="button secondary" type="button">실행 상태 갱신</button><button id="runtimeOwnership" class="button secondary" type="button" hidden>탭 소유권·정리 확인</button></div>
+      <div class="runtime-summary"><span id="runtimeSummary" role="status" aria-live="polite"></span><button id="refreshRuntime" class="button secondary" type="button">실행 상태 갱신</button><button id="runtimeOwnership" class="button secondary" type="button" hidden>탭 소유권·정리 확인</button><button id="koofrSettings" class="button secondary" type="button">Koofr 설정</button></div>
 
       <section class="disclosure" aria-label="작동 방식 안내">
         <span class="disclosure-mark">i</span>
-        <p><strong>권한과 데이터:</strong> 사용자가 선택한 사이트에만 연결하며, URL·선택자·텍스트는 이 브라우저에만 저장됩니다. 정기 확인은 해당 사이트를 비활성 임시 탭에서 렌더링한 뒤 선택 요소를 비교합니다.</p>
+        <p><strong>권한과 데이터</strong> 선택한 사이트를 확인하고 URL·선택자·텍스트를 브라우저에 저장합니다. Koofr 백업을 이용하면 추적·설정·복구 원본의 사본이 연결한 Koofr 계정에 저장됩니다. 정기 확인은 해당 사이트를 비활성 임시 탭에서 렌더링한 뒤 선택 요소를 비교합니다.</p>
       </section>
     </main>
+
+    <dialog id="koofrSettingsDialog" class="dialog page-url-dialog" aria-labelledby="koofrSettingsTitle">
+      <form id="koofrForm" method="dialog">
+        <div class="dialog-heading"><h2 id="koofrSettingsTitle">Koofr 설정</h2><button class="icon-button" type="button" data-close-dialog="koofrSettingsDialog" aria-label="닫기">×</button></div>
+        <p id="koofrAccount" class="field-help"></p>
+        <label>이메일<input id="koofrEmail" type="email" autocomplete="off" maxlength="254" spellcheck="false"></label>
+        <label>앱 비밀번호<input id="koofrPassword" type="password" autocomplete="new-password" maxlength="512"></label>
+        <p class="field-help">Koofr에서 OpenStill용 앱 비밀번호를 발급하세요. 기존 연결로 주기나 보관 정책을 바꾸려면 두 입력란을 비워 두세요.</p>
+        <label>자동 백업<select id="koofrInterval"><option value="0">꺼짐</option><option value="60">1시간마다</option><option value="360">6시간마다</option><option value="1440">매일</option><option value="10080">매주</option></select></label>
+        <label>이 기기의 완료 백업 보관<select id="koofrRetention"><option value="0">모두 보관</option><option value="3">최근 3개</option><option value="5">최근 5개</option><option value="10">최근 10개</option></select></label>
+        <p class="field-help">자동 백업은 브라우저 실행 중에 동작합니다. 연결 정보를 삭제해도 Koofr에 저장한 백업은 남습니다.</p>
+        <p id="koofrJobStatus" class="field-help" role="status"></p>
+        <p id="koofrLastSuccess" class="field-help"></p>
+        <p id="koofrLastFailure" class="field-help"></p>
+        <p id="koofrSettingsMessage" class="form-message" role="alert"></p>
+        <div class="dialog-actions">
+          <button id="koofrCancel" class="button secondary" type="button" hidden>백업 작업 중단</button>
+          <button id="koofrRemove" class="button danger" type="button" hidden>정보 삭제</button>
+          <button id="koofrCheck" class="button secondary" type="button">연결 확인</button>
+          <button id="koofrSave" class="button primary" type="submit">저장</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="koofrRestoreDialog" class="dialog page-url-dialog" aria-labelledby="koofrRestoreTitle">
+      <form id="koofrRestoreForm" method="dialog">
+        <div class="dialog-heading"><h2 id="koofrRestoreTitle">Koofr에서 불러오기</h2><button class="icon-button" type="button" data-close-dialog="koofrRestoreDialog" aria-label="닫기">×</button></div>
+        <label>완료된 백업<select id="koofrBackupChoice" required></select></label>
+        <p id="koofrRestoreMessage" class="form-message" role="status"></p>
+        <div class="dialog-actions"><button id="koofrRestore" class="button primary" type="submit" disabled>선택한 백업 불러오기</button></div>
+      </form>
+    </dialog>
 
     <dialog id="editorDialog" class="dialog editor-dialog">
       <form id="editorForm" method="dialog">
@@ -148,6 +182,8 @@
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="backup-integrity.js"></script>
+    <script src="backup-transfer.js"></script>
+    <script src="backup-import.js"></script>
     <script src="dashboard-core.js"></script>
     <script src="dashboard.js"></script>
   </body>

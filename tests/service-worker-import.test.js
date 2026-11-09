@@ -20,7 +20,7 @@ globalThis.__openStillTest = {
   mutateMonitors,
   persistNormalizedMonitorRepairs,
   startExportSession,
-  startImportSession, touchImportSession, checkpointExportSession, finishExportSession, getMonitorById, recoveryStatus, abortImportSession,
+  startImportSession, touchImportSession, checkpointExportSession, finishExportSession, getMonitorById, recoveryStatus, abortImportSession, restoreRecoveryRecord,
   exportMonitorRecordForTransfer, normalizeSnapshot, normalizeMonitor, snapshotsEqual, compareSnapshotIdentities, importMonitors, appendImportFragments, reusePageUrl, replaceSiteHost
 };`;
 
@@ -225,6 +225,33 @@ test('legacy container, invalid records, duplicate IDs and unknown fields surviv
   const restarted = harness({}, env.localValues); assert.equal((await restarted.api.getState()).monitors.length, 2);
 });
 
+test('separate legacy profiles retain both same-ID originals after repeated backup imports and re-export', async () => {
+  async function exportRecords(env) {
+    const session = await env.api.startExportSession();
+    const records = [];
+    for (let index = 0; index < session.total; index += 1) {
+      records.push(JSON.parse((await env.api.getExportMonitor({ id: session.id, index })).record));
+    }
+    await env.api.finishExportSession({ id: session.id, completed: true });
+    return records;
+  }
+  const [first, second] = await Promise.all(['first', 'second'].map((name) =>
+    exportRecords(harness({ 'openStill.monitors.v2': [monitor({ id: name, name, originalMarker: name })] }))));
+  assert.equal(first.find((record) => record._openStillRecovery)._openStillRecovery.id, 'legacy-container:0');
+  assert.equal(second.find((record) => record._openStillRecovery)._openStillRecovery.id, 'legacy-container:0');
+  const target = harness();
+  for (let index = 0; index < 3; index += 1) {
+    for (const records of [first, second]) await target.api.importMonitors({ monitors: records });
+  }
+  const originals = await target.store.allAux('recovery');
+  assert.deepEqual(Array.from(originals, (entry) => entry.raw.originalMarker).sort(), ['first', 'second']);
+  assert.equal(new Set(Array.from(originals, (entry) => entry.id)).size, 2);
+  assert.equal((await target.api.recoveryStatus()).records.length, 2);
+  const other = harness();
+  await other.api.importMonitors({ monitors: await exportRecords(target) });
+  assert.deepEqual(Array.from(await other.store.allAux('recovery'), (entry) => entry.raw.originalMarker).sort(), ['first', 'second']);
+});
+
 test('safe field repair preserves content and scans past broken histories and runs', () => {
   const env = harness();
   const record = env.api.normalizeMonitor(monitor({ createdAt: 1e20, enabled: 'false', locators: [null, { type: 'css', expr: '.good', op: 'include' }], schedule: { type: 'interval', params: { interval: 'broken' } },
@@ -289,12 +316,130 @@ test('export waits for queued mutation, includes original records, and resumes a
   assert.equal(imported.imported, 2); assert.equal((await target.api.getState()).monitors.length, 2);
 });
 
-test('history timestamp-only export explicitly marks omitted content', () => {
+test('history from older exports retains the explicit omitted-content marker', () => {
   const env = harness();
-  const exported = env.api.exportMonitorRecordForTransfer({ history: [ { snapshot: { exists: true, text: 'latest' } }, { capturedAt: '2026-01-01', snapshot: { exists: true, text: 'older' } } ] });
-  assert.equal(exported.history[0].snapshot.text, 'latest'); assert.equal(exported.history[1].snapshot.contentOmitted, true);
+  const exported = env.api.exportMonitorRecordForTransfer({ history: [{ snapshot: { exists: true, text: '' } }, { capturedAt: '2026-01-01', snapshot: { exists: true, contentOmitted: true } }] });
   const normalized = env.api.normalizeMonitor(monitor({ history: exported.history }));
+  assert.equal(normalized.history[0].snapshot.text, '');
+  assert.equal(Boolean(normalized.history[0].snapshot.contentOmitted), false);
   assert.equal(normalized.history[1].snapshot.contentOmitted, true);
+});
+
+async function exportRecords(env) {
+  const started = await env.api.startExportSession();
+  const records = [];
+  for (let index = 0; index < started.total; index += 1) {
+    const response = await env.api.getExportMonitor({ id: started.id, index });
+    assert.equal(response.ok, true);
+    records.push(JSON.parse(response.record));
+  }
+  return { ...started, records };
+}
+
+test('stored history and configuration survive a backup and deduplicate on the source profile', async () => {
+  const source = harness();
+  const snapshot = (text) => ({ exists: true, text, data: `<article>${text}</article>` });
+  const baseline = snapshot('현재 🙂');
+  const previous = snapshot('이전 🌳');
+  const oldest = snapshot('과거 🌱');
+  await source.api.importMonitors({ monitors: [monitor({
+    labels: ['보존'], unread: true, lastChangedAt: '2026-09-03T00:00:00Z', lastViewedAt: '2026-09-02T00:00:00Z',
+    snapshot: baseline, lastErrorSnapshot: oldest, lastChange: { previous, current: baseline },
+    history: [baseline, previous, oldest].map((value, index) => ({ kind: 'change', capturedAt: `2026-09-0${3 - index}T00:00:00Z`, snapshot: value })),
+    runs: [{ checkedAt: '2026-09-03T00:00:00Z', status: 'changed' }]
+  })] });
+  const original = await source.api.getMonitorById('monitor-1');
+  const backup = await exportRecords(source);
+  const target = harness();
+  const imported = await target.api.importMonitors({ monitors: backup.records });
+  assert.equal(imported.imported, 1);
+  const restored = await target.api.getMonitorById('monitor-1');
+  for (const key of ['name', 'url', 'locators', 'labels', 'tracking', 'schedule', 'unread', 'lastViewedAt', 'snapshot', 'lastErrorSnapshot', 'lastChange', 'history', 'runs']) {
+    assert.deepEqual(clone(restored[key]), clone(original[key]), key);
+  }
+  assert.equal(backup.snapshotCount, 3);
+  const repeated = await source.api.importMonitors({ monitors: backup.records });
+  assert.equal(repeated.imported, 0);
+  assert.equal(repeated.conflicts, 0);
+  assert.equal(repeated.duplicates, 1);
+});
+
+test('discarded prepared references survive two backup round trips', async () => {
+  let env = harness();
+  const prepared = await env.api.startImportSession();
+  const snapshots = ['baseline', 'error', 'previous', 'current', 'old'].map((text) => ({ exists: true, text }));
+  await env.api.appendImportSession({ id: prepared.id, monitors: [monitor({ snapshot: snapshots[0], lastErrorSnapshot: snapshots[1],
+    lastChange: { previous: snapshots[2], current: snapshots[3] }, history: [{ snapshot: snapshots[4] }] })] });
+  await env.api.abortImportSession({ id: prepared.id, discard: true });
+  const original = (await env.store.allAux('recovery')).find((entry) => entry.source === 'discarded-prepared');
+  for (let round = 0; round < 2; round += 1) {
+    const backup = await exportRecords(env);
+    assert.equal(backup.normalCount, 0);
+    assert.equal(backup.snapshotCount, snapshots.length);
+    const target = harness();
+    await target.api.importMonitors({ monitors: backup.records });
+    const restored = (await target.store.allAux('recovery')).find((entry) => entry.source === 'discarded-prepared');
+    assert.deepEqual(clone(restored.raw), clone(original.raw));
+    const record = await target.store.unpack(restored.raw.monitor);
+    assert.deepEqual([record.snapshot, record.lastErrorSnapshot, record.lastChange.previous, record.lastChange.current, record.history[0].snapshot]
+      .map((value) => value.text), snapshots.map((value) => value.text));
+    env = target;
+  }
+  const archived = (await env.store.allAux('recovery')).find((entry) => entry.source === 'discarded-prepared');
+  assert.equal((await env.api.restoreRecoveryRecord({ id: archived.id })).imported, 1);
+  assert.equal((await env.api.getMonitorById('monitor-1')).snapshot.text, 'baseline');
+});
+
+test('recovery exports include version and pending-native refs and retain evidence of damaged refs', async () => {
+  const source = harness();
+  const saved = await source.store.stageMonitor(monitor({ snapshot: { exists: true, text: 'valid version' } }));
+  const damagedId = 'a'.repeat(64);
+  const broken = { ...saved, id: 'broken', snapshot: { $snapshot: damagedId } };
+  const old = { record: saved, digest: await source.store.digest(JSON.stringify(saved)) };
+  const primary = { json: 'corrupted primary' };
+  const copy = { json: 'corrupted copy' };
+  await source.store.putAux('snapshots', damagedId, primary);
+  await source.store.putAux('snapshotCopies', damagedId, copy);
+  const archive = { id: 'originals', source: 'versions', raw: [{ record: broken, digest: 'damaged', versions: [old] }] };
+  await source.store.putRecovery(archive);
+  const native = await source.store.stageMonitor(monitor({ id: 'native', snapshot: { exists: true, text: 'native body' } }));
+  const pending = { id: 'pending', source: 'discarded-native', raw: { kind: 'pending-native', raw: { _openStillMonitorRecord: native } } };
+  await source.store.putRecovery(pending);
+  await source.api.importMonitors({ monitors: [monitor({ id: 'independent' })] });
+  const backup = await exportRecords(source);
+  assert.equal(backup.snapshotCount, 2);
+  const target = harness();
+  assert.equal((await target.api.importMonitors({ monitors: backup.records })).imported, 1);
+  assert.equal(JSON.stringify((await target.store.getAux('recovery', archive.id)).raw), JSON.stringify(archive.raw));
+  assert.equal((await target.store.unpack(old.record)).snapshot.text, 'valid version');
+  assert.equal((await target.store.unpack(native)).snapshot.text, 'native body');
+  await assert.rejects(target.store.unpack(broken), /스냅샷 지문/);
+  const diagnosis = (await target.store.allAux('recovery')).find((entry) => entry.snapshotId === damagedId);
+  assert.deepEqual(clone(diagnosis.raw), primary);
+  assert.deepEqual(clone(diagnosis.copyRaw), copy);
+});
+
+test('trash backup preserves the packed record and detects only actual envelope damage', async () => {
+  const source = harness();
+  await source.api.importMonitors({ monitors: [monitor({ snapshot: { exists: true, text: 'restorable text' }, status: 'ok' })] });
+  await source.api.mutateMonitors((records) => { records.splice(0); return { ok: true }; });
+  const healthy = (await source.store.allAux('recovery')).find((entry) => entry.source === 'trash');
+  const damaged = { ...healthy, id: 'damaged-trash', sourceOriginalId: 'damaged-trash', raw: { ...healthy.raw, digest: '' } };
+  await source.store.putAux('recovery', damaged.id, damaged);
+  const backup = await exportRecords(source);
+  assert.equal(backup.snapshotCount, 1);
+  for (const entry of [healthy, damaged]) {
+    const target = harness();
+    const transferred = backup.records.find((value) => value._openStillRecovery?.id === entry.id);
+    assert.deepEqual(clone(transferred._openStillRecovery.raw), clone(entry.raw));
+    await target.api.importMonitors({ monitors: backup.records });
+    const recovery = (await target.store.allAux('recovery')).find((record) => record.id === entry.id);
+    await target.api.restoreRecoveryRecord({ id: recovery.id });
+    const restored = await target.api.getMonitorById('monitor-1');
+    assert.equal(restored.snapshot.text, 'restorable text');
+    assert.equal(restored.status, entry === healthy ? 'ok' : 'needs-review');
+    assert.equal((restored.recoveryIssues || []).some((message) => message.includes('원본 레코드 지문')), entry === damaged);
+  }
 });
 
 test('address relocation preserves baseline, changes, read state, and history', async () => {

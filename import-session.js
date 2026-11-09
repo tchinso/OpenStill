@@ -31,23 +31,30 @@ async function loadImportSession(id) {
   }
   return session;
 }
-async function startImportSession(message = {}) {
-  if (message.resumeId) {
-    const session = await loadImportSession(message.resumeId);
-    if (!session) return { ok: false, reason: 'missing', error: '보관된 불러오기 작업을 찾지 못했습니다.' };
-    importSessions.set(session.id, session);
-    return { ok: true, id: session.id, resumed: true, processed: session.sourceCount };
+async function startImportSession(message = {}, cloud) {
+  const resumeId = cloud?.id || message.resumeId;
+  if (resumeId) {
+    const session = await loadImportSession(resumeId);
+    if (session && (session.target === 'koofr') === Boolean(cloud)) {
+      if (!cloud && session.phase !== 'committed') {
+        session.phase = 'staging';
+        await persistImportSession(session);
+      }
+      importSessions.set(session.id, session);
+      return { ok: true, id: session.id, resumed: true, processed: session.sourceCount };
+    }
+    if (!cloud || session) return { ok: false, reason: 'missing', error: '보관된 불러오기 작업을 찾지 못했습니다.' };
   }
-  const session = { kind: 'import', id: createId(), mode: message.mode === 'replace' ? 'replace' : 'merge',
+  const session = { kind: 'import', id: cloud?.id || createId(), ...(cloud && { target: 'koofr' }), mode: message.mode === 'replace' ? 'replace' : 'merge',
     sourceCount: 0, preparedCount: 0, fragmentRecords: {}, diagnostics: [], sourceFiles: [], rejected: 0,
     repaired: 0, disabledForPermission: 0, duplicates: 0, revision: 0, phase: 'staging', settings: null, explicitEmpty: message.explicitEmpty === true };
   await persistImportSession(session);
   return { ok: true, id: session.id };
 }
 async function preserveImportRaw(session, raw, source, error, extra = {}) {
-  const id = 'import:' + session.id + ':' + session.diagnostics.length;
-  const diagnostic = { id, source, error, ...extra, capturedAt: nowIso() };
-  await OpenStillRecordStore.putAux('recovery', id, { ...diagnostic, raw });
+  const evidence = { source, error, ...extra };
+  const id = await OpenStillRecordStore.putRecovery({ ...evidence, raw });
+  const diagnostic = { ...evidence, id, capturedAt: nowIso() };
   session.diagnostics.push(diagnostic);
   return diagnostic;
 }
@@ -85,10 +92,13 @@ async function prepareImportSessionMonitor(session, raw, source = {}) {
     await appendImportFragmentsUnlocked({ id: session.id, exportId: raw._openStillImportFragment.exportId, fragments: [raw._openStillImportFragment.fragment] });
     return summary;
   }
-  if (raw?._openStillSettings) { session.settings = raw._openStillSettings; return summary; }
+  if (raw?._openStillSettings) { session.settings = normalizeSettings(raw._openStillSettings); return summary; }
   if (raw?._openStillRecovery) {
     const entry = raw._openStillRecovery;
-    await OpenStillRecordStore.putAux('recovery', entry.id || createId(), entry);
+    if (typeof entry !== 'object' || Array.isArray(entry)) {
+      session.rejected += 1; summary.rejected = 1;
+      await preserveImportRaw(session, raw, source.fileName || 'recovery', '원본 보관 레코드의 형식이 잘못되었습니다.');
+    } else await OpenStillRecordStore.putRecovery(entry);
     return summary;
   }
   if (raw?._openStillRecoveryFile) {
@@ -102,23 +112,40 @@ async function prepareImportSessionMonitor(session, raw, source = {}) {
       session.rejected += 1; summary.rejected = 1;
       await preserveImportRaw(session, raw, source.fileName || 'recovery-file', '원문 파일 조각의 Base64 내용을 해석하지 못했습니다.'); return summary;
     }
-    const fileKey = 'recovery-file:' + session.id + ':' + piece.id;
+    // Separate independent v5 backup sets even if their legacy file IDs match.
+    const legacyFileKey = 'recovery-file:' + session.id + ':' + piece.id;
+    const fileKey = session.recoveryFiles?.[legacyFileKey] ? legacyFileKey
+      : 'recovery-file:' + session.id + ':' + JSON.stringify([source.exportId || '', piece.id]);
     session.recoveryFiles ||= {};
     const file = session.recoveryFiles[fileKey] ||= { id: piece.id, name: piece.name, chunkCount: piece.chunkCount, keys: {}, completed: false };
     const key = fileKey + ':' + piece.chunkIndex;
     const prior = await OpenStillRecordStore.getAux('staging', key);
-    if (file.chunkCount !== piece.chunkCount || (prior && prior.base64 !== piece.base64)) {
+    if (file.chunkCount !== piece.chunkCount || (prior && JSON.stringify(prior) !== JSON.stringify(piece))) {
       session.rejected += 1; summary.rejected = 1; await preserveImportRaw(session, raw, piece.name, '같은 원문 파일 조각의 내용이 충돌하여 두 원본을 보관했습니다.'); return summary;
     }
     await OpenStillRecordStore.putAux('staging', key, piece); file.keys[piece.chunkIndex] = key;
     if (!file.completed && Object.keys(file.keys).length === piece.chunkCount) {
       const blobs = [];
+      const { base64, chunkIndex, ...header } = piece;
+      const headerJson = JSON.stringify(header);
       for (let index = 0; index < piece.chunkCount; index += 1) {
         const part = await OpenStillRecordStore.getAux('staging', file.keys[index]);
         if (!part) return summary;
-        blobs.push(Uint8Array.from(atob(part.base64), (character) => character.charCodeAt(0)));
+        const { base64, chunkIndex, ...partHeader } = part;
+        if (JSON.stringify(partHeader) !== headerJson) {
+          session.rejected += 1; summary.rejected = 1;
+          await preserveImportRaw(session, raw, piece.name, '원문 파일 조각의 메타데이터가 일치하지 않아 원본을 보관했습니다.');
+          return summary;
+        }
+        blobs.push(new Blob([Uint8Array.from(atob(base64), (character) => character.charCodeAt(0))]));
       }
-      await OpenStillRecordStore.putAux('recovery', piece.id, { id: piece.id, source: piece.name, error: piece.error, raw: new Blob(blobs) });
+      const type = typeof piece.type === 'string' ? piece.type : '';
+      const metadata = piece.metadata && typeof piece.metadata === 'object' && !Array.isArray(piece.metadata)
+        ? piece.metadata : { source: piece.name, error: piece.error };
+      const nativeFile = typeof piece.name === 'string' && Number.isSafeInteger(piece.lastModified);
+      const fileBody = nativeFile && typeof File !== 'undefined'
+        ? new File(blobs, piece.name, { type, lastModified: piece.lastModified }) : new Blob(blobs, { type });
+      await OpenStillRecordStore.putRecovery({ ...metadata, id: piece.id, raw: fileBody });
       file.completed = true;
     }
     return summary;
@@ -138,7 +165,10 @@ async function prepareImportSessionMonitor(session, raw, source = {}) {
   }
   if (monitor.recoveryIssues?.length || monitor.recoveryRepairs?.length || monitor.snapshot?.existsInferred) {
     summary.repaired = 1; session.repaired += 1;
-    await preserveImportRaw(session, raw, source.fileName || 'import-repair', '안전한 필드 수리 후 원본을 보관했습니다.', { recordId: monitor.id, fields: [...(monitor.recoveryRepairs || []), ...(monitor.recoveryIssues || [])] });
+    await preserveImportRaw(session, raw, source.fileName || 'import-repair', '안전한 필드 수리 후 원본을 보관했습니다.', {
+      recordId: typeof raw?.id === 'string' ? raw.id : undefined,
+      fields: [...(monitor.recoveryRepairs || []), ...(monitor.recoveryIssues || [])]
+    });
   }
   if (!monitor.snapshot && monitor.status === 'ok') monitor.status = 'needs-baseline';
   if (monitor.enabled && !await hasSitePermission(monitor.url)) {
@@ -233,7 +263,7 @@ async function prepareFragmentedImportRecords(session) {
     }
     if (record.invalid) { if (!record.reported) { record.reported = true; session.rejected += 1; } continue; }
     try {
-      await prepareImportSessionMonitor(session, JSON.parse(payload), { recordId }); record.completed = true;
+      await prepareImportSessionMonitor(session, JSON.parse(payload), { recordId, exportId: record.exportId }); record.completed = true;
       if (record.reported) { session.rejected = Math.max(0, session.rejected - 1); session.diagnostics = session.diagnostics.filter((item) => item.recordId !== recordId || item.source !== 'fragments'); }
     }
     catch (error) { session.rejected += 1; await preserveImportRaw(session, payload, 'fragment-json', responseError(error), { recordId }); record.completed = true; }
@@ -310,9 +340,13 @@ async function finishImportSessionUnlocked(message) {
 async function abortImportSessionUnlocked(message) {
   const session = await loadImportSession(message.id);
   if (!session) return { ok: true };
+  if (message.keepCommitted && session.phase === 'committed') return { ok: true };
+  if (message.keepCommitted) delete session.target;
   for (const fileKey of await OpenStillRecordStore.keysAux('staging', { prefix: 'import-file:' + session.id + ':' })) {
     const file = await OpenStillRecordStore.getAux('staging', fileKey); if (!file) continue;
-    await OpenStillRecordStore.putAux('recovery', file.id, { id: file.id, source: file.source, raw: file.raw, error: '불러오기 중단 원본', capturedAt: nowIso() });
+    if (file.recoveryId && await OpenStillRecordStore.getAux('recovery', file.recoveryId)) continue;
+    const recoveryId = await OpenStillRecordStore.putRecovery({ id: 'import-file:' + (file.source || ''), source: file.source, raw: file.raw, error: '불러오기 중단 원본' });
+    await OpenStillRecordStore.putAux('staging', fileKey, { ...file, recoveryId });
   }
   if (message.discard === true) {
     // Explicit discard removes staging, while recovery originals stay available.
@@ -323,7 +357,7 @@ async function abortImportSessionUnlocked(message) {
     for (const key of session.pendingNativeIds || []) originals.push([key, 'discarded-native']);
     for (const [key, source] of originals) {
       const raw = await OpenStillRecordStore.getAux('staging', key); if (!raw) continue;
-      await OpenStillRecordStore.putAux('recovery', 'discard:' + key, { id: 'discard:' + key, source, raw, error: '준비 작업을 폐기하고 원본을 보관했습니다.', capturedAt: nowIso() });
+      await OpenStillRecordStore.putRecovery({ source, raw, error: '준비 작업을 폐기하고 원본을 보관했습니다.' });
       await OpenStillRecordStore.deleteAux('staging', key);
     }
     await OpenStillRecordStore.deleteAux('staging', 'import:' + session.id); importSessions.delete(session.id);
@@ -354,3 +388,8 @@ function appendImportSession(message) { return serializeImportSession(message, a
 function appendImportFragments(message) { return serializeImportSession(message, appendImportFragmentsUnlocked); }
 function finishImportSession(message) { return serializeImportSession(message, finishImportSessionUnlocked); }
 function abortImportSession(message) { return serializeImportSession(message, abortImportSessionUnlocked); }
+async function localImportRequest(id, action) {
+  const session = id && await loadImportSession(id);
+  if (session?.target === 'koofr') return { ok: false, error: 'Koofr 작업은 Koofr 설정에서 관리해 주세요.' };
+  return action();
+}

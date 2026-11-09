@@ -90,6 +90,45 @@ test('commit response loss leaves durable generation, settings and operation rec
   assert.equal(result.settings.soundEnabled, false);
 });
 
+test('concurrent import contexts preserve same-ID Files with equal names, lengths and types', { skip: !chromium }, async (t) => {
+  const { context, page } = await fixture(t);
+  const secondPage = await initPage(context);
+  function importOriginal(page, base64) {
+    return page.evaluate(async (base64) => {
+      const session = await storageTest.startImportSession();
+      await storageTest.appendImportSession({ id: session.id, monitors: [{ _openStillRecoveryFile: {
+        id: 'same-file', name: 'same.json', type: 'application/json', lastModified: 1_700_000_000_000,
+        metadata: { id: 'same-file', source: 'same.json' }, chunkIndex: 0, chunkCount: 1, base64
+      } }] });
+    }, base64);
+  }
+  await Promise.all([importOriginal(page, 'eA=='), importOriginal(secondPage, 'eQ==')]);
+  await importOriginal(page, 'eA==');
+  const transferred = await page.evaluate(async () => {
+    const session = await storageTest.startExportSession();
+    const records = [];
+    for (let index = 0; index < session.total; index += 1) {
+      records.push(JSON.parse((await storageTest.getExportMonitor({ id: session.id, index })).record));
+    }
+    return records;
+  });
+  assert.equal(transferred.filter((record) => record._openStillRecoveryFile).length, 2);
+  const target = await fixture(t);
+  const originals = await target.page.evaluate(async (transferred) => {
+    for (let index = 0; index < 3; index += 1) {
+      const session = await storageTest.startImportSession();
+      await storageTest.appendImportSession({ id: session.id, monitors: transferred });
+    }
+    const records = await OpenStillRecordStore.allAux('recovery');
+    return Promise.all(records.map(async (entry) => ({ id: entry.id, text: await entry.raw.text(), name: entry.raw.name,
+      type: entry.raw.type, size: entry.raw.size, lastModified: entry.raw.lastModified })));
+  }, transferred);
+  assert.equal(originals.length, 2);
+  assert.equal(new Set(originals.map(({ id }) => id)).size, 2);
+  assert.deepEqual(originals.map(({ id, ...file }) => file).sort((a, b) => a.text.localeCompare(b.text)),
+    ['x', 'y'].map((text) => ({ text, name: 'same.json', type: 'application/json', size: 1, lastModified: 1_700_000_000_000 })));
+});
+
 test('corrupt current records fall back independently and retain null/container originals', { skip: !chromium }, async (t) => {
   const { page } = await fixture(t);
   const result = await page.evaluate(async () => {

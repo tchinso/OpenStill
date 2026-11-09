@@ -105,10 +105,10 @@ test('real import Worker recovers healthy siblings and preserves the diagnostic 
   const parsed = await waitMessage(page, id, 'parsed');
   assert.deepEqual((await records(page, id)).map((event) => event.record), [before, after]);
   assert.equal(parsed.monitorCount, 2); assert.ok(parsed.diagnostics.length > 0);
-  assert.equal(parsed.recoveryId, 'import-file:damaged:0');
+  assert.equal(parsed.recoveryId, 'import-file:damaged-한글.json');
   const stored = await page.evaluate(async (key) => {
     const recovery = await OpenStillRecordStore.getAux('recovery', key);
-    const stage = await OpenStillRecordStore.getAux('staging', key);
+    const stage = await OpenStillRecordStore.getAux('staging', 'import-file:damaged:0');
     return { raw: await recovery.raw.text(), size: recovery.raw.size, source: recovery.source,
       phase: stage.phase, stageRaw: await stage.raw.text(), diagnostics: recovery.diagnostics };
   }, parsed.recoveryId);
