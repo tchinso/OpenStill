@@ -1,64 +1,83 @@
-# OpenStill 개인정보처리방침
+# 개인정보처리방침 / Privacy Policy
 
-시행일: 2026-11-09
+## 개인정보처리방침
 
-개정일 2026-11-09
+본 개인정보처리방침은 OpenStill 브라우저 확장 프로그램의 개인정보 처리 방식에 대해 설명합니다.
 
-OpenStill은 사용자가 지정한 웹페이지 요소의 변화를 브라우저 로컬에서 확인하는 Chrome 확장 프로그램입니다.
+### 1. 개인정보 수집 여부
 
-## 처리하는 데이터
+개발자는 OpenStill을 통해 사용자의 개인정보를 수집하거나 보관하지 않습니다. OpenStill은 추적 데이터, 백업 파일, Koofr 연결 정보를 개발자에게 전송하지 않습니다.
 
-OpenStill은 사용자가 직접 저장하거나 가져온 추적에 한해 다음 정보를 처리합니다.
+### 2. 데이터 처리 방식
 
-- 페이지 URL과 페이지 제목
-- CSS/XCSS/XPath locator, 표시 이름, 라벨, 확인 방식과 활성 상태
-- 선택된 요소의 필터된 HTML·텍스트, 속성/프로퍼티 필드값, 직전 변경·기준값·실행 이력과 선택 실패 화면 증거
-- 마지막 확인·변경·확인 필요 시각과 오류 상태
-- 로컬 설정, 작업 진행·저장 결과, 이전 정상본, 삭제·교체 자료 및 해석 실패·수리 전 원본
-- Koofr를 연결한 경우 가입 이메일, 앱 비밀번호, 이 기기의 식별자, 선택한 백업·보관 주기, 작업 진행 상태
+OpenStill은 사용자가 저장하거나 가져온 웹페이지를 브라우저에서 열고, 사용자가 설정한 선택자에 해당하는 내용을 확인합니다. 추적 URL, 페이지 제목, 선택자, 캡처한 텍스트·HTML·링크, 변경·실행 이력, 설정과 복구 자료는 사용자의 브라우저 프로필에 저장합니다. 사용자는 JSON 파일로 데이터를 내보내거나 불러올 수 있습니다.
 
-OpenStill은 관련 없는 방문 기록, 다른 탭의 내용, 추적 사이트의 쿠키 값·비밀번호·인증 헤더, 기존 다운로드 목록을 읽거나 저장하지 않습니다. 사용자가 로컬 내보내기를 요청한 경우에 그 JSON 파일의 저장 완료·실패 상태를 확인합니다.
+Koofr 연결을 등록하면 OpenStill은 사용자가 입력한 가입 이메일과 앱 비밀번호를 일반 설정과 분리해 브라우저 프로필의 확장 프로그램 저장소에 보관합니다. 두 값은 Koofr 연결을 인증하는 데 사용되며 로컬 또는 Koofr 백업 파일에 포함되지 않습니다.
 
-## 이용 목적과 전송
+### 3. 제3자 제공
 
-이 정보는 사용자에게 변화 여부와 비교 결과를 표시하고, 자동 또는 수동 확인, 라벨별 목록, 내보내기·복원 기능을 제공하는 데 사용합니다. OpenStill은 개발자 서버로 전송하거나 분석·광고·판매에 사용하지 않습니다.
+Koofr는 선택 기능입니다. 연결 확인, 백업 저장, 백업 목록 조회와 복원에 필요한 요청은 HTTPS로 Koofr WebDAV에 직접 전송합니다. 연결 확인 시 작은 시험용 JSON 파일을 생성하고 읽은 뒤 삭제합니다.
 
-자동 확인은 사용자가 명시적으로 저장한 URL만 비활성 Chrome 탭에서 열어 이루어집니다. 초기 캡처는 DOM 준비 뒤 약 2초와 설정된 추가 대기를 적용하고 해당 추적의 locator 결과만 읽습니다. 모든 페이지 자원의 완전한 로드를 기다리는 방식은 아닙니다. 하위 프레임 locator는 지정된 프레임만 읽고 접근 불가·모호한 프레임은 확인 필요 상태로 처리합니다. 수동 추적은 사용자가 확인을 요청할 때만 갱신됩니다. 일회성 확인 탭은 포커스를 빼앗지 않는 고정 전용 탭으로 잠시 표시하며, 실제 제거가 확인될 때까지 소유권·정리 상태를 유지합니다.
+사용자가 수동 백업을 실행하거나 직접 켠 자동 백업이 실행되면, 추적 정보, 캡처한 내용, 이력, 설정과 복구 원본의 사본이 사용자의 Koofr 계정에 저장됩니다. 백업 목록을 구성하는 데 사용하는 임의의 브라우저 프로필 식별자와 백업 정보도 함께 전송합니다. 복원할 때는 사용자가 선택한 백업을 해당 계정에서 읽습니다. Koofr에서 처리하는 데이터에는 Koofr의 개인정보처리방침이 적용됩니다. [Koofr 개인정보처리방침](https://koofr.eu/privacy/)
 
-사용자가 실시간 감시를 켠 경우, OpenStill은 저장 URL을 별도의 고정 전용 탭에서 열고 DOM 변경 신호를 관찰합니다. 상주 전용 탭은 최대 12개이며 연결·대기·복구 상태를 관리합니다. 신호가 오면 같은 locator 필터와 비교 절차를 실행합니다. 관련 없는 탭의 DOM·콘텐츠는 읽거나 저장하지 않으며, 재시작 뒤 소유권이 불확실한 탭은 자동으로 닫지 않습니다.
+### 4. 외부 서버 및 분석 도구
 
-웹사이트에는 일반적인 페이지 요청이 Chrome의 현재 세션 상태로 전송될 수 있습니다. 이는 사용자가 그 웹사이트를 열 때와 같은 요청입니다. OpenStill은 쿠키·비밀번호·인증 헤더의 값을 읽거나 별도로 전송하지 않으며, 로그인·페이월·CAPTCHA를 우회하지 않습니다.
+OpenStill은 개발자가 운영하는 데이터 수집 서버, 광고 SDK, 사용 분석 또는 광고 추적 도구를 사용하지 않습니다. 개발자는 OpenStill 사용자의 데이터를 판매하거나 광고에 이용하지 않습니다.
 
-## 로컬 저장과 백업
+### 5. 개인정보 보관 및 파기
 
-URL, typed locator, 일정, 필터된 스냅샷과 이력은 브라우저 로컬 IndexedDB에 레코드별로 저장합니다. 설정·일부 작업 상태는 Chrome 로컬 저장소에 저장합니다. 이전 정상본, 삭제·교체 원본, 마이그레이션·수리 전 자료와 손상 파일도 같은 프로필의 복구 영역에 보관할 수 있습니다. 준비 자료와 저장 결과는 중단 뒤 복구를 위해 지속 저장합니다.
+추적을 삭제하면 되돌릴 수 있도록 사본이 브라우저의 복구함에 남을 수 있습니다. 사용자는 브라우저에서 확장 프로그램의 저장 데이터를 지워 로컬 데이터를 삭제할 수 있습니다. 내보낸 JSON 파일은 사용자가 직접 관리합니다.
 
-사용자는 대시보드에서 로컬 JSON 백업을 내보내거나 가져올 수 있습니다. 백업은 추적·저장된 스냅샷·이력·설정·복구 원본을 포함합니다. 불완전한 로컬 백업에서는 완전한 독립 레코드를 먼저 복원하고 손상·누락 조각은 복구 대기로 남깁니다.
+Koofr 자동 백업과 자동 삭제는 기본값에서 꺼져 있습니다. 사용자가 보관할 백업 개수를 설정하면 OpenStill은 새 백업을 검증한 뒤 이 기기의 오래된 완료 백업을 정리합니다. Koofr 설정에서 연결 정보를 삭제하면 브라우저에 저장된 이메일과 앱 비밀번호가 지워지고 자동 백업이 꺼집니다. 업로드한 백업은 Koofr 계정에 남으며, 사용자가 Koofr에서 직접 삭제할 수 있습니다.
 
-새 Chrome 프로필이나 새 컴퓨터에서는 Chrome의 사이트 접근 권한을 다시 승인해야 할 수 있습니다.
+### 6. 문의
 
-## 선택 기능인 Koofr 백업
+본 개인정보처리방침에 대한 문의가 있는 경우, 아래 연락처로 문의할 수 있습니다.
 
-사용자가 Koofr를 연결하면 OpenStill은 가입 이메일과 앱 비밀번호로 Koofr WebDAV에 HTTPS 연결합니다. 연결 확인은 `/OpenStill`에 작은 시험용 JSON을 쓴 뒤 읽고 정리합니다. 사용자가 내보내기를 요청하거나 선택한 자동 백업 시각이 되면 로컬 JSON과 같은 추적·스냅샷·이력·설정·복구 원본 사본과 백업 목록 정보를 사용자의 Koofr 계정으로 전송합니다. 복원은 사용자가 선택한 완료 백업을 Koofr에서 읽어 현재 추적에 병합합니다.
+- 이메일: `team@soleil.channel.io`
 
-Koofr 가입 이메일과 앱 비밀번호는 확장의 로컬 저장소에 일반 설정과 별도로 보관합니다. 앱 비밀번호는 `https://app.koofr.net`의 Koofr WebDAV 인증 요청에 사용하며, 로컬·Koofr 백업과 동기화 저장소에는 포함하지 않습니다. 자동 백업 주기, 기기 식별자와 진행 상태는 이 프로필에 보관하고 복원으로 바꾸지 않습니다. 자동 백업은 기본값에서 꺼져 있으며, 사용자가 주기를 선택하면 브라우저가 실행되는 동안 동작합니다.
+### 7. 시행일
 
-## 권한
+최초 시행일은 2026년 5월 5일입니다. 이 개정 방침은 OpenStill 1.7.0부터 적용됩니다.
 
-OpenStill은 예약 확인과 대량 가져오기를 위해 설치 시 HTTP 및 HTTPS 웹사이트 접근 권한을 요청합니다. 이 권한은 수백 개의 사용자가 선택한 도메인을 도메인별 반복 승인 없이 확인하기 위한 것입니다. 권한이 있다고 해서 모든 사이트의 데이터를 수집하지는 않으며, OpenStill은 사용자가 저장하거나 가져온 추적 URL만 엽니다.
+---
 
-`offscreen`은 선택자 문법 검증, 정규식 Worker, 로컬 알림음 및 Koofr 백업 전송·파일 처리에 사용합니다. `alarms`는 추적 일정과 사용자가 선택한 Koofr 자동 백업을 예약합니다. `unlimitedStorage`는 최대 10,000개 추적과 스냅샷·이전본·복구 자료를 로컬에 보관하는 데 사용합니다. `tabs`는 저장 URL의 확인·실시간 전용 탭과 소유권·복구·정리 상태를 관리하는 데 사용합니다. `downloads`는 요청한 로컬 JSON 백업 파일과 그 파일의 완료·실패 상태만 처리하며, 기존 다운로드 목록을 조회·저장하지 않습니다.
+## Privacy Policy
 
-OpenStill은 시크릿 창에서 동작하지 않도록 설정되어 있으므로, 시크릿 창의 URL이나 요소 텍스트를 일반 로컬 저장소에 저장하지 않습니다.
+This Privacy Policy explains how the OpenStill browser extension handles user data.
 
-## 사용자 제어와 보관 기간
+### 1. Collection of Personal Information
 
-사용자는 언제든 추적을 일시정지하거나 삭제하고, 확장 프로그램을 제거할 수 있습니다. 추적 삭제 시 해당 추적을 정상 목록에서 제거하고 되돌릴 원본을 로컬 복구함에 보관합니다. 손상·수리 전 원본과 중단 작업도 복구 또는 내보내기를 위해 보관합니다. 따라서 추적 삭제만으로 모든 관련 로컬 원문이 영구 삭제되지는 않습니다. 확장 제거·프로필 손상으로 내부 복구 자료를 사용할 수 없게 될 수 있으므로 필요한 자료는 외부 JSON 백업으로 보관해야 합니다.
+The developer does not collect or retain personal information through OpenStill. OpenStill does not send tracking data, backup files, or Koofr connection credentials to the developer.
 
-Koofr 연결 정보는 대시보드에서 삭제할 수 있습니다. 연결 정보를 지우면 자동 백업이 꺼지며, 이미 업로드된 백업은 Koofr 계정에 남습니다. 기본 보관 정책은 모두 보관입니다. 사용자가 최근 백업 개수를 선택하면 새 백업의 검증이 끝난 뒤 이 기기의 보관 한도를 넘긴 이전 완료본을 정리합니다.
+### 2. Data Processing
 
-Koofr의 계정과 원격 보관 자료에는 Koofr의 휴면 계정 정책이 적용됩니다. 2년간 로그인하지 않은 계정은 통지 후 삭제될 수 있습니다. [Koofr 휴면 계정 정책](https://koofr.eu/help/privacy-and-safety-on-koofr/what-happens-if-my-account-is-inactive/)
+OpenStill opens web pages the user saves or imports and reads the content matched by the selectors the user configures. It stores tracked URLs, page titles, selectors, captured text, HTML and links, change and check history, settings, and recovery data in the user's browser profile. Users can export and import data as JSON files.
 
-## 문의
+If the user connects Koofr, OpenStill stores the Koofr account email address and app password in the extension's local storage, separately from general settings. OpenStill uses these credentials to authenticate to Koofr and excludes them from both local and Koofr backup files.
 
-이 확장 프로그램의 배포자는 Chrome Web Store 등록 정보에 기재한 연락처를 통해 개인정보 관련 문의를 받습니다.
+### 3. Sharing with Third Parties
+
+Koofr is optional. OpenStill sends requests for connection checks, uploads, backup listings, and restores directly to Koofr WebDAV over HTTPS. A connection check creates, reads, and then deletes a small test JSON file.
+
+When the user starts a manual backup or an automatic backup they have enabled runs, OpenStill saves a copy of the tracking data, captured content, history, settings, and recovery originals to the user's Koofr account. It also sends a randomly generated browser profile identifier and backup information used to list available backups. During a restore, OpenStill reads the backup the user selected from that account. Koofr's privacy policy applies to data it processes. [Koofr Privacy Policy](https://koofr.eu/privacy/)
+
+### 4. External Servers and Analytics Tools
+
+OpenStill does not use developer-operated data collection servers, advertising SDKs, usage analytics, or ad tracking tools. The developer does not sell OpenStill user data or use it for advertising.
+
+### 5. Data Retention and Deletion
+
+Deleting a tracker can leave a copy in the browser's recovery area so the user can restore it. Users can delete local data by clearing the extension's stored data in their browser. Users manage their exported JSON files.
+
+Automatic Koofr backups and automatic deletion are off by default. If the user sets a retention limit, OpenStill removes older completed backups for that device after verifying a new backup. Removing the connection in Koofr settings clears the stored email address and app password and disables automatic backups. Uploaded backups remain in the user's Koofr account, where the user can delete them.
+
+### 6. Contact
+
+For questions about this Privacy Policy, please contact:
+
+- Email: `team@soleil.channel.io`
+
+### 7. Effective Date
+
+This Privacy Policy first took effect on May 5, 2026. This revision applies starting with OpenStill 1.7.0.
